@@ -10,105 +10,71 @@ from typing import Any, Dict, List, Literal, Optional, Sequence
 from openai import OpenAI
 
 from function import TokenUsageAccumulator, call_llm_stream, extract_json_object, read_api_key
+from initial_hypothesis_generation import GenerationMode, generate_initial_hypotheses
 from llm_api.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from llm_api.llm_api_info import base_url as DEFAULT_BASE_URL
 from llm_api.llm_api_info import model_name as DEFAULT_MODEL_NAME
 from neuronpedia_feature_api import fetch_and_parse_feature_observation
-from prompts.hypothesis_generation_prompt import (
-    build_iterative_user_prompt,
-    build_single_call_user_prompt,
-    build_system_prompt,
-)
+from prompts.experiments_generation_prompt import build_system_prompt, build_user_prompt
 
 SideType = Literal["input", "output"]
-GenerationMode = Literal["single_call", "iterative"]
+
+OUTPUT_SIDE_PLACEHOLDER = ["The explanation is simple:", "I think", "We"]
 
 
-def _normalize_hypothesis(text: str) -> str:
+def _normalize_sentence(text: str) -> str:
     stripped = text.strip().strip('"').strip("'")
     stripped = re.sub(r"^\d+[\).\s-]+", "", stripped)
     return " ".join(stripped.split())
 
 
-def _parse_hypothesis_list(raw_output: str, expected_count: int) -> List[str]:
+def _parse_sentence_list(raw_output: str, expected_count: int) -> List[str]:
     parsed = extract_json_object(raw_output)
-    hypotheses: List[str] = []
+    sentences: List[str] = []
 
     if isinstance(parsed, dict):
-        candidate = parsed.get("hypotheses")
+        candidate = parsed.get("sentences")
         if isinstance(candidate, list):
-            hypotheses = [
-                _normalize_hypothesis(item)
+            sentences = [
+                _normalize_sentence(item)
                 for item in candidate
-                if isinstance(item, str) and _normalize_hypothesis(item)
+                if isinstance(item, str) and _normalize_sentence(item)
             ]
 
-    if not hypotheses:
+    if not sentences:
         lines = [line for line in raw_output.splitlines() if line.strip()]
-        hypotheses = [_normalize_hypothesis(line) for line in lines if _normalize_hypothesis(line)]
+        sentences = [_normalize_sentence(line) for line in lines if _normalize_sentence(line)]
 
-    if not hypotheses:
-        raise ValueError(f"Failed to parse hypotheses from output: {raw_output}")
+    if not sentences:
+        raise ValueError(f"Failed to parse sentences from output: {raw_output}")
 
-    return hypotheses[:expected_count]
-
-
-def _parse_single_hypothesis(raw_output: str) -> str:
-    parsed = extract_json_object(raw_output)
-    if isinstance(parsed, dict):
-        for key in ("hypothesis", "output", "text"):
-            value = parsed.get(key)
-            if isinstance(value, str):
-                normalized = _normalize_hypothesis(value)
-                if normalized:
-                    return normalized
-
-    lines = [line for line in raw_output.splitlines() if line.strip()]
-    for line in lines:
-        normalized = _normalize_hypothesis(line)
-        if normalized:
-            return normalized
-    raise ValueError(f"Failed to parse one hypothesis from output: {raw_output}")
+    if len(sentences) < expected_count:
+        raise ValueError(
+            f"Expected {expected_count} sentences, but only parsed {len(sentences)}: {raw_output}"
+        )
+    return sentences[:expected_count]
 
 
-def _get_side_observation(observation_dict: Dict[str, Any], side: SideType) -> Dict[str, Any]:
-    if side == "input":
-        keys = ("input_side_observation", "input_side_obseravtion")
-    else:
-        keys = ("output_side_observation", "output_side_obseravtion")
-
-    for key in keys:
-        value = observation_dict.get(key)
-        if isinstance(value, dict):
-            return value
-    raise KeyError(f"Cannot find {side} observation in observation dict.")
-
-
-def _generate_hypotheses_for_side(
+def _generate_experiments_for_side(
+    *,
+    side: SideType,
+    hypotheses: Sequence[str],
+    num_sentences: int,
     client: OpenAI,
     model: str,
-    side: SideType,
-    side_observation: Dict[str, Any],
-    num_hypothesis: int,
-    generation_mode: GenerationMode,
     token_counter: TokenUsageAccumulator,
     llm_calls: List[Dict[str, Any]],
-    *,
     temperature: float,
     max_tokens: int,
-) -> List[str]:
-    if num_hypothesis <= 0:
-        raise ValueError("num_hypothesis must be a positive integer.")
+) -> List[List[str]]:
+    if side == "output":
+        return [list(OUTPUT_SIDE_PLACEHOLDER) for _ in hypotheses]
 
     system_prompt = build_system_prompt(side)
-    hypotheses: List[str] = []
+    all_sentences: List[List[str]] = []
 
-    if generation_mode == "single_call":
-        user_prompt = build_single_call_user_prompt(
-            side=side,
-            observation=side_observation,
-            num_hypothesis=num_hypothesis,
-        )
+    for index, hypothesis in enumerate(hypotheses, start=1):
+        user_prompt = build_user_prompt(side=side, hypothesis=hypothesis, num_sentences=num_sentences)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -120,59 +86,22 @@ def _generate_hypotheses_for_side(
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        print('raw output:')
-        print(raw_output)
         usage_counts = token_counter.add(usage_obj)
-        hypotheses = _parse_hypothesis_list(raw_output, expected_count=num_hypothesis)
+        designed_sentences = _parse_sentence_list(raw_output, expected_count=num_sentences)
+        all_sentences.append(designed_sentences)
 
         llm_calls.append(
             {
                 "side": side,
-                "mode": generation_mode,
-                "round": 1,
+                "hypothesis_index": index,
+                "hypothesis_text": hypothesis,
                 "messages": messages,
                 "raw_output": raw_output,
                 "usage": usage_counts,
             }
         )
-        return hypotheses
 
-    if generation_mode == "iterative":
-        for idx in range(1, num_hypothesis + 1):
-            user_prompt = build_iterative_user_prompt(
-                side=side,
-                observation=side_observation,
-                existing_hypotheses=hypotheses,
-                current_index=idx,
-                total_count=num_hypothesis,
-            )
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-            raw_output, usage_obj = call_llm_stream(
-                client,
-                model,
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            usage_counts = token_counter.add(usage_obj)
-            one_hypothesis = _parse_single_hypothesis(raw_output)
-            hypotheses.append(one_hypothesis)
-            llm_calls.append(
-                {
-                    "side": side,
-                    "mode": generation_mode,
-                    "round": idx,
-                    "messages": messages,
-                    "raw_output": raw_output,
-                    "usage": usage_counts,
-                }
-            )
-        return hypotheses
-
-    raise ValueError(f"Unsupported generation mode: {generation_mode}")
+    return all_sentences
 
 
 def _write_markdown_log(
@@ -182,36 +111,45 @@ def _write_markdown_log(
     llm_calls: Sequence[Dict[str, Any]],
 ) -> None:
     lines: List[str] = []
-    lines.append("# SAE Initial Hypothesis Generation")
+    lines.append("# SAE Hypothesis Experiments Generation")
     lines.append("")
     lines.append("## Metadata")
+    lines.append(f"- model_id: {result['model_id']}")
     lines.append(f"- layer_id: {result['layer_id']}")
     lines.append(f"- feature_id: {result['feature_id']}")
     lines.append(f"- timestamp: {result['timestamp']}")
     lines.append(f"- num_hypothesis: {result['num_hypothesis']}")
-    lines.append(f"- generation_mode: {result['generation_mode']}")
+    lines.append(f"- num_input_sentences_per_hypothesis: {result['num_input_sentences_per_hypothesis']}")
     lines.append(f"- llm_model: {result['llm_model']}")
     lines.append("")
-    lines.append("## Token Usage (Full Initial Hypothesis Generation)")
+    lines.append("## Token Usage (Experiments Generation)")
     token_usage = result["token_usage"]
     lines.append(f"- prompt_tokens: {token_usage['prompt_tokens']}")
     lines.append(f"- completion_tokens: {token_usage['completion_tokens']}")
     lines.append(f"- total_tokens: {token_usage['total_tokens']}")
     lines.append("")
-    lines.append("## Input-side Hypotheses")
-    for idx, hyp in enumerate(result["input_side_hypotheses"], start=1):
-        lines.append(f"{idx}. {hyp}")
-    lines.append("")
-    lines.append("## Output-side Hypotheses")
-    for idx, hyp in enumerate(result["output_side_hypotheses"], start=1):
-        lines.append(f"{idx}. {hyp}")
-    lines.append("")
+    lines.append("## Input-side Hypotheses And Designed Sentences")
+    for idx, pair in enumerate(result["input_side_experiments"], start=1):
+        lines.append(f"### Input Hypothesis {idx}")
+        lines.append(f"- hypothesis: {pair['hypothesis']}")
+        lines.append("- designed_sentences:")
+        for sentence in pair["designed_sentences"]:
+            lines.append(f"  - {sentence}")
+        lines.append("")
+    lines.append("## Output-side Hypotheses And Designed Sentences")
+    for idx, pair in enumerate(result["output_side_experiments"], start=1):
+        lines.append(f"### Output Hypothesis {idx}")
+        lines.append(f"- hypothesis: {pair['hypothesis']}")
+        lines.append("- designed_sentences:")
+        for sentence in pair["designed_sentences"]:
+            lines.append(f"  - {sentence}")
+        lines.append("")
     lines.append("## LLM Calls")
     for i, call in enumerate(llm_calls, start=1):
         lines.append(f"### Call {i}")
         lines.append(f"- side: {call['side']}")
-        lines.append(f"- mode: {call['mode']}")
-        lines.append(f"- round: {call['round']}")
+        lines.append(f"- hypothesis_index: {call['hypothesis_index']}")
+        lines.append(f"- hypothesis_text: {call['hypothesis_text']}")
         usage = call.get("usage", {})
         lines.append(f"- prompt_tokens: {usage.get('prompt_tokens', 0)}")
         lines.append(f"- completion_tokens: {usage.get('completion_tokens', 0)}")
@@ -231,53 +169,48 @@ def _write_markdown_log(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def generate_initial_hypotheses(
+def generate_hypothesis_experiments(
     *,
-    observation: Dict[str, Any],
-    model_id: str,
-    layer_id: str,
-    feature_id: str,
-    num_hypothesis: int,
-    generation_mode: GenerationMode,
-    timestamp: Optional[str] = None,
+    initial_hypotheses_result: Dict[str, Any],
+    num_input_sentences_per_hypothesis: int,
     llm_base_url: str = DEFAULT_BASE_URL,
     llm_model: str = DEFAULT_MODEL_NAME,
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
     temperature: float = 0.2,
     max_tokens: int = 1000,
 ) -> Dict[str, Any]:
-    ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    input_observation = _get_side_observation(observation, "input")
-    output_observation = _get_side_observation(observation, "output")
+    model_id = initial_hypotheses_result.get("model_id", "unknown-model")
+    layer_id = str(initial_hypotheses_result["layer_id"])
+    feature_id = str(initial_hypotheses_result["feature_id"])
+    ts = str(initial_hypotheses_result["timestamp"])
+    input_hypotheses = list(initial_hypotheses_result["input_side_hypotheses"])
+    output_hypotheses = list(initial_hypotheses_result["output_side_hypotheses"])
+    num_hypothesis = len(input_hypotheses)
 
     client = OpenAI(
         base_url=llm_base_url,
         api_key=read_api_key(llm_api_key_file),
     )
-
     token_counter = TokenUsageAccumulator()
     llm_calls: List[Dict[str, Any]] = []
 
-    input_hypotheses = _generate_hypotheses_for_side(
+    input_sentences = _generate_experiments_for_side(
+        side="input",
+        hypotheses=input_hypotheses,
+        num_sentences=num_input_sentences_per_hypothesis,
         client=client,
         model=llm_model,
-        side="input",
-        side_observation=input_observation,
-        num_hypothesis=num_hypothesis,
-        generation_mode=generation_mode,
         token_counter=token_counter,
         llm_calls=llm_calls,
         temperature=temperature,
         max_tokens=max_tokens,
     )
-    output_hypotheses = _generate_hypotheses_for_side(
+    output_sentences = _generate_experiments_for_side(
+        side="output",
+        hypotheses=output_hypotheses,
+        num_sentences=num_input_sentences_per_hypothesis,
         client=client,
         model=llm_model,
-        side="output",
-        side_observation=output_observation,
-        num_hypothesis=num_hypothesis,
-        generation_mode=generation_mode,
         token_counter=token_counter,
         llm_calls=llm_calls,
         temperature=temperature,
@@ -293,17 +226,24 @@ def generate_initial_hypotheses(
         "feature_id": feature_id,
         "timestamp": ts,
         "num_hypothesis": num_hypothesis,
-        "generation_mode": generation_mode,
+        "generation_mode": initial_hypotheses_result.get("generation_mode"),
+        "num_input_sentences_per_hypothesis": num_input_sentences_per_hypothesis,
         "llm_model": llm_model,
-        "input_side_hypotheses": input_hypotheses,
-        "output_side_hypotheses": output_hypotheses,
+        "input_side_experiments": [
+            {"hypothesis": hyp, "designed_sentences": sentences}
+            for hyp, sentences in zip(input_hypotheses, input_sentences)
+        ],
+        "output_side_experiments": [
+            {"hypothesis": hyp, "designed_sentences": sentences}
+            for hyp, sentences in zip(output_hypotheses, output_sentences)
+        ],
         "token_usage": token_counter.as_dict(),
     }
 
-    result_json_path = base_dir / f"layer{layer_id}-feature{feature_id}-initial-hypotheses.json"
+    result_json_path = base_dir / f"layer{layer_id}-feature{feature_id}-experiments.json"
     result_json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    result_md_path = base_dir / f"layer{layer_id}-feature{feature_id}-initial-hypotheses.md"
+    result_md_path = base_dir / f"layer{layer_id}-feature{feature_id}-experiments.md"
     _write_markdown_log(result_md_path, result=result, llm_calls=llm_calls)
 
     return result
@@ -311,7 +251,7 @@ def generate_initial_hypotheses(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Step 2 of SAE workflow: generate initial input/output hypotheses from Neuronpedia observations.",
+        description="Step 3 of SAE workflow: design hypothesis validation experiments.",
     )
     parser.add_argument("--model-id", default="gemma-2-2b", help="Neuronpedia model id")
     parser.add_argument("--layer-id", required=True, help="Layer id")
@@ -321,7 +261,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--generation-mode",
         choices=["single_call", "iterative"],
         default="single_call",
-        help="single_call: one call outputs n hypotheses; iterative: n calls output n hypotheses",
+        help="Generation mode used in initial hypothesis generation.",
+    )
+    parser.add_argument(
+        "--num-input-sentences-per-hypothesis",
+        type=int,
+        default=5,
+        help="For each input-side hypothesis, generate this many activation sentences.",
     )
     parser.add_argument("--width", default="16k", help="Neuronpedia source width")
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])
@@ -331,7 +277,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, read observation input from logs/{layer}_{feature}/{timestamp} instead of refetching from Neuronpedia.",
+        help="If set, reuse logs/{layer}_{feature}/{timestamp} intermediate JSON files instead of refetching.",
     )
     parser.add_argument("--neuronpedia-api-key", default=None)
     parser.add_argument("--neuronpedia-timeout", type=int, default=30)
@@ -350,15 +296,18 @@ if __name__ == "__main__":
     if args.reuse_from_logs:
         if args.timestamp is None:
             raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
-        observation_path = (
-            Path("logs")
-            / f"{args.layer_id}_{args.feature_id}"
-            / ts
-            / f"layer{args.layer_id}-feature{args.feature_id}-observation-input.json"
-        )
+        base_dir = Path("logs") / f"{args.layer_id}_{args.feature_id}" / ts
+        observation_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-observation-input.json"
+        initial_hypotheses_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-initial-hypotheses.json"
+
         if not observation_path.exists():
             raise FileNotFoundError(f"Cannot find observation input file: {observation_path}")
-        observation = json.loads(observation_path.read_text(encoding="utf-8"))
+        if not initial_hypotheses_path.exists():
+            raise FileNotFoundError(f"Cannot find initial hypotheses file: {initial_hypotheses_path}")
+
+        # Kept for workflow completeness: this is the step-1 parsed output structure.
+        _ = json.loads(observation_path.read_text(encoding="utf-8"))
+        initial_result = json.loads(initial_hypotheses_path.read_text(encoding="utf-8"))
     else:
         observation = fetch_and_parse_feature_observation(
             model_id=args.model_id,
@@ -372,15 +321,24 @@ if __name__ == "__main__":
             timeout=args.neuronpedia_timeout,
             timestamp=ts,
         )
+        initial_result = generate_initial_hypotheses(
+            observation=observation,
+            model_id=args.model_id,
+            layer_id=args.layer_id,
+            feature_id=args.feature_id,
+            num_hypothesis=args.num_hypothesis,
+            generation_mode=args.generation_mode,
+            timestamp=ts,
+            llm_base_url=args.llm_base_url,
+            llm_model=args.llm_model,
+            llm_api_key_file=args.llm_api_key_file,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+        )
 
-    result = generate_initial_hypotheses(
-        observation=observation,
-        model_id=args.model_id,
-        layer_id=args.layer_id,
-        feature_id=args.feature_id,
-        num_hypothesis=args.num_hypothesis,
-        generation_mode=args.generation_mode,
-        timestamp=ts,
+    result = generate_hypothesis_experiments(
+        initial_hypotheses_result=initial_result,
+        num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
         llm_base_url=args.llm_base_url,
         llm_model=args.llm_model,
         llm_api_key_file=args.llm_api_key_file,
