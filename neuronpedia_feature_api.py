@@ -30,11 +30,11 @@ def fetch_feature_json(
     resp.raise_for_status()
 
     payload = resp.json()
-    backup_dir = Path("./neuronpedia_return")
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    backup_path = backup_dir / f"feature_{model_id}_{source}_{feature_id}.json"
-    with backup_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+    # backup_dir = Path("./neuronpedia_return")
+    # backup_dir.mkdir(parents=True, exist_ok=True)
+    # backup_path = backup_dir / f"feature_{model_id}_{source}_{feature_id}.json"
+    # with backup_path.open("w", encoding="utf-8") as f:
+    #     json.dump(payload, f, indent=2, ensure_ascii=False)
 
     return payload
 
