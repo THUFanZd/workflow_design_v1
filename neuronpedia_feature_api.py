@@ -234,13 +234,14 @@ def convert_to_input_observation(parsed_result: Dict[str, Any]) -> Dict[str, Any
                 }
             )
 
-    return {
+    converted = {
         "input_side_observation": {
             "selected_count": input_side.get("selected_count", 0),
             "activation_examples": activation_examples,
         },
         "output_side_observation": output_side,
     }
+    return converted
 
 
 def fetch_and_parse_feature_observation(
@@ -328,7 +329,7 @@ def fetch_and_parse_feature_observation(
     with observation_input_path.open("w", encoding="utf-8") as f:
         json.dump(converted, f, indent=2, ensure_ascii=False)
 
-    return result
+    return converted
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
