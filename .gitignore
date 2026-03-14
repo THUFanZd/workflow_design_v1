@@ -1,0 +1,8 @@
+__pycache__/
+.uv-cache/
+.venv/
+outputs/
+*.pdf
+models/
+a.py
+logs/
