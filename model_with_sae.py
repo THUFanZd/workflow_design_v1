@@ -239,6 +239,15 @@ class ModelWithSAEModule:
                 "falling back to local forward-hook intervention."
             )
             self.use_hooked_transformer = False
+            # Important: when disabling hooked mode, ensure model API also switches
+            # from TransformerLens-style forward(...) to HF-style forward(input_ids=...).
+            if isinstance(self.model, HookedTransformer):
+                self.model = load_model(llm_name, self.device, use_hooked_transformer=False)
+                if self.model is None:
+                    raise RuntimeError(
+                        "Failed to reload HuggingFace model after disabling hooked mode. "
+                        "Please verify llm_name and environment dependencies."
+                    )
         if self.layer is None and not self.use_hooked_transformer:
             raise ValueError(
                 "sae_layer is required for non-hooked models when it cannot be inferred from sae_path."
