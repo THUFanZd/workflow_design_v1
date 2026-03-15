@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 from experiments_execution import execute_hypothesis_experiments
 from experiments_execution_output import KL_DIV_VALUES_DEFAULT
-from experiments_generation import generate_hypothesis_experiments
+from experiments_design import design_hypothesis_experiments
 from initial_hypothesis_generation import generate_initial_hypotheses
 from llm_api.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from llm_api.llm_api_info import base_url as DEFAULT_BASE_URL
@@ -797,8 +797,8 @@ if __name__ == "__main__":
             temperature=args.temperature,
             max_tokens=args.max_tokens,
         )
-        experiments_result = generate_hypothesis_experiments(
-            initial_hypotheses_result=initial_result,
+        experiments_result = design_hypothesis_experiments(
+            hypotheses_result=initial_result,
             num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,

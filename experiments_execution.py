@@ -11,7 +11,7 @@ from openai import OpenAI
 
 from experiments_execution_input import execute_input_side_experiments
 from experiments_execution_output import KL_DIV_VALUES_DEFAULT, execute_output_side_experiments
-from experiments_generation import generate_hypothesis_experiments
+from experiments_design import design_hypothesis_experiments
 from function import TokenUsageAccumulator, read_api_key
 from initial_hypothesis_generation import generate_initial_hypotheses
 from llm_api.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
@@ -410,8 +410,8 @@ if __name__ == "__main__":
             temperature=args.temperature,
             max_tokens=args.max_tokens,
         )
-        experiments_result = generate_hypothesis_experiments(
-            initial_hypotheses_result=initial_result,
+        experiments_result = design_hypothesis_experiments(
+            hypotheses_result=initial_result,
             num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,

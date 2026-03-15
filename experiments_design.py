@@ -55,7 +55,7 @@ def _parse_sentence_list(raw_output: str, expected_count: int) -> List[str]:
     return sentences[:expected_count]
 
 
-def _generate_experiments_for_side(
+def _design_experiments_for_side(
     *,
     side: SideType,
     hypotheses: Sequence[str],
@@ -169,9 +169,9 @@ def _write_markdown_log(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def generate_hypothesis_experiments(
+def design_hypothesis_experiments(
     *,
-    initial_hypotheses_result: Dict[str, Any],
+    hypotheses_result: Dict[str, Any],
     num_input_sentences_per_hypothesis: int,
     llm_base_url: str = DEFAULT_BASE_URL,
     llm_model: str = DEFAULT_MODEL_NAME,
@@ -179,12 +179,12 @@ def generate_hypothesis_experiments(
     temperature: float = 0.2,
     max_tokens: int = 1000,
 ) -> Dict[str, Any]:
-    model_id = initial_hypotheses_result.get("model_id", "unknown-model")
-    layer_id = str(initial_hypotheses_result["layer_id"])
-    feature_id = str(initial_hypotheses_result["feature_id"])
-    ts = str(initial_hypotheses_result["timestamp"])
-    input_hypotheses = list(initial_hypotheses_result["input_side_hypotheses"])
-    output_hypotheses = list(initial_hypotheses_result["output_side_hypotheses"])
+    model_id = hypotheses_result.get("model_id", "unknown-model")
+    layer_id = str(hypotheses_result["layer_id"])
+    feature_id = str(hypotheses_result["feature_id"])
+    ts = str(hypotheses_result["timestamp"])
+    input_hypotheses = list(hypotheses_result["input_side_hypotheses"])
+    output_hypotheses = list(hypotheses_result["output_side_hypotheses"])
     num_hypothesis = len(input_hypotheses)
 
     client = OpenAI(
@@ -194,7 +194,7 @@ def generate_hypothesis_experiments(
     token_counter = TokenUsageAccumulator()
     llm_calls: List[Dict[str, Any]] = []
 
-    input_sentences = _generate_experiments_for_side(
+    input_sentences = _design_experiments_for_side(
         side="input",
         hypotheses=input_hypotheses,
         num_sentences=num_input_sentences_per_hypothesis,
@@ -205,7 +205,7 @@ def generate_hypothesis_experiments(
         temperature=temperature,
         max_tokens=max_tokens,
     )
-    output_sentences = _generate_experiments_for_side(
+    output_sentences = _design_experiments_for_side(
         side="output",
         hypotheses=output_hypotheses,
         num_sentences=num_input_sentences_per_hypothesis,
@@ -226,7 +226,7 @@ def generate_hypothesis_experiments(
         "feature_id": feature_id,
         "timestamp": ts,
         "num_hypothesis": num_hypothesis,
-        "generation_mode": initial_hypotheses_result.get("generation_mode"),
+        "generation_mode": hypotheses_result.get("generation_mode"),
         "num_input_sentences_per_hypothesis": num_input_sentences_per_hypothesis,
         "llm_model": llm_model,
         "input_side_experiments": [
@@ -336,8 +336,8 @@ if __name__ == "__main__":
             max_tokens=args.max_tokens,
         )
 
-    result = generate_hypothesis_experiments(
-        initial_hypotheses_result=initial_result,
+    result = design_hypothesis_experiments(
+        hypotheses_result=initial_result,
         num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
         llm_base_url=args.llm_base_url,
         llm_model=args.llm_model,
