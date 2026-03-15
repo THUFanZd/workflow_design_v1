@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import random
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence
 
 from openai import OpenAI
 
-from function import TokenUsageAccumulator
+from function import TokenUsageAccumulator, call_llm
 from model_with_sae import ModelWithSAEModule
 from prompts.experiments_execution_prompt import build_output_judge_system_prompt, build_output_judge_user_prompt
 
@@ -96,130 +96,6 @@ def _extract_choice(judge_response: str, *, num_choices: int) -> int:
     raise ValueError(f"Could not parse a valid choice in [1, {num_choices}] from: {judge_response!r}")
 
 
-def _extract_text_from_message(message: Any) -> Tuple[str, str, Optional[Dict[str, Any]]]:
-    text = ""
-    content_type = "missing"
-    message_dump: Optional[Dict[str, Any]] = None
-
-    content = getattr(message, "content", None)
-    if isinstance(content, str):
-        return content.strip(), "content_str", None
-
-    if isinstance(content, list):
-        parts: List[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-                continue
-
-            if isinstance(item, dict):
-                maybe_text = item.get("text")
-                if isinstance(maybe_text, str):
-                    parts.append(maybe_text)
-                    continue
-                maybe_content = item.get("content")
-                if isinstance(maybe_content, str):
-                    parts.append(maybe_content)
-                    continue
-
-            maybe_text = getattr(item, "text", None)
-            if isinstance(maybe_text, str):
-                parts.append(maybe_text)
-                continue
-            maybe_content = getattr(item, "content", None)
-            if isinstance(maybe_content, str):
-                parts.append(maybe_content)
-                continue
-
-            if hasattr(item, "model_dump"):
-                try:
-                    item_dump = item.model_dump()
-                    if isinstance(item_dump, dict):
-                        if isinstance(item_dump.get("text"), str):
-                            parts.append(item_dump["text"])
-                        elif isinstance(item_dump.get("content"), str):
-                            parts.append(item_dump["content"])
-                except Exception:
-                    pass
-
-        joined = "".join(parts).strip()
-        if joined:
-            return joined, "content_list", None
-
-    reasoning_content = getattr(message, "reasoning_content", None)
-    if isinstance(reasoning_content, str) and reasoning_content.strip():
-        return reasoning_content.strip(), "reasoning_content_str", None
-
-    if hasattr(message, "model_dump"):
-        try:
-            message_dump = message.model_dump()
-            if isinstance(message_dump, dict):
-                for key in ("output_text", "text", "content", "reasoning_content"):
-                    value = message_dump.get(key)
-                    if isinstance(value, str) and value.strip():
-                        text = value.strip()
-                        content_type = f"message_dump_{key}"
-                        break
-        except Exception:
-            message_dump = None
-
-    return text, content_type, message_dump
-
-
-def _call_judge_non_stream(
-    *,
-    client: OpenAI,
-    llm_model: str,
-    messages: Sequence[Dict[str, str]],
-    temperature: float,
-    max_tokens: int,
-) -> tuple[str, Any, Dict[str, Any]]:
-    response = None
-    request_mode = "with_response_format_text"
-    request_error = None
-
-    try:
-        response = client.chat.completions.create(
-            model=llm_model,
-            messages=list(messages),
-            stream=False,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={"type": "text"},
-            extra_body={},
-        )
-    except Exception as exc:
-        request_mode = "fallback_without_response_format"
-        request_error = repr(exc)
-        response = client.chat.completions.create(
-            model=llm_model,
-            messages=list(messages),
-            stream=False,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-
-    text = ""
-    content_type = "missing"
-    finish_reason = None
-    message_dump = None
-
-    if getattr(response, "choices", None):
-        choice0 = response.choices[0]
-        finish_reason = getattr(choice0, "finish_reason", None)
-        message = choice0.message
-        text, content_type, message_dump = _extract_text_from_message(message)
-
-    debug_meta = {
-        "request_mode": request_mode,
-        "request_error": request_error,
-        "content_type": content_type,
-        "finish_reason": finish_reason,
-        "message_dump": message_dump,
-    }
-    return text, getattr(response, "usage", None), debug_meta
-
-
 def format_intervention_result(
     *,
     completions_by_kl: Dict[float, Sequence[str]],
@@ -276,12 +152,15 @@ def _run_single_blind_trial(
         {"role": "user", "content": user_prompt},
     ]
 
-    raw_output, usage_obj, response_debug = _call_judge_non_stream(
+    raw_output, usage_obj, response_debug = call_llm(
         client=client,
-        llm_model=llm_model,
+        model=llm_model,
         messages=messages,
         temperature=judge_temperature,
         max_tokens=judge_max_tokens,
+        stream=False,
+        response_format_text=True,
+        return_debug=True,
     )
     usage_counts = token_counter.add(usage_obj)
 
