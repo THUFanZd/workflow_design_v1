@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Sequence
 
 
-def build_input_activation_prompt(*, hypothesis: str, designed_sentences: Sequence[str]) -> str:
+def build_input_activation_context(*, hypothesis: str, designed_sentences: Sequence[str]) -> str:
     lines = []
     lines.append("Task background:")
     lines.append("You are validating an input-side SAE hypothesis.")

@@ -19,7 +19,7 @@ chat_completion_res = client.chat.completions.create(
     messages=[
         {
             "role": "user",
-            "content": "Hi there!",
+            "content": "Output 'Hello'",
         }
     ],
     stream=stream,

@@ -638,11 +638,11 @@ class ModelWithSAEModule:
             raise RuntimeError("No SAE loaded.")
 
         if "__sae_lens_obj__" in self.sae:
-            print('encoding with sae-lens')
+            # print('encoding with sae-lens')
             sae_obj = self.sae["__sae_lens_obj__"]
             return sae_obj.encode(residual)
         
-        print('encoding with local sae')
+        # print('encoding with local sae')
         w_enc = self.sae.get("W_enc")
         if w_enc is None:
             w_enc = self.sae.get("encoder.weight")
@@ -685,11 +685,11 @@ class ModelWithSAEModule:
             raise RuntimeError("No SAE loaded.")
 
         if "__sae_lens_obj__" in self.sae:
-            print('decoding with sae-lens')
+            # print('decoding with sae-lens')
             sae_obj = self.sae["__sae_lens_obj__"]
             return sae_obj.decode(features)
 
-        print('decoding with local sae')
+        # print('decoding with local sae')
         w_dec = self.sae.get("W_dec")
         if w_dec is None:
             w_dec = self.sae.get("decoder.weight")

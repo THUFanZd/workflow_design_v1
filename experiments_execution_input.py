@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Sequence
 
 from model_with_sae import ModelWithSAEModule
-from prompts.experiments_execution_prompt import build_input_activation_prompt
+from prompts.experiments_execution_prompt import build_input_activation_context
 
 
 def _extract_designed_sentences(experiment_item: Dict[str, Any]) -> List[str]:
@@ -76,7 +76,7 @@ def execute_input_side_experiments(
                 "hypothesis_index": hypothesis_index,
                 "hypothesis": hypothesis_text,
                 "designed_sentences": sentences,
-                "input_activation_prompt": build_input_activation_prompt(
+                "input_activation_context": build_input_activation_context(
                     hypothesis=hypothesis_text,
                     designed_sentences=sentences,
                 ),

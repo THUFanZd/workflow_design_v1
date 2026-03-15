@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -124,11 +124,10 @@ def _write_markdown_log(
         lines.append(f"- mean_summary_activation: {hypothesis_result['mean_summary_activation']}")
         lines.append(f"- max_summary_activation: {hypothesis_result['max_summary_activation']}")
         lines.append("")
-        lines.append("#### Input Activation Prompt")  # 输入端测例
+        lines.append("#### Input Activation Context")
         lines.append("```text")
-        lines.append(hypothesis_result["input_activation_prompt"])
+        lines.append(hypothesis_result["input_activation_context"])
         lines.append("```")
-        lines.append("")
         lines.append("| sentence_index | sentence | summary_activation | max_token | non_zero |")
         lines.append("| --- | --- | ---: | --- | --- |")
         for sentence_result in hypothesis_result["sentence_results"]:
@@ -213,7 +212,7 @@ def execute_hypothesis_experiments(
     output_max_new_tokens: int = 25,
     output_generation_temperature: float = 0.75,
     output_judge_temperature: float = 0.0,
-    output_judge_max_tokens: int = 512,
+    output_judge_max_tokens: int = 1024,
     output_kl_values: Sequence[float] = KL_DIV_VALUES_DEFAULT,
 ) -> Dict[str, Any]:
     model_id = str(experiments_result.get("model_id", "unknown-model"))
@@ -326,7 +325,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--llm-api-key-file", default=DEFAULT_API_KEY_FILE)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=100000)
+    parser.add_argument("--max-tokens", type=int, default=20000)
 
     parser.add_argument("--model-checkpoint-path", default="google/gemma-2-2b")
     parser.add_argument("--sae-path", default=None, help="SAE path or sae-lens URI")
@@ -350,7 +349,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-judge-trials", type=int, default=1)
     parser.add_argument("--output-judge-seed", type=int, default=42)
     parser.add_argument("--output-judge-temperature", type=float, default=0.0)
-    parser.add_argument("--output-judge-max-tokens", type=int, default=512)
+    parser.add_argument("--output-judge-max-tokens", type=int, default=10000)
     parser.add_argument("--output-kl-values", type=float, nargs="*", default=KL_DIV_VALUES_DEFAULT)
     parser.add_argument(
         "--control-result-files",
