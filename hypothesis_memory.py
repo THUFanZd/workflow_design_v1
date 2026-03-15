@@ -292,6 +292,7 @@ def build_hypothesis_memory(
     experiments_result: Dict[str, Any],
     execution_result: Dict[str, Any],
     hypothesis_reasons: Optional[Dict[str, Any]] = None,
+    round_index: int = 1,
     round_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     model_id = _clean_text(
@@ -417,7 +418,7 @@ def build_hypothesis_memory(
             lookup_by_key[key] = item
 
     return {
-        "memory_version": "v1",
+        "round_index": _safe_int(round_index, 1),
         "round_id": _clean_text(round_id) or ts,
         "model_id": model_id,
         "layer_id": layer_id,
@@ -453,7 +454,7 @@ def write_hypothesis_memory_markdown(path: Path, *, memory: Dict[str, Any]) -> N
     lines.append("# SAE Hypothesis Memory")
     lines.append("")
     lines.append("## Metadata")
-    lines.append(f"- memory_version: {memory.get('memory_version', '')}")
+    lines.append(f"- round_index: {memory.get('round_index', 1)}")
     lines.append(f"- round_id: {memory.get('round_id', '')}")
     lines.append(f"- model_id: {memory.get('model_id', '')}")
     lines.append(f"- layer_id: {memory.get('layer_id', '')}")
@@ -666,6 +667,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
     parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument("--round-index", type=int, default=1, help="Round index used as memory anchor.")
     parser.add_argument("--round-id", default=None, help="Optional explicit round id for the memory record.")
     parser.add_argument(
         "--reuse-from-logs",
@@ -846,6 +848,7 @@ if __name__ == "__main__":
         experiments_result=experiments_result,
         execution_result=execution_result,
         hypothesis_reasons=reasons,
+        round_index=args.round_index,
         round_id=args.round_id,
     )
 
@@ -867,6 +870,7 @@ if __name__ == "__main__":
                 "memory_json_path": str(memory_json_path),
                 "memory_md_path": str(memory_md_path),
                 "round_id": memory.get("round_id", ""),
+                "round_index": memory.get("round_index", 1),
                 "hypothesis_counts": {
                     "input": len(get_side_hypothesis_memories(memory, side="input")),
                     "output": len(get_side_hypothesis_memories(memory, side="output")),
