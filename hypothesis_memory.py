@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 from experiments_execution import execute_hypothesis_experiments
 from experiments_execution_output import KL_DIV_VALUES_DEFAULT
 from experiments_design import design_hypothesis_experiments
+from function import build_round_dir, normalize_round_id
 from initial_hypothesis_generation import generate_initial_hypotheses
 from llm_api.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from llm_api.llm_api_info import base_url as DEFAULT_BASE_URL
@@ -317,6 +318,7 @@ def build_hypothesis_memory(
         or initial_hypotheses_result.get("timestamp")
         or datetime.now().strftime("%Y%m%d_%H%M%S")
     )
+    resolved_round_id = normalize_round_id(round_id, round_index=round_index)
 
     reasons = _resolve_reason_map(
         initial_hypotheses_result=initial_hypotheses_result,
@@ -419,7 +421,7 @@ def build_hypothesis_memory(
 
     return {
         "round_index": _safe_int(round_index, 1),
-        "round_id": _clean_text(round_id) or ts,
+        "round_id": resolved_round_id,
         "model_id": model_id,
         "layer_id": layer_id,
         "feature_id": feature_id,
@@ -634,8 +636,10 @@ def _load_from_logs(
     layer_id: str,
     feature_id: str,
     timestamp: str,
+    round_id: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-    base_dir = Path("logs") / f"{layer_id}_{feature_id}" / timestamp
+    resolved_round_id = normalize_round_id(round_id, round_index=1)
+    base_dir = Path("logs") / f"{layer_id}_{feature_id}" / timestamp / resolved_round_id
     initial_path = base_dir / f"layer{layer_id}-feature{feature_id}-initial-hypotheses.json"
     experiments_path = base_dir / f"layer{layer_id}-feature{feature_id}-experiments.json"
     execution_path = base_dir / f"layer{layer_id}-feature{feature_id}-experiments-execution.json"
@@ -672,7 +676,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, reuse logs/{layer}_{feature}/{timestamp} intermediate JSON files.",
+        help="If set, reuse logs/{layer}_{feature}/{timestamp}/{round_id} intermediate JSON files.",
     )
     parser.add_argument(
         "--initial-hypotheses-json-path",
@@ -741,14 +745,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
     ts = args.timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_round_id = normalize_round_id(args.round_id, round_index=args.round_index)
 
     if args.execution_json_path:
         execution_result = _load_json(Path(args.execution_json_path))
         layer_id = _clean_text(execution_result.get("layer_id") or args.layer_id)
         feature_id = _clean_text(execution_result.get("feature_id") or args.feature_id)
         ts = _clean_text(execution_result.get("timestamp") or ts)
+        resolved_round_id = normalize_round_id(
+            _clean_text(execution_result.get("round_id")) or target_round_id,
+            round_index=args.round_index,
+        )
 
-        default_base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts
+        default_base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts / resolved_round_id
         initial_path = (
             Path(args.initial_hypotheses_json_path)
             if args.initial_hypotheses_json_path
@@ -769,6 +778,7 @@ if __name__ == "__main__":
             layer_id=args.layer_id,
             feature_id=args.feature_id,
             timestamp=ts,
+            round_id=target_round_id,
         )
     else:
         observation = fetch_and_parse_feature_observation(
@@ -782,6 +792,7 @@ if __name__ == "__main__":
             api_key=args.neuronpedia_api_key,
             timeout=args.neuronpedia_timeout,
             timestamp=ts,
+            round_id=target_round_id,
         )
         initial_result = generate_initial_hypotheses(
             observation=observation,
@@ -791,6 +802,7 @@ if __name__ == "__main__":
             num_hypothesis=args.num_hypothesis,
             generation_mode=args.generation_mode,
             timestamp=ts,
+            round_id=target_round_id,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,
             llm_api_key_file=args.llm_api_key_file,
@@ -800,6 +812,7 @@ if __name__ == "__main__":
         experiments_result = design_hypothesis_experiments(
             hypotheses_result=initial_result,
             num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
+            round_id=target_round_id,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,
             llm_api_key_file=args.llm_api_key_file,
@@ -828,6 +841,7 @@ if __name__ == "__main__":
             experiments_result=experiments_result,
             module=module,
             control_results=control_results,
+            round_id=target_round_id,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,
             llm_api_key_file=args.llm_api_key_file,
@@ -849,13 +863,23 @@ if __name__ == "__main__":
         execution_result=execution_result,
         hypothesis_reasons=reasons,
         round_index=args.round_index,
-        round_id=args.round_id,
+        round_id=target_round_id,
     )
 
     layer_id = _clean_text(memory.get("layer_id"))
     feature_id = _clean_text(memory.get("feature_id"))
     ts = _clean_text(memory.get("timestamp"))
-    base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts
+    memory_round_id = normalize_round_id(
+        _clean_text(memory.get("round_id")),
+        round_index=_safe_int(memory.get("round_index"), args.round_index),
+    )
+    base_dir = build_round_dir(
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=ts,
+        round_id=memory_round_id,
+        round_index=_safe_int(memory.get("round_index"), args.round_index),
+    )
     base_dir.mkdir(parents=True, exist_ok=True)
 
     memory_json_path = base_dir / f"layer{layer_id}-feature{feature_id}-memory.json"

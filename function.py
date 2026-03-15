@@ -42,6 +42,27 @@ def extract_usage_counts(usage: Any) -> Dict[str, int]:
     }
 
 
+def normalize_round_id(round_id: Optional[str], *, round_index: Optional[int] = None) -> str:
+    text = str(round_id).strip() if round_id is not None else ""
+    if text:
+        return text
+    if round_index is not None:
+        return f"round_{int(round_index)}"
+    return "round_1"
+
+
+def build_round_dir(
+    *,
+    layer_id: str,
+    feature_id: str,
+    timestamp: str,
+    round_id: Optional[str] = None,
+    round_index: Optional[int] = None,
+) -> Path:
+    resolved_round_id = normalize_round_id(round_id, round_index=round_index)
+    return Path("logs") / f"{layer_id}_{feature_id}" / str(timestamp) / resolved_round_id
+
+
 @dataclass
 class TokenUsageAccumulator:
     prompt_tokens: int = 0

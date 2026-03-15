@@ -9,7 +9,14 @@ from typing import Any, Dict, List, Literal, Optional, Sequence
 
 from openai import OpenAI
 
-from function import TokenUsageAccumulator, call_llm_stream, extract_json_object, read_api_key
+from function import (
+    TokenUsageAccumulator,
+    build_round_dir,
+    call_llm_stream,
+    extract_json_object,
+    normalize_round_id,
+    read_api_key,
+)
 from initial_hypothesis_generation import GenerationMode, generate_initial_hypotheses
 from llm_api.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from llm_api.llm_api_info import base_url as DEFAULT_BASE_URL
@@ -118,6 +125,8 @@ def _write_markdown_log(
     lines.append(f"- layer_id: {result['layer_id']}")
     lines.append(f"- feature_id: {result['feature_id']}")
     lines.append(f"- timestamp: {result['timestamp']}")
+    if "round_id" in result:
+        lines.append(f"- round_id: {result['round_id']}")
     lines.append(f"- num_hypothesis: {result['num_hypothesis']}")
     lines.append(f"- num_input_sentences_per_hypothesis: {result['num_input_sentences_per_hypothesis']}")
     lines.append(f"- llm_model: {result['llm_model']}")
@@ -173,6 +182,7 @@ def design_hypothesis_experiments(
     *,
     hypotheses_result: Dict[str, Any],
     num_input_sentences_per_hypothesis: int,
+    round_id: Optional[str] = None,
     llm_base_url: str = DEFAULT_BASE_URL,
     llm_model: str = DEFAULT_MODEL_NAME,
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
@@ -183,6 +193,10 @@ def design_hypothesis_experiments(
     layer_id = str(hypotheses_result["layer_id"])
     feature_id = str(hypotheses_result["feature_id"])
     ts = str(hypotheses_result["timestamp"])
+    resolved_round_id = normalize_round_id(
+        round_id or str(hypotheses_result.get("round_id", "")).strip() or None,
+        round_index=1,
+    )
     input_hypotheses = list(hypotheses_result["input_side_hypotheses"])
     output_hypotheses = list(hypotheses_result["output_side_hypotheses"])
     num_hypothesis = len(input_hypotheses)
@@ -217,7 +231,13 @@ def design_hypothesis_experiments(
         max_tokens=max_tokens,
     )
 
-    base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts
+    base_dir = build_round_dir(
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=ts,
+        round_id=resolved_round_id,
+        round_index=1,
+    )
     base_dir.mkdir(parents=True, exist_ok=True)
 
     result: Dict[str, Any] = {
@@ -225,6 +245,7 @@ def design_hypothesis_experiments(
         "layer_id": layer_id,
         "feature_id": feature_id,
         "timestamp": ts,
+        "round_id": resolved_round_id,
         "num_hypothesis": num_hypothesis,
         "generation_mode": hypotheses_result.get("generation_mode"),
         "num_input_sentences_per_hypothesis": num_input_sentences_per_hypothesis,
@@ -274,10 +295,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
     parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument("--round-id", default=None, help="Round directory under timestamp, e.g. round_1")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, reuse logs/{layer}_{feature}/{timestamp} intermediate JSON files instead of refetching.",
+        help="If set, reuse logs/{layer}_{feature}/{timestamp}/{round_id} intermediate JSON files instead of refetching.",
     )
     parser.add_argument("--neuronpedia-api-key", default=None)
     parser.add_argument("--neuronpedia-timeout", type=int, default=30)
@@ -296,7 +318,13 @@ if __name__ == "__main__":
     if args.reuse_from_logs:
         if args.timestamp is None:
             raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
-        base_dir = Path("logs") / f"{args.layer_id}_{args.feature_id}" / ts
+        resolved_round_id = normalize_round_id(args.round_id, round_index=1)
+        base_dir = (
+            Path("logs")
+            / f"{args.layer_id}_{args.feature_id}"
+            / ts
+            / resolved_round_id
+        )
         observation_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-observation-input.json"
         initial_hypotheses_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-initial-hypotheses.json"
 
@@ -320,6 +348,7 @@ if __name__ == "__main__":
             api_key=args.neuronpedia_api_key,
             timeout=args.neuronpedia_timeout,
             timestamp=ts,
+            round_id=args.round_id,
         )
         initial_result = generate_initial_hypotheses(
             observation=observation,
@@ -329,6 +358,7 @@ if __name__ == "__main__":
             num_hypothesis=args.num_hypothesis,
             generation_mode=args.generation_mode,
             timestamp=ts,
+            round_id=args.round_id,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,
             llm_api_key_file=args.llm_api_key_file,
@@ -339,6 +369,7 @@ if __name__ == "__main__":
     result = design_hypothesis_experiments(
         hypotheses_result=initial_result,
         num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
+        round_id=args.round_id,
         llm_base_url=args.llm_base_url,
         llm_model=args.llm_model,
         llm_api_key_file=args.llm_api_key_file,

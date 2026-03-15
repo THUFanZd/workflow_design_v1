@@ -12,7 +12,7 @@ from openai import OpenAI
 from experiments_execution_input import execute_input_side_experiments
 from experiments_execution_output import KL_DIV_VALUES_DEFAULT, execute_output_side_experiments
 from experiments_design import design_hypothesis_experiments
-from function import TokenUsageAccumulator, read_api_key
+from function import TokenUsageAccumulator, build_round_dir, normalize_round_id, read_api_key
 from initial_hypothesis_generation import generate_initial_hypotheses
 from llm_api.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from llm_api.llm_api_info import base_url as DEFAULT_BASE_URL
@@ -103,6 +103,8 @@ def _write_markdown_log(
     lines.append(f"- layer_id: {result['layer_id']}")
     lines.append(f"- feature_id: {result['feature_id']}")
     lines.append(f"- timestamp: {result['timestamp']}")
+    if "round_id" in result:
+        lines.append(f"- round_id: {result['round_id']}")
     lines.append(f"- output_judge_llm_model: {result['output_judge_llm_model']}")
     lines.append("")
     lines.append("## Token Usage (Output-side Blind Judge)")
@@ -202,6 +204,7 @@ def execute_hypothesis_experiments(
     experiments_result: Dict[str, Any],
     module: ModelWithSAEModule,
     control_results: Sequence[str],
+    round_id: Optional[str] = None,
     llm_base_url: str = DEFAULT_BASE_URL,
     llm_model: str = DEFAULT_MODEL_NAME,
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
@@ -219,6 +222,10 @@ def execute_hypothesis_experiments(
     layer_id = str(experiments_result["layer_id"])
     feature_id = str(experiments_result["feature_id"])
     ts = str(experiments_result["timestamp"])
+    resolved_round_id = normalize_round_id(
+        round_id or str(experiments_result.get("round_id", "")).strip() or None,
+        round_index=1,
+    )
     input_side_experiments = list(experiments_result.get("input_side_experiments", []))
     output_side_experiments = list(experiments_result.get("output_side_experiments", []))
 
@@ -267,6 +274,7 @@ def execute_hypothesis_experiments(
         "layer_id": layer_id,
         "feature_id": feature_id,
         "timestamp": ts,
+        "round_id": resolved_round_id,
         "output_judge_llm_model": llm_model,
         "input_side_execution": input_side_execution,
         "output_side_execution": output_side_execution,
@@ -274,7 +282,13 @@ def execute_hypothesis_experiments(
         "llm_calls": llm_calls,
     }
 
-    base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts
+    base_dir = build_round_dir(
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=ts,
+        round_id=resolved_round_id,
+        round_index=1,
+    )
     base_dir.mkdir(parents=True, exist_ok=True)
     result_json_path = base_dir / f"layer{layer_id}-feature{feature_id}-experiments-execution.json"
     result_json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -309,10 +323,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
     parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument("--round-id", default=None, help="Round directory under timestamp, e.g. round_1")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, reuse logs/{layer}_{feature}/{timestamp} intermediate JSON files instead of refetching.",
+        help="If set, reuse logs/{layer}_{feature}/{timestamp}/{round_id} intermediate JSON files instead of refetching.",
     )
     parser.add_argument(
         "--experiments-json-path",
@@ -374,10 +389,12 @@ if __name__ == "__main__":
     elif args.reuse_from_logs:
         if args.timestamp is None:
             raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
+        resolved_round_id = normalize_round_id(args.round_id, round_index=1)
         experiments_path = (
             Path("logs")
             / f"{args.layer_id}_{args.feature_id}"
             / ts
+            / resolved_round_id
             / f"layer{args.layer_id}-feature{args.feature_id}-experiments.json"
         )
         if not experiments_path.exists():
@@ -395,6 +412,7 @@ if __name__ == "__main__":
             api_key=args.neuronpedia_api_key,
             timeout=args.neuronpedia_timeout,
             timestamp=ts,
+            round_id=args.round_id,
         )
         initial_result = generate_initial_hypotheses(
             observation=observation,
@@ -404,6 +422,7 @@ if __name__ == "__main__":
             num_hypothesis=args.num_hypothesis,
             generation_mode=args.generation_mode,
             timestamp=ts,
+            round_id=args.round_id,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,
             llm_api_key_file=args.llm_api_key_file,
@@ -413,6 +432,7 @@ if __name__ == "__main__":
         experiments_result = design_hypothesis_experiments(
             hypotheses_result=initial_result,
             num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
+            round_id=args.round_id,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,
             llm_api_key_file=args.llm_api_key_file,
@@ -443,6 +463,7 @@ if __name__ == "__main__":
         experiments_result=experiments_result,
         module=module,
         control_results=control_results,
+        round_id=args.round_id,
         llm_base_url=args.llm_base_url,
         llm_model=args.llm_model,
         llm_api_key_file=args.llm_api_key_file,

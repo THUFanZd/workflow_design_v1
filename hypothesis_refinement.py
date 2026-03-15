@@ -10,7 +10,14 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 from openai import OpenAI
 
-from function import TokenUsageAccumulator, call_llm, extract_json_object, read_api_key
+from function import (
+    TokenUsageAccumulator,
+    build_round_dir,
+    call_llm,
+    extract_json_object,
+    normalize_round_id,
+    read_api_key,
+)
 from llm_api.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from llm_api.llm_api_info import base_url as DEFAULT_BASE_URL
 from llm_api.llm_api_info import model_name as DEFAULT_MODEL_NAME
@@ -447,6 +454,8 @@ def _write_refinement_markdown(
     lines.append(f"- layer_id: {result['layer_id']}")
     lines.append(f"- feature_id: {result['feature_id']}")
     lines.append(f"- timestamp: {result['timestamp']}")
+    if "round_id" in result:
+        lines.append(f"- round_id: {result['round_id']}")
     lines.append(f"- top_m: {result['top_m']}")
     lines.append(f"- history_rounds: {result['history_rounds']}")
     lines.append(f"- history_scope: {result['history_scope']}")
@@ -547,6 +556,7 @@ def refine_hypotheses(
     top_m: int = 3,
     history_scope: HistoryScope = "same_hypothesis",
     timestamp: Optional[str] = None,
+    round_id: Optional[str] = None,
     llm_base_url: str = DEFAULT_BASE_URL,
     llm_model: str = DEFAULT_MODEL_NAME,
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
@@ -554,6 +564,11 @@ def refine_hypotheses(
     max_tokens: int = 2000,
 ) -> Dict[str, Any]:
     ts = timestamp or _clean_text(current_memory.get("timestamp")) or datetime.now().strftime("%Y%m%d_%H%M%S")
+    round_index = _safe_int(current_memory.get("round_index"), 1)
+    resolved_round_id = normalize_round_id(
+        round_id or _clean_text(current_memory.get("round_id")) or None,
+        round_index=round_index,
+    )
     client = OpenAI(
         base_url=llm_base_url,
         api_key=read_api_key(llm_api_key_file),
@@ -596,6 +611,7 @@ def refine_hypotheses(
         "layer_id": layer_id,
         "feature_id": feature_id,
         "timestamp": ts,
+        "round_id": resolved_round_id,
         "top_m": top_m,
         "history_rounds": len(historical_memories),
         "history_scope": history_scope,
@@ -615,7 +631,13 @@ def refine_hypotheses(
         "token_usage": token_counter.as_dict(),
     }
 
-    base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts
+    base_dir = build_round_dir(
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=ts,
+        round_id=resolved_round_id,
+        round_index=round_index,
+    )
     base_dir.mkdir(parents=True, exist_ok=True)
 
     result_json_path = base_dir / f"layer{layer_id}-feature{feature_id}-refined-hypotheses.json"
@@ -631,6 +653,7 @@ def _load_historical_memories(
     layer_id: str,
     feature_id: str,
     current_timestamp: str,
+    current_round_id: Optional[str],
     history_rounds: int,
 ) -> List[Dict[str, Any]]:
     if history_rounds <= 0:
@@ -640,18 +663,35 @@ def _load_historical_memories(
     if not feature_dir.exists():
         return []
 
-    timestamps = sorted(
-        [path.name for path in feature_dir.iterdir() if path.is_dir() and path.name != current_timestamp],
-        reverse=True,
-    )
-    selected = timestamps[:history_rounds]
-    selected.sort()
+    current_round = normalize_round_id(current_round_id, round_index=1)
+    memory_entries: List[Tuple[str, str, Path]] = []
+    for ts_dir in feature_dir.iterdir():
+        if not ts_dir.is_dir():
+            continue
+
+        # Preferred new layout: logs/{layer}_{feature}/{timestamp}/{round_id}/...
+        for round_dir in ts_dir.iterdir():
+            if not round_dir.is_dir():
+                continue
+            memory_path = round_dir / f"layer{layer_id}-feature{feature_id}-memory.json"
+            if memory_path.exists():
+                memory_entries.append((ts_dir.name, round_dir.name, memory_path))
+
+        # Backward-compatible legacy layout.
+        legacy_memory_path = ts_dir / f"layer{layer_id}-feature{feature_id}-memory.json"
+        if legacy_memory_path.exists():
+            memory_entries.append((ts_dir.name, "", legacy_memory_path))
+
+    filtered = [
+        item
+        for item in memory_entries
+        if not (item[0] == current_timestamp and item[1] == current_round)
+    ]
+    filtered.sort(key=lambda item: (item[0], item[1]))
+    selected = filtered[-history_rounds:]
 
     histories: List[Dict[str, Any]] = []
-    for ts in selected:
-        memory_path = feature_dir / ts / f"layer{layer_id}-feature{feature_id}-memory.json"
-        if not memory_path.exists():
-            continue
+    for _, _, memory_path in selected:
         payload = _load_json(memory_path)
         histories.append(payload)
     return histories
@@ -666,10 +706,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layer-id", required=True, help="Layer id")
     parser.add_argument("--feature-id", required=True, help="Feature id")
     parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument("--round-id", default=None, help="Round directory under timestamp, e.g. round_1")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, reuse existing logs/{layer}_{feature}/{timestamp} files for initial/experiments/execution/memory.",
+        help="If set, reuse existing logs/{layer}_{feature}/{timestamp}/{round_id} files for initial/experiments/execution/memory.",
     )
     parser.add_argument("--history-rounds", type=int, default=1, help="Use previous n rounds as historical memory.")
     parser.add_argument(
@@ -748,6 +789,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
     ts = args.timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    target_round_id = normalize_round_id(args.round_id, round_index=1)
 
     initial_result: Dict[str, Any]
     experiments_result: Dict[str, Any]
@@ -760,8 +802,13 @@ if __name__ == "__main__":
         layer_id = _clean_text(memory.get("layer_id") or args.layer_id)
         feature_id = _clean_text(memory.get("feature_id") or args.feature_id)
         ts = _clean_text(memory.get("timestamp") or ts)
+        memory_round_index = _safe_int(memory.get("round_index"), 1)
+        memory_round_id = normalize_round_id(
+            _clean_text(memory.get("round_id")) or target_round_id,
+            round_index=memory_round_index,
+        )
 
-        default_base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts
+        default_base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts / memory_round_id
         execution_path = (
             Path(args.execution_json_path)
             if args.execution_json_path
@@ -785,7 +832,8 @@ if __name__ == "__main__":
         if args.timestamp is None:
             raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
 
-        base_dir = Path("logs") / f"{args.layer_id}_{args.feature_id}" / ts
+        resolved_round_id = normalize_round_id(args.round_id, round_index=1)
+        base_dir = Path("logs") / f"{args.layer_id}_{args.feature_id}" / ts / resolved_round_id
         initial_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-initial-hypotheses.json"
         experiments_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-experiments.json"
         execution_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-experiments-execution.json"
@@ -805,7 +853,7 @@ if __name__ == "__main__":
                 experiments_result=experiments_result,
                 execution_result=execution_result,
                 round_index=1,
-                round_id=ts,
+                round_id=resolved_round_id,
             )
             memory_path.write_text(json.dumps(memory, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     else:
@@ -827,6 +875,7 @@ if __name__ == "__main__":
             api_key=args.neuronpedia_api_key,
             timeout=args.neuronpedia_timeout,
             timestamp=ts,
+            round_id=target_round_id,
         )
         initial_result = generate_initial_hypotheses(
             observation=observation,
@@ -836,6 +885,7 @@ if __name__ == "__main__":
             num_hypothesis=args.num_hypothesis,
             generation_mode=args.generation_mode,
             timestamp=ts,
+            round_id=target_round_id,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,
             llm_api_key_file=args.llm_api_key_file,
@@ -845,6 +895,7 @@ if __name__ == "__main__":
         experiments_result = design_hypothesis_experiments(
             hypotheses_result=initial_result,
             num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
+            round_id=target_round_id,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,
             llm_api_key_file=args.llm_api_key_file,
@@ -873,6 +924,7 @@ if __name__ == "__main__":
             experiments_result=experiments_result,
             module=module,
             control_results=control_results,
+            round_id=target_round_id,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,
             llm_api_key_file=args.llm_api_key_file,
@@ -891,15 +943,26 @@ if __name__ == "__main__":
             experiments_result=experiments_result,
             execution_result=execution_result,
             round_index=1,
-            round_id=ts,
+            round_id=target_round_id,
         )
 
     layer_id = _clean_text(memory.get("layer_id") or args.layer_id)
     feature_id = _clean_text(memory.get("feature_id") or args.feature_id)
     ts = _clean_text(memory.get("timestamp") or ts)
     model_id = _clean_text(memory.get("model_id") or args.model_id)
+    memory_round_index = _safe_int(memory.get("round_index"), 1)
+    memory_round_id = normalize_round_id(
+        _clean_text(memory.get("round_id")) or target_round_id,
+        round_index=memory_round_index,
+    )
 
-    base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts
+    base_dir = build_round_dir(
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=ts,
+        round_id=memory_round_id,
+        round_index=memory_round_index,
+    )
     base_dir.mkdir(parents=True, exist_ok=True)
 
     memory_json_path = base_dir / f"layer{layer_id}-feature{feature_id}-memory.json"
@@ -911,6 +974,7 @@ if __name__ == "__main__":
         layer_id=layer_id,
         feature_id=feature_id,
         current_timestamp=ts,
+        current_round_id=memory_round_id,
         history_rounds=max(args.history_rounds, 0),
     )
 
@@ -924,6 +988,7 @@ if __name__ == "__main__":
         top_m=args.top_m,
         history_scope=args.history_scope,
         timestamp=ts,
+        round_id=memory_round_id,
         llm_base_url=args.llm_base_url,
         llm_model=args.llm_model,
         llm_api_key_file=args.llm_api_key_file,

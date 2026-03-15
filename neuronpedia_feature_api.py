@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from function import build_round_dir, normalize_round_id
+
 BASE_URL = "https://www.neuronpedia.org"
 
 
@@ -255,6 +257,7 @@ def fetch_and_parse_feature_observation(
     api_key: Optional[str] = None,
     timeout: int = 30,
     timestamp: Optional[str] = None,
+    round_id: Optional[str] = "round_0",
 ) -> Dict[str, Any]:
     """
     Fetch a feature JSON from Neuronpedia, store raw payload, parse observations, and save parsed result.
@@ -273,7 +276,14 @@ def fetch_and_parse_feature_observation(
     )
 
     ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts
+    resolved_round_id = normalize_round_id(round_id, round_index=0)
+    base_dir = build_round_dir(
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=ts,
+        round_id=resolved_round_id,
+        round_index=0,
+    )
     base_dir.mkdir(parents=True, exist_ok=True)
 
     raw_path = base_dir / f"layer{layer_id}-feature{feature_id}-neuronpedia-raw.json"
@@ -309,6 +319,8 @@ def fetch_and_parse_feature_observation(
     result: Dict[str, Any] = {
         "layer_id": layer_id,
         "feature_id": feature_id,
+        "timestamp": ts,
+        "round_id": resolved_round_id,
         "input_side_observation": {
             "selection_method": selection_method,
             "m": m,
@@ -344,6 +356,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--neuronpedia-api-key", default=None)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--timestamp", default=None, help="Optional custom timestamp folder name")
+    parser.add_argument("--round-id", default="round_0", help="Round directory under timestamp, e.g. round_0")
     return parser
 
 
@@ -360,6 +373,7 @@ if __name__ == "__main__":
         api_key=args.neuronpedia_api_key,
         timeout=args.timeout,
         timestamp=args.timestamp,
+        round_id=args.round_id,
     )
     print(
         json.dumps(
