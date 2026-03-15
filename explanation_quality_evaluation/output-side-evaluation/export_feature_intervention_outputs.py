@@ -170,7 +170,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run output-side SAE feature intervention and export results into md/txt files "
-            "under explanation_quality_evaluation/output-side-evaluation/{SAE}/layer-{layer}/feature-{id}."
+            "under explanation_quality_evaluation/output-side-evaluation/outputs/{SAE}/layer-{layer}/feature-{id}."
         )
     )
     parser.add_argument("--layer-id", required=True, help="SAE layer id")
@@ -213,7 +213,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output-root",
-        default=str(PROJECT_ROOT / "explanation_quality_evaluation" / "output-side-evaluation"),
+        default=str(PROJECT_ROOT / "explanation_quality_evaluation" / "output-side-evaluation" / "outputs"),
         help="Root output directory",
     )
     parser.add_argument("--txt-filename", default="intervention_output.txt")

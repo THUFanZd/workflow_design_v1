@@ -120,7 +120,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
         "--output-root",
-        default=str(PROJECT_ROOT / "explanation_quality_evaluation" / "output-side-evaluation"),
+        default=str(PROJECT_ROOT / "explanation_quality_evaluation" / "output-side-evaluation" / "outputs"),
     )
     parser.add_argument("--fail-fast", action="store_true", help="Stop immediately when one job fails.")
     parser.add_argument(
