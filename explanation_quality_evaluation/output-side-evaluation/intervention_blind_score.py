@@ -94,8 +94,17 @@ def _resolve_api_key(api_key: Optional[str], api_key_file: Optional[str]) -> Opt
     return None
 
 
-def _resolve_target_dir(*, output_root: Path, sae_name: str, layer_id: str, feature_id: int) -> Path:
+def _resolve_target_dir(
+    *,
+    output_root: Path,
+    sae_name: str,
+    layer_id: str,
+    feature_id: int,
+    timestamp: Optional[str] = None,
+) -> Path:
     target_dir = output_root / sae_name / f"layer-{layer_id}" / f"feature-{feature_id}"
+    if timestamp and str(timestamp).strip():
+        target_dir = target_dir / str(timestamp).strip()
     target_dir.mkdir(parents=True, exist_ok=True)
     return target_dir
 
@@ -317,6 +326,7 @@ def _write_markdown(path: Path, *, payload: Dict[str, Any]) -> None:
     metadata = payload.get("metadata", {})
     score = payload.get("score", {})
     trials = score.get("trial_results", [])
+    llm_calls = payload.get("llm_calls", [])
 
     lines: List[str] = []
     lines.append("# Output-side Blind Evaluation")
@@ -358,6 +368,33 @@ def _write_markdown(path: Path, *, payload: Dict[str, Any]) -> None:
             f"| {trial.get('trial_index')} | {trial.get('correct_choice')} | {trial.get('chosen_choice')} | {trial.get('success')} |"
         )
     lines.append("")
+    lines.append("## LLM Call IO")
+    if not isinstance(llm_calls, list) or not llm_calls:
+        lines.append("- No LLM call records.")
+        lines.append("")
+    else:
+        for call in llm_calls:
+            if not isinstance(call, dict):
+                continue
+            lines.append(f"### Trial {call.get('trial_index')}")
+            lines.append(f"- correct_choice: {call.get('correct_choice')}")
+            lines.append(f"- chosen_choice: {call.get('chosen_choice')}")
+            lines.append(f"- success: {call.get('success')}")
+            lines.append("#### Messages")
+            messages = call.get("messages", [])
+            if isinstance(messages, list):
+                for msg in messages:
+                    if not isinstance(msg, dict):
+                        continue
+                    lines.append(f"- role: {msg.get('role')}")
+                    lines.append("```text")
+                    lines.append(str(msg.get("content", "")))
+                    lines.append("```")
+            lines.append("#### Raw Output")
+            lines.append("```text")
+            lines.append(str(call.get("raw_output", "")))
+            lines.append("```")
+            lines.append("")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -367,6 +404,7 @@ def evaluate_intervention_blind(
     feature_id: int,
     sae_name: str,
     output_root: Path,
+    timestamp: Optional[str],
     explanation: Optional[str],
     intervention_result_text: Optional[str],
     intervention_result_path: Optional[Path],
@@ -401,6 +439,7 @@ def evaluate_intervention_blind(
         sae_name=sae_name,
         layer_id=layer_id,
         feature_id=feature_id,
+        timestamp=timestamp,
     )
     resolved_intervention_path: Optional[Path] = intervention_result_path
     resolved_intervention_text = intervention_result_text.strip() if intervention_result_text else ""
@@ -527,6 +566,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", default="16k", help="SAE width")
     parser.add_argument("--sae-name", default="gemmascope-res")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
+    parser.add_argument("--timestamp", default=None, help="Optional timestamp subdirectory under feature path.")
     parser.add_argument("--json-filename", default="intervention_blind_score.json")
     parser.add_argument("--md-filename", default="intervention_blind_score.md")
 
@@ -593,6 +633,7 @@ def main() -> None:
         feature_id=int(args.feature_id),
         sae_name=str(args.sae_name),
         output_root=Path(args.output_root),
+        timestamp=args.timestamp,
         explanation=args.explanation,
         intervention_result_text=args.intervention_text,
         intervention_result_path=Path(args.intervention_file) if args.intervention_file else None,

@@ -27,6 +27,7 @@ DEFAULT_API_KEY_FILE = (
 )
 DEBUG_LLM_IO_PATH = Path("./outputs/llm_inout.md")
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "explanation_quality_evaluation" / "input-side-evaluation" / "outputs"
+DEFAULT_REFERENCE_CACHE_ROOT = PROJECT_ROOT / "explanation_quality_evaluation" / "input-side-evaluation"
 
 SAE_RELEASE_BY_NAME: Dict[str, str] = {
     "gemmascope-res": "gemma-scope-2b-pt-res",
@@ -113,13 +114,19 @@ def _prepare_run_output_paths(
     feature_id: str,
     *,
     output_root: Path,
+    output_timestamp: Optional[str] = None,
 ) -> Dict[str, Path]:
     layer_id, sae_name = _extract_output_layout_from_source(source)
-    run_dir = (
+    run_dir_base = (
         output_root
         / _sanitize_path_component(sae_name)
         / f"layer-{_sanitize_path_component(layer_id)}"
         / f"feature-{_sanitize_path_component(str(feature_id))}"
+    )
+    run_dir = (
+        run_dir_base / _sanitize_path_component(str(output_timestamp))
+        if output_timestamp and str(output_timestamp).strip()
+        else run_dir_base
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     return {
@@ -129,6 +136,60 @@ def _prepare_run_output_paths(
         "result_json": run_dir / "result.json",
         "result_md": run_dir / "result.md",
     }
+
+
+def _prepare_reference_cache_path(
+    source: str,
+    feature_id: str,
+    *,
+    cache_root: Path,
+) -> Path:
+    layer_id, sae_name = _extract_output_layout_from_source(source)
+    cache_dir = (
+        cache_root
+        / _sanitize_path_component(sae_name)
+        / f"layer-{_sanitize_path_component(layer_id)}"
+        / f"feature-{_sanitize_path_component(str(feature_id))}"
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / "neuronpedia_reference_cache.json"
+
+
+def _load_reference_cache(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _is_cache_compatible(cache_data: Dict[str, Any], expected_signature: Dict[str, Any]) -> bool:
+    return cache_data.get("signature") == expected_signature
+
+
+def _to_boundary_score(payload: Dict[str, Any]) -> BoundaryScore:
+    details_raw = payload.get("details")
+    details: List[BoundaryCaseResult] = []
+    if isinstance(details_raw, list):
+        for item in details_raw:
+            if not isinstance(item, dict):
+                continue
+            details.append(
+                BoundaryCaseResult(
+                    context=str(item.get("context", "")),
+                    activation_max=float(item.get("activation_max", 0.0)),
+                    is_non_activated=bool(item.get("is_non_activated", False)),
+                )
+            )
+    return BoundaryScore(
+        explanation=str(payload.get("explanation", "")),
+        sample_count=int(payload.get("sample_count", len(details))),
+        activation_threshold=float(payload.get("activation_threshold", 0.0)),
+        non_activation_rate=float(payload.get("non_activation_rate", 0.0)),
+        details=details,
+    )
 
 
 def _read_api_key(api_key_file: str) -> str:
@@ -693,6 +754,62 @@ def _non_activation_accuracy(decisions: Sequence[Decision]) -> float:
     return sum(1 for d in decisions if d == "DO_NOT_ACTIVATE") / len(decisions)
 
 
+def _score_activation_against_reference_decisions(
+    *,
+    reference_explanation: str,
+    ref_decisions: Sequence[Decision],
+    my_decisions: Sequence[Decision],
+) -> ExplanationScore:
+    if not ref_decisions:
+        raise ValueError("No reference decisions available for activation evaluation.")
+    if len(my_decisions) != len(ref_decisions):
+        raise ValueError("Decision count mismatch.")
+
+    sample_count = len(ref_decisions)
+    adherence = (
+        sum(1 for left, right in zip(ref_decisions, my_decisions) if left == right) / sample_count
+    )
+    np_acc = _activation_accuracy(ref_decisions)
+    my_acc = _activation_accuracy(my_decisions)
+    relative_quality = (my_acc / np_acc) if np_acc > 0 else None
+    return ExplanationScore(
+        reference_explanation=reference_explanation,
+        sample_count=sample_count,
+        adherence=adherence,
+        neuronpedia_activation_accuracy=np_acc,
+        my_activation_accuracy=my_acc,
+        relative_quality=relative_quality,
+    )
+
+
+def _score_non_activation_against_reference_decisions(
+    *,
+    reference_explanation: str,
+    ref_decisions: Sequence[Decision],
+    my_decisions: Sequence[Decision],
+) -> NonActivationExplanationScore:
+    if not ref_decisions:
+        raise ValueError("No reference decisions available for non-activation evaluation.")
+    if len(my_decisions) != len(ref_decisions):
+        raise ValueError("Decision count mismatch.")
+
+    sample_count = len(ref_decisions)
+    adherence = (
+        sum(1 for left, right in zip(ref_decisions, my_decisions) if left == right) / sample_count
+    )
+    np_acc = _non_activation_accuracy(ref_decisions)
+    my_acc = _non_activation_accuracy(my_decisions)
+    relative_quality = (my_acc / np_acc) if np_acc > 0 else None
+    return NonActivationExplanationScore(
+        reference_explanation=reference_explanation,
+        sample_count=sample_count,
+        adherence=adherence,
+        neuronpedia_non_activation_accuracy=np_acc,
+        my_non_activation_accuracy=my_acc,
+        relative_quality=relative_quality,
+    )
+
+
 def evaluate_against_reference(
     client: OpenAI,
     model: str,
@@ -808,49 +925,101 @@ def compare_with_neuronpedia_explanations(
     sae_canonical_map: Optional[str] = None,
     sae_device: str = "auto",
     output_root: Optional[Path] = None,
+    output_timestamp: Optional[str] = None,
 ) -> Dict[str, Any]:
     global DEBUG_LLM_IO_PATH
     output_paths = _prepare_run_output_paths(
         source=source,
         feature_id=index,
         output_root=Path(output_root) if output_root is not None else DEFAULT_OUTPUT_ROOT,
+        output_timestamp=output_timestamp,
     )
     DEBUG_LLM_IO_PATH = output_paths["llm_io_log"]
 
-    print("in comparing:")
-    payload = fetch_feature_json(
-        model_id=model_id,
+    reference_cache_path = _prepare_reference_cache_path(
         source=source,
         feature_id=index,
-        api_key=neuronpedia_api_key,
-        timeout=neuronpedia_timeout,
+        cache_root=DEFAULT_REFERENCE_CACHE_ROOT,
     )
-    print("fetched")
-    reference_explanations = extract_explanations(payload, limit=max_explanations)
-    if not reference_explanations:
-        raise ValueError("No explanation found in Neuronpedia response.")
+    cache_signature = {
+        "model_id": model_id,
+        "source": source,
+        "feature_id": str(index),
+        "max_explanations": int(max_explanations),
+        "selection_method": int(selection_method),
+        "m": int(m),
+        "n": int(n),
+        "non_activation_context_count": int(non_activation_context_count),
+        "enable_activation_score": bool(enable_activation_score),
+        "enable_non_activation_score": bool(enable_non_activation_score),
+        "enable_boundary_score": bool(enable_boundary_score),
+        "boundary_case_count": int(boundary_case_count),
+        "boundary_max_tokens": int(boundary_max_tokens),
+        "boundary_llm_model": boundary_llm_model or llm_model,
+        "boundary_activation_threshold": float(boundary_activation_threshold),
+        "llm_model": llm_model,
+    }
+    cached_reference = _load_reference_cache(reference_cache_path)
+    use_reference_cache = bool(
+        cached_reference and _is_cache_compatible(cached_reference, cache_signature)
+    )
 
-    contexts: List[str] = []
-    non_activation_contexts: List[str] = []
-    if enable_activation_score:
-        contexts = select_activation_contexts(
-            payload,
-            selection_method=selection_method,
-            m=m,
-            n=n,
+    if use_reference_cache:
+        reference_explanations = [
+            str(item) for item in (cached_reference.get("reference_explanations") or [])
+        ]
+        if not reference_explanations:
+            raise ValueError("Reference cache is invalid: no reference explanations found.")
+        contexts = [str(item) for item in (cached_reference.get("activation_contexts") or [])]
+        non_activation_contexts = [
+            str(item) for item in (cached_reference.get("non_activation_contexts") or [])
+        ]
+        activation_reference_decisions_raw = cached_reference.get("activation_reference_decisions") or {}
+        non_activation_reference_decisions_raw = (
+            cached_reference.get("non_activation_reference_decisions") or {}
         )
-        if not contexts:
-            raise ValueError("No contexts selected from activations.")
-
-    if enable_non_activation_score:
-        non_activation_contexts = select_non_activation_contexts(
-            payload,
-            non_activation_context_count=non_activation_context_count,
+        boundary_reference_scores_raw = cached_reference.get("boundary_reference_scores") or []
+    else:
+        payload = fetch_feature_json(
+            model_id=model_id,
+            source=source,
+            feature_id=index,
+            api_key=neuronpedia_api_key,
+            timeout=neuronpedia_timeout,
         )
-        if not non_activation_contexts:
-            raise ValueError("No non-activation contexts selected from activations.")
+        reference_explanations = extract_explanations(payload, limit=max_explanations)
+        if not reference_explanations:
+            raise ValueError("No explanation found in Neuronpedia response.")
 
-    print("context selected")
+        contexts: List[str] = []
+        non_activation_contexts: List[str] = []
+        if enable_activation_score:
+            contexts = select_activation_contexts(
+                payload,
+                selection_method=selection_method,
+                m=m,
+                n=n,
+            )
+            if not contexts:
+                raise ValueError("No contexts selected from activations.")
+
+        if enable_non_activation_score:
+            non_activation_contexts = select_non_activation_contexts(
+                payload,
+                non_activation_context_count=non_activation_context_count,
+            )
+            if not non_activation_contexts:
+                raise ValueError("No non-activation contexts selected from activations.")
+
+        activation_reference_decisions_raw: Dict[str, List[Decision]] = {}
+        non_activation_reference_decisions_raw: Dict[str, List[Decision]] = {}
+        boundary_reference_scores_raw: List[Dict[str, Any]] = []
+
+    if enable_activation_score and not contexts:
+        raise ValueError("No activation contexts available for evaluation.")
+    if enable_non_activation_score and not non_activation_contexts:
+        raise ValueError("No non-activation contexts available for evaluation.")
+
     need_llm = enable_activation_score or enable_non_activation_score or enable_boundary_score
     client: Optional[OpenAI] = build_client(ppio_api_key_file, ppio_base_url) if need_llm else None
 
@@ -865,8 +1034,6 @@ def compare_with_neuronpedia_explanations(
             judge_should_activate(client, llm_model, my_explanation, ctx)
             for ctx in non_activation_contexts
         ]
-    print("judged")
-
     boundary_contexts: List[str] = []
     boundary_score: Optional[BoundaryScore] = None
     boundary_reference_scores: List[BoundaryScore] = []
@@ -914,58 +1081,73 @@ def compare_with_neuronpedia_explanations(
             module=boundary_module,
         )
 
-        for exp in reference_explanations:
-            ref_boundary_contexts = generate_boundary_contexts(
-                client=client,
-                model=boundary_llm_model or llm_model,
-                explanation=exp,
-                boundary_case_count=boundary_case_count,
-                max_tokens=boundary_max_tokens,
-            )
-            ref_boundary_score = evaluate_boundary_with_sae(
-                contexts=ref_boundary_contexts,
-                explanation=exp,
-                model_id=model_id,
-                source=source,
-                feature_index=feature_index,
-                activation_threshold=boundary_activation_threshold,
-                hf_model_name=hf_model_name,
-                sae_path=sae_path,
-                sae_layer=sae_layer,
-                sae_variant=sae_variant,
-                sae_device=sae_device,
-                module=boundary_module,
-            )
-            boundary_reference_scores.append(ref_boundary_score)
+        if use_reference_cache:
+            boundary_reference_scores = [
+                _to_boundary_score(item)
+                for item in boundary_reference_scores_raw
+                if isinstance(item, dict)
+            ]
+        else:
+            for exp in reference_explanations:
+                ref_boundary_contexts = generate_boundary_contexts(
+                    client=client,
+                    model=boundary_llm_model or llm_model,
+                    explanation=exp,
+                    boundary_case_count=boundary_case_count,
+                    max_tokens=boundary_max_tokens,
+                )
+                ref_boundary_score = evaluate_boundary_with_sae(
+                    contexts=ref_boundary_contexts,
+                    explanation=exp,
+                    model_id=model_id,
+                    source=source,
+                    feature_index=feature_index,
+                    activation_threshold=boundary_activation_threshold,
+                    hf_model_name=hf_model_name,
+                    sae_path=sae_path,
+                    sae_layer=sae_layer,
+                    sae_variant=sae_variant,
+                    sae_device=sae_device,
+                    module=boundary_module,
+                )
+                boundary_reference_scores.append(ref_boundary_score)
 
     details: List[ExplanationScore] = []
     non_activation_details: List[NonActivationExplanationScore] = []
     if enable_activation_score:
         assert client is not None
         for exp in reference_explanations:
-            score = evaluate_against_reference(
-                client=client,
-                model=llm_model,
-                contexts=contexts,
+            ref_decisions = activation_reference_decisions_raw.get(exp)
+            if not use_reference_cache:
+                ref_decisions = [judge_should_activate(client, llm_model, exp, ctx) for ctx in contexts]
+                activation_reference_decisions_raw[exp] = ref_decisions
+            if not ref_decisions:
+                raise ValueError(f"Missing activation reference decisions for explanation: {exp}")
+            score = _score_activation_against_reference_decisions(
                 reference_explanation=exp,
-                my_explanation=my_explanation,
+                ref_decisions=ref_decisions,
                 my_decisions=my_decisions,
             )
             details.append(score)
     if enable_non_activation_score:
         assert client is not None
         for exp in reference_explanations:
-            non_activation_score = evaluate_non_activation_against_reference(
-                client=client,
-                model=llm_model,
-                contexts=non_activation_contexts,
+            ref_decisions = non_activation_reference_decisions_raw.get(exp)
+            if not use_reference_cache:
+                ref_decisions = [
+                    judge_should_activate(client, llm_model, exp, ctx) for ctx in non_activation_contexts
+                ]
+                non_activation_reference_decisions_raw[exp] = ref_decisions
+            if not ref_decisions:
+                raise ValueError(
+                    f"Missing non-activation reference decisions for explanation: {exp}"
+                )
+            non_activation_score = _score_non_activation_against_reference_decisions(
                 reference_explanation=exp,
-                my_explanation=my_explanation,
+                ref_decisions=ref_decisions,
                 my_decisions=my_non_activation_decisions,
             )
             non_activation_details.append(non_activation_score)
-
-    print("evaluated")
     relative_quality_score: Optional[float] = None
     adherence: Optional[float] = None
     if enable_activation_score:
@@ -1059,6 +1241,10 @@ def compare_with_neuronpedia_explanations(
             "result_json": str(output_paths["result_json"]),
             "result_md": str(output_paths["result_md"]),
         },
+        "neuronpedia_reference_cache": {
+            "path": str(reference_cache_path),
+            "hit": use_reference_cache,
+        },
     }
 
     activation_case_results = [
@@ -1128,7 +1314,32 @@ def compare_with_neuronpedia_explanations(
                 else 0
             ),
         },
+        "neuronpedia_reference_cache": {
+            "path": str(reference_cache_path),
+            "hit": use_reference_cache,
+        },
     }
+
+    if not use_reference_cache:
+        cache_payload = {
+            "signature": cache_signature,
+            "cached_at": datetime.now().isoformat(timespec="seconds"),
+            "feature": {"model_id": model_id, "source": source, "index": index},
+            "reference_explanations": reference_explanations,
+            "activation_contexts": contexts if enable_activation_score else [],
+            "non_activation_contexts": (
+                non_activation_contexts if enable_non_activation_score else []
+            ),
+            "activation_reference_decisions": activation_reference_decisions_raw,
+            "non_activation_reference_decisions": non_activation_reference_decisions_raw,
+            "boundary_reference_scores": (
+                [asdict(item) for item in boundary_reference_scores] if enable_boundary_score else []
+            ),
+        }
+        reference_cache_path.write_text(
+            json.dumps(cache_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     output_paths["evaluation_record"].write_text(
         json.dumps(record, ensure_ascii=False, indent=2) + "\n",
@@ -1358,6 +1569,11 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_OUTPUT_ROOT),
         help="Output root directory. Results are saved under outputs/{sae}/layer-{id}/feature-{id}.",
     )
+    parser.add_argument(
+        "--timestamp",
+        default=None,
+        help="Optional timestamp subdirectory under feature path.",
+    )
     parser.add_argument("--output-json", default=None, help="Optional path to write JSON output")
     return parser.parse_args()
 
@@ -1398,6 +1614,7 @@ def main() -> None:
         sae_canonical_map=args.sae_canonical_map,
         sae_device=args.sae_device,
         output_root=Path(args.output_root),
+        output_timestamp=args.timestamp,
     )
 
     text = json.dumps(result, ensure_ascii=False, indent=2)

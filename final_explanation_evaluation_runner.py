@@ -4,6 +4,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -176,19 +177,47 @@ def _pick_best_hypothesis(
 
 
 def _run_command(cmd: Sequence[str], *, cwd: Path) -> None:
-    process = subprocess.run(
-        list(cmd),
-        cwd=str(cwd),
-        text=True,
-        capture_output=True,
-    )
+    process = subprocess.run(list(cmd), cwd=str(cwd), text=True)
     if process.returncode != 0:
-        raise RuntimeError(
-            "Command failed:\n"
-            f"{' '.join(cmd)}\n\n"
-            f"STDOUT:\n{process.stdout}\n\n"
-            f"STDERR:\n{process.stderr}"
-        )
+        raise RuntimeError(f"Command failed (exit={process.returncode}): {' '.join(cmd)}")
+
+
+def _log_progress(message: str) -> None:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [final-eval] {message}", flush=True)
+
+
+def _run_command_with_progress(
+    cmd: Sequence[str],
+    *,
+    cwd: Path,
+    step_name: str,
+    heartbeat_seconds: int = 30,
+) -> None:
+    _log_progress(f"Start step: {step_name}")
+    _log_progress(f"Command: {' '.join(cmd)}")
+
+    started_at = time.monotonic()
+    process = subprocess.Popen(list(cmd), cwd=str(cwd), text=True)
+    last_heartbeat = started_at
+
+    while True:
+        return_code = process.poll()
+        if return_code is not None:
+            elapsed = int(time.monotonic() - started_at)
+            if return_code != 0:
+                raise RuntimeError(
+                    f"Step failed: {step_name} (exit={return_code}, elapsed={elapsed}s). "
+                    f"Command: {' '.join(cmd)}"
+                )
+            _log_progress(f"Finished step: {step_name} (elapsed={elapsed}s)")
+            return
+
+        now = time.monotonic()
+        if heartbeat_seconds > 0 and (now - last_heartbeat) >= heartbeat_seconds:
+            elapsed = int(now - started_at)
+            _log_progress(f"Still running: {step_name} (elapsed={elapsed}s)")
+            last_heartbeat = now
+        time.sleep(1.0)
 
 
 def _build_source(layer_id: str, sae_name: str, width: str) -> str:
@@ -226,6 +255,8 @@ def _write_summary_markdown(path: Path, *, payload: Dict[str, Any]) -> None:
     lines.append(f"- model_id: {metadata.get('model_id')}")
     lines.append(f"- layer_id: {metadata.get('layer_id')}")
     lines.append(f"- feature_id: {metadata.get('feature_id')}")
+    lines.append(f"- evaluation_timestamp: {metadata.get('evaluation_timestamp')}")
+    lines.append(f"- run_mode: {metadata.get('run_mode')}")
     lines.append(f"- workflow_final_result: {metadata.get('workflow_final_result_path')}")
     lines.append("")
     lines.append("## Selected Input Hypothesis")
@@ -313,6 +344,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-api-key-file", default=None)
     parser.add_argument("--output-openai-model", default="zai-org/glm-4.7")
     parser.add_argument("--output-openai-base-url", default="https://api.ppio.com/openai")
+    parser.add_argument(
+        "--run-mode",
+        choices=["both", "input", "output", "none"],
+        default="both",
+        help="Control which side(s) to run. Default is both.",
+    )
+    parser.add_argument(
+        "--heartbeat-seconds",
+        type=int,
+        default=30,
+        help="Progress heartbeat interval in seconds while a child process is running.",
+    )
 
     parser.add_argument("--blind-trials", type=int, default=1)
     parser.add_argument("--blind-seed", type=int, default=42)
@@ -341,6 +384,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    _log_progress("Resolving workflow artifacts")
     workflow_path = _resolve_workflow_path_from_args(args)
     final_result_path = _resolve_workflow_final_result_path(workflow_path)
     final_result = _load_json(final_result_path)
@@ -362,6 +406,13 @@ def main() -> None:
         )
 
     workflow_timestamp_dir = final_result_path.parents[1]
+    evaluation_timestamp = str(args.timestamp).strip() if args.timestamp else workflow_timestamp_dir.name
+    if not str(args.timestamp or "").strip():
+        _log_progress(
+            "No --timestamp provided; using workflow directory name as evaluation timestamp: "
+            f"{evaluation_timestamp}"
+        )
+
     refined_payload: Optional[Dict[str, Any]] = None
     execution_payload: Optional[Dict[str, Any]] = None
     if executed_rounds > 0:
@@ -385,6 +436,10 @@ def main() -> None:
         execution_payload=execution_payload,
         side="output",
     )
+    _log_progress(
+        f"Selected hypotheses (input idx={selected_input.get('hypothesis_index')}, "
+        f"output idx={selected_output.get('hypothesis_index')})"
+    )
 
     source = _build_source(layer_id=layer_id, sae_name=str(args.sae_name), width=str(args.width))
     input_script = (
@@ -406,166 +461,204 @@ def main() -> None:
         / "intervention_logit_topk_score.py"
     )
 
-    input_cmd: List[str] = [
-        sys.executable,
-        str(input_script),
-        "--model-id",
-        model_id,
-        "--layer-id",
-        layer_id,
-        "--width",
-        str(args.width),
-        "--source",
-        source,
-        "--feature-id",
-        str(feature_id),
-        "--my-explanation",
-        str(selected_input["hypothesis"]),
-        "--max-explanations",
-        str(args.input_max_explanations),
-        "--selection-method",
-        str(args.input_selection_method),
-        "--m",
-        str(args.input_m),
-        "--n",
-        str(args.input_n),
-        "--non-activation-context-count",
-        str(args.input_non_activation_context_count),
-        "--llm-model",
-        str(args.input_llm_model),
-        "--ppio-base-url",
-        str(args.input_ppio_base_url),
-        "--sae-name",
-        str(args.sae_name),
-        "--sae-device",
-        str(args.sae_device),
-        "--output-root",
-        str(args.input_output_root),
-    ]
-    if args.input_ppio_api_key_file:
-        input_cmd.extend(["--ppio-api-key-file", str(args.input_ppio_api_key_file)])
-    if args.sae_release:
-        input_cmd.extend(["--sae-release", str(args.sae_release)])
-    if args.sae_average_l0:
-        input_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
-    if args.sae_canonical_map:
-        input_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
-    if args.input_disable_boundary_score:
-        input_cmd.append("--disable-boundary-score")
+    run_input = args.run_mode in ("both", "input")
+    run_output = args.run_mode in ("both", "output")
+    if args.run_mode == "none":
+        _log_progress("Run mode is 'none': skip input-side and output-side evaluation execution.")
 
-    _run_command(input_cmd, cwd=PROJECT_ROOT)
-    input_result_path = (
-        Path(args.input_output_root)
-        / str(args.sae_name)
-        / f"layer-{layer_id}"
-        / f"feature-{feature_id}"
-        / "result.json"
-    )
-    input_result = _load_json(input_result_path)
-
-    output_result_path: Path
-    output_summary: Dict[str, Any]
-    if args.output_eval_mode == "blind":
-        output_cmd: List[str] = [
+    input_result_path: Optional[Path] = None
+    input_result: Dict[str, Any] = {}
+    if run_input:
+        input_cmd: List[str] = [
             sys.executable,
-            str(output_blind_script),
+            str(input_script),
+            "--model-id",
+            model_id,
             "--layer-id",
             layer_id,
-            "--feature-id",
-            str(feature_id),
             "--width",
             str(args.width),
+            "--source",
+            source,
+            "--feature-id",
+            str(feature_id),
+            "--my-explanation",
+            str(selected_input["hypothesis"]),
+            "--max-explanations",
+            str(args.input_max_explanations),
+            "--selection-method",
+            str(args.input_selection_method),
+            "--m",
+            str(args.input_m),
+            "--n",
+            str(args.input_n),
+            "--non-activation-context-count",
+            str(args.input_non_activation_context_count),
+            "--llm-model",
+            str(args.input_llm_model),
+            "--ppio-base-url",
+            str(args.input_ppio_base_url),
             "--sae-name",
             str(args.sae_name),
+            "--sae-device",
+            str(args.sae_device),
             "--output-root",
-            str(args.output_output_root),
-            "--explanation",
-            str(selected_output["hypothesis"]),
-            "--prefer-existing",
-            "--trials",
-            str(args.blind_trials),
-            "--seed",
-            str(args.blind_seed),
-            "--num-choices",
-            str(args.blind_num_choices),
-            "--openai-model",
-            str(args.output_openai_model),
-            "--openai-base-url",
-            str(args.output_openai_base_url),
-            "--device",
-            str(args.device),
-            "--model-checkpoint-path",
-            str(args.model_checkpoint_path),
+            str(args.input_output_root),
+            "--timestamp",
+            evaluation_timestamp,
         ]
-        if args.output_api_key_file:
-            output_cmd.extend(["--api-key-file", str(args.output_api_key_file)])
+        if args.input_ppio_api_key_file:
+            input_cmd.extend(["--ppio-api-key-file", str(args.input_ppio_api_key_file)])
         if args.sae_release:
-            output_cmd.extend(["--sae-release", str(args.sae_release)])
+            input_cmd.extend(["--sae-release", str(args.sae_release)])
         if args.sae_average_l0:
-            output_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
+            input_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
         if args.sae_canonical_map:
-            output_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
-        if args.blind_use_checkpoint_fallback:
-            output_cmd.append("--use-checkpoint")
-        _run_command(output_cmd, cwd=PROJECT_ROOT)
-        output_result_path = (
-            Path(args.output_output_root)
+            input_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
+        if args.input_disable_boundary_score:
+            input_cmd.append("--disable-boundary-score")
+
+        _run_command_with_progress(
+            input_cmd,
+            cwd=PROJECT_ROOT,
+            step_name="input-side evaluation",
+            heartbeat_seconds=int(args.heartbeat_seconds),
+        )
+        input_result_path = (
+            Path(args.input_output_root)
             / str(args.sae_name)
             / f"layer-{layer_id}"
             / f"feature-{feature_id}"
-            / "intervention_blind_score.json"
+            / evaluation_timestamp
+            / "result.json"
         )
-        output_payload = _load_json(output_result_path)
-        output_summary = {
-            "score_blind_accuracy": output_payload.get("score", {}).get("score"),
-            "blind_judge_successes": output_payload.get("score", {}).get("successes"),
-            "blind_judge_trials": output_payload.get("score", {}).get("trials"),
-        }
+        input_result = _load_json(input_result_path)
     else:
-        output_cmd = [
-            sys.executable,
-            str(output_logit_script),
-            "--layer-id",
-            layer_id,
-            "--feature-id",
-            str(feature_id),
-            "--width",
-            str(args.width),
-            "--sae-name",
-            str(args.sae_name),
-            "--output-root",
-            str(args.output_output_root),
-            "--explanation",
-            str(selected_output["hypothesis"]),
-            "--top-k",
-            str(args.logit_top_k),
-            "--judge-max-tokens",
-            str(args.logit_judge_max_tokens),
-            "--openai-model",
-            str(args.output_openai_model),
-            "--openai-base-url",
-            str(args.output_openai_base_url),
-            "--prefer-existing",
-        ]
-        output_cmd.extend(["--target-kl", *[str(float(kl)) for kl in args.logit_target_kl]])
-        if args.output_api_key_file:
-            output_cmd.extend(["--api-key-file", str(args.output_api_key_file)])
-        if args.sae_release:
-            output_cmd.extend(["--sae-release", str(args.sae_release)])
-        if args.sae_average_l0:
-            output_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
-        if args.sae_canonical_map:
-            output_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
-        _run_command(output_cmd, cwd=PROJECT_ROOT)
-        output_result_path = (
-            Path(args.output_output_root)
-            / str(args.sae_name)
-            / f"layer-{layer_id}"
-            / f"feature-{feature_id}"
-            / "intervention_logit_topk_score.json"
-        )
-        output_payload = _load_json(output_result_path)
-        output_summary = _extract_logit_summary(output_payload)
+        _log_progress("Skip input-side evaluation.")
+
+    output_result_path: Optional[Path] = None
+    output_payload: Dict[str, Any] = {}
+    output_summary: Dict[str, Any] = {}
+    if run_output:
+        if args.output_eval_mode == "blind":
+            output_cmd: List[str] = [
+                sys.executable,
+                str(output_blind_script),
+                "--layer-id",
+                layer_id,
+                "--feature-id",
+                str(feature_id),
+                "--width",
+                str(args.width),
+                "--sae-name",
+                str(args.sae_name),
+                "--output-root",
+                str(args.output_output_root),
+                "--timestamp",
+                evaluation_timestamp,
+                "--explanation",
+                str(selected_output["hypothesis"]),
+                "--prefer-existing",
+                "--trials",
+                str(args.blind_trials),
+                "--seed",
+                str(args.blind_seed),
+                "--num-choices",
+                str(args.blind_num_choices),
+                "--openai-model",
+                str(args.output_openai_model),
+                "--openai-base-url",
+                str(args.output_openai_base_url),
+                "--device",
+                str(args.device),
+                "--model-checkpoint-path",
+                str(args.model_checkpoint_path),
+            ]
+            if args.output_api_key_file:
+                output_cmd.extend(["--api-key-file", str(args.output_api_key_file)])
+            if args.sae_release:
+                output_cmd.extend(["--sae-release", str(args.sae_release)])
+            if args.sae_average_l0:
+                output_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
+            if args.sae_canonical_map:
+                output_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
+            if args.blind_use_checkpoint_fallback:
+                output_cmd.append("--use-checkpoint")
+            _run_command_with_progress(
+                output_cmd,
+                cwd=PROJECT_ROOT,
+                step_name="output-side evaluation (blind)",
+                heartbeat_seconds=int(args.heartbeat_seconds),
+            )
+            output_result_path = (
+                Path(args.output_output_root)
+                / str(args.sae_name)
+                / f"layer-{layer_id}"
+                / f"feature-{feature_id}"
+                / evaluation_timestamp
+                / "intervention_blind_score.json"
+            )
+            output_payload = _load_json(output_result_path)
+            output_summary = {
+                "score_blind_accuracy": output_payload.get("score", {}).get("score"),
+                "blind_judge_successes": output_payload.get("score", {}).get("successes"),
+                "blind_judge_trials": output_payload.get("score", {}).get("trials"),
+            }
+        else:
+            output_cmd = [
+                sys.executable,
+                str(output_logit_script),
+                "--layer-id",
+                layer_id,
+                "--feature-id",
+                str(feature_id),
+                "--width",
+                str(args.width),
+                "--sae-name",
+                str(args.sae_name),
+                "--output-root",
+                str(args.output_output_root),
+                "--timestamp",
+                evaluation_timestamp,
+                "--explanation",
+                str(selected_output["hypothesis"]),
+                "--top-k",
+                str(args.logit_top_k),
+                "--judge-max-tokens",
+                str(args.logit_judge_max_tokens),
+                "--openai-model",
+                str(args.output_openai_model),
+                "--openai-base-url",
+                str(args.output_openai_base_url),
+                "--prefer-existing",
+            ]
+            output_cmd.extend(["--target-kl", *[str(float(kl)) for kl in args.logit_target_kl]])
+            if args.output_api_key_file:
+                output_cmd.extend(["--api-key-file", str(args.output_api_key_file)])
+            if args.sae_release:
+                output_cmd.extend(["--sae-release", str(args.sae_release)])
+            if args.sae_average_l0:
+                output_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
+            if args.sae_canonical_map:
+                output_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
+            _run_command_with_progress(
+                output_cmd,
+                cwd=PROJECT_ROOT,
+                step_name="output-side evaluation (logit)",
+                heartbeat_seconds=int(args.heartbeat_seconds),
+            )
+            output_result_path = (
+                Path(args.output_output_root)
+                / str(args.sae_name)
+                / f"layer-{layer_id}"
+                / f"feature-{feature_id}"
+                / evaluation_timestamp
+                / "intervention_logit_topk_score.json"
+            )
+            output_payload = _load_json(output_result_path)
+            output_summary = _extract_logit_summary(output_payload)
+    else:
+        _log_progress("Skip output-side evaluation.")
 
     final_summary_path = (
         workflow_timestamp_dir
@@ -573,6 +666,7 @@ def main() -> None:
         / f"layer{layer_id}-feature{feature_id}-final-evaluation.json"
     )
     final_summary_md_path = final_summary_path.with_suffix(".md")
+    _log_progress("Building final merged summary payload")
 
     summary_payload: Dict[str, Any] = {
         "metadata": {
@@ -580,6 +674,8 @@ def main() -> None:
             "model_id": model_id,
             "layer_id": layer_id,
             "feature_id": feature_id,
+            "evaluation_timestamp": evaluation_timestamp,
+            "run_mode": str(args.run_mode),
             "workflow_final_result_path": str(final_result_path),
         },
         "selected_hypotheses": {
@@ -587,23 +683,28 @@ def main() -> None:
             "output": selected_output,
         },
         "input_evaluation": {
-            "relative_quality_score": input_result.get("relative_quality_score"),
-            "non_activation_relative_quality_score": input_result.get("non_activation_relative_quality_score"),
-            "boundary_relative_quality_score": input_result.get("boundary_relative_quality_score"),
-            "raw_result": input_result,
+            "status": "completed" if run_input else "skipped",
+            "relative_quality_score": input_result.get("relative_quality_score") if run_input else None,
+            "non_activation_relative_quality_score": (
+                input_result.get("non_activation_relative_quality_score") if run_input else None
+            ),
+            "boundary_relative_quality_score": input_result.get("boundary_relative_quality_score") if run_input else None,
+            "raw_result": input_result if run_input else None,
         },
         "output_evaluation": {
             "mode": str(args.output_eval_mode),
-            "summary": output_summary,
-            "raw_result": output_payload,
+            "status": "completed" if run_output else "skipped",
+            "summary": output_summary if run_output else {},
+            "raw_result": output_payload if run_output else None,
         },
         "paths": {
-            "input_result_json": str(input_result_path),
-            "output_result_json": str(output_result_path),
+            "input_result_json": str(input_result_path) if input_result_path is not None else None,
+            "output_result_json": str(output_result_path) if output_result_path is not None else None,
             "final_summary_json": str(final_summary_path),
             "final_summary_md": str(final_summary_md_path),
         },
     }
+    _log_progress("Writing final summary json and markdown")
     final_summary_path.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     _write_summary_markdown(final_summary_md_path, payload=summary_payload)
 

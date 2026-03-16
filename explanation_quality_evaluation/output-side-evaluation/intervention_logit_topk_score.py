@@ -377,6 +377,31 @@ def _write_markdown(path: Path, payload: Dict[str, Any]) -> None:
                 f"| {row.get('llm_expected_effect')} | {row.get('llm_is_correct')} |"
             )
         lines.append("")
+        lines.append("### LLM Judge IO")
+        llm_judge = run.get("llm_judge", {})
+        if not isinstance(llm_judge, dict):
+            lines.append("- No LLM judge record.")
+            lines.append("")
+            continue
+        messages = llm_judge.get("messages", [])
+        lines.append("#### Messages")
+        if isinstance(messages, list):
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                lines.append(f"- role: {msg.get('role')}")
+                lines.append("```text")
+                lines.append(str(msg.get("content", "")))
+                lines.append("```")
+        lines.append("#### Raw Output")
+        lines.append("```text")
+        lines.append(str(llm_judge.get("raw_output", "")))
+        lines.append("```")
+        lines.append("#### Parsed Output")
+        lines.append("```json")
+        lines.append(json.dumps(llm_judge.get("parsed_output"), ensure_ascii=False, indent=2))
+        lines.append("```")
+        lines.append("")
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -428,6 +453,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=str(PROJECT_ROOT / "explanation_quality_evaluation" / "output-side-evaluation" / "outputs"),
         help="Root output directory",
     )
+    parser.add_argument("--timestamp", default=None, help="Optional timestamp subdirectory under feature path.")
     parser.add_argument("--json-filename", default="intervention_logit_topk_score.json")
     parser.add_argument("--md-filename", default="intervention_logit_topk_score.md")
     parser.add_argument(
@@ -461,8 +487,17 @@ def _resolve_explanation(args: argparse.Namespace) -> str:
     raise ValueError("Missing explanation: provide --explanation or --explanation-file.")
 
 
-def _resolve_target_dir(*, output_root: str, sae_name: str, layer_id: str, feature_id: int) -> Path:
+def _resolve_target_dir(
+    *,
+    output_root: str,
+    sae_name: str,
+    layer_id: str,
+    feature_id: int,
+    timestamp: Optional[str] = None,
+) -> Path:
     target_dir = Path(output_root) / sae_name / f"layer-{layer_id}" / f"feature-{feature_id}"
+    if timestamp and str(timestamp).strip():
+        target_dir = target_dir / str(timestamp).strip()
     target_dir.mkdir(parents=True, exist_ok=True)
     return target_dir
 
@@ -497,6 +532,7 @@ def main() -> None:
         sae_name=str(args.sae_name),
         layer_id=layer_id,
         feature_id=feature_id,
+        timestamp=args.timestamp,
     )
 
     if bool(args.prefer_existing) and not bool(args.force_refresh_score):
