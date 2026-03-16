@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -12,81 +11,21 @@ from openai import OpenAI
 from experiments_execution_input import execute_input_side_experiments
 from experiments_execution_output import KL_DIV_VALUES_DEFAULT, execute_output_side_experiments
 from experiments_design import design_hypothesis_experiments
-from function import TokenUsageAccumulator, build_round_dir, normalize_round_id, read_api_key
+from function import (
+    DEFAULT_CANONICAL_MAP_PATH,
+    TokenUsageAccumulator,
+    build_default_sae_path,
+    build_round_dir,
+    load_control_results,
+    normalize_round_id,
+    read_api_key,
+)
 from initial_hypothesis_generation import generate_initial_hypotheses
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
 from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
 from model_with_sae import ModelWithSAEModule
 from neuronpedia_feature_api import fetch_and_parse_feature_observation
-
-
-def _extract_average_l0_from_canonical_map(
-    *,
-    canonical_map_path: Path,
-    layer_id: str,
-    width: str,
-) -> Optional[str]:
-    if not canonical_map_path.exists():
-        return None
-
-    target_id = f"layer_{layer_id}/width_{width}/canonical"
-    in_target_block = False
-    path_pattern = re.compile(
-        rf"layer_{re.escape(layer_id)}/width_{re.escape(width)}/average_l0_([0-9]+(?:\.[0-9]+)?)"
-    )
-
-    with canonical_map_path.open("r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if line.startswith("- id:"):
-                current_id = line.split(":", 1)[1].strip()
-                in_target_block = current_id == target_id
-                continue
-
-            if in_target_block and line.startswith("path:"):
-                match = path_pattern.search(line.split(":", 1)[1].strip())
-                if match:
-                    return match.group(1)
-                return None
-    return None
-
-
-def _default_sae_path(
-    *,
-    layer_id: str,
-    width: str,
-    release: str,
-    average_l0: Optional[str],
-    canonical_map_path: Optional[str],
-) -> str:
-    resolved_average_l0 = average_l0
-    if not resolved_average_l0 and canonical_map_path:
-        resolved_average_l0 = _extract_average_l0_from_canonical_map(
-            canonical_map_path=Path(canonical_map_path),
-            layer_id=layer_id,
-            width=width,
-        )
-
-    if not resolved_average_l0:
-        # Keep backward-compatible fallback.
-        resolved_average_l0 = "70"
-
-    return (
-        "sae-lens://"
-        f"release={release};"
-        f"sae_id=layer_{layer_id}/width_{width}/average_l0_{resolved_average_l0}"
-    )
-
-
-def _load_control_results(control_result_files: Sequence[str]) -> List[str]:
-    texts: List[str] = []
-    for file_path in control_result_files:
-        path = Path(file_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Cannot find control result file: {path}")
-        texts.append(path.read_text(encoding="utf-8").strip())
-    return texts
 
 
 def _write_markdown_log(
@@ -352,7 +291,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sae-canonical-map",
-        default=str(Path("model_download") / "canonical_map.txt"),
+        default=str(DEFAULT_CANONICAL_MAP_PATH),
         help="Path to canonical_map.txt used to resolve average_l0 when --sae-average-l0 is omitted.",
     )
     parser.add_argument("--device", default="cpu")
@@ -443,13 +382,13 @@ if __name__ == "__main__":
     layer_id = str(experiments_result["layer_id"])
     feature_id = str(experiments_result["feature_id"])
 
-    sae_path = args.sae_path or _default_sae_path(
+    sae_path = args.sae_path or build_default_sae_path(
         layer_id=layer_id,
         width=args.width,
         release=args.sae_release,
         average_l0=args.sae_average_l0,
         canonical_map_path=args.sae_canonical_map,
-    )
+    )[0]
     module = ModelWithSAEModule(
         llm_name=args.model_checkpoint_path,
         sae_path=sae_path,
@@ -458,7 +397,7 @@ if __name__ == "__main__":
         device=args.device,
     )
 
-    control_results = _load_control_results(args.control_result_files)
+    control_results = load_control_results(args.control_result_files)
     execution_result = execute_hypothesis_experiments(
         experiments_result=experiments_result,
         module=module,

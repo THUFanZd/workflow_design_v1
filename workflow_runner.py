@@ -4,12 +4,19 @@ import argparse
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 from experiments_design import design_hypothesis_experiments
-from experiments_execution import _default_sae_path, execute_hypothesis_experiments
+from experiments_execution import execute_hypothesis_experiments
 from experiments_execution_output import KL_DIV_VALUES_DEFAULT
-from function import TokenUsageAccumulator, build_round_dir, normalize_round_id
+from function import (
+    DEFAULT_CANONICAL_MAP_PATH,
+    TokenUsageAccumulator,
+    build_default_sae_path,
+    build_round_dir,
+    load_control_results,
+    normalize_round_id,
+)
 from hypothesis_memory import build_hypothesis_memory, write_hypothesis_memory_markdown
 from hypothesis_refinement import refine_hypotheses
 from initial_hypothesis_generation import generate_initial_hypotheses
@@ -81,16 +88,6 @@ def _load_json_or_raise(path: Path) -> Dict[str, Any]:
 def _save_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def _load_control_results(control_result_files: Sequence[str]) -> List[str]:
-    texts: List[str] = []
-    for file_path in control_result_files:
-        path = Path(file_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Cannot find control result file: {path}")
-        texts.append(path.read_text(encoding="utf-8").strip())
-    return texts
 
 
 def _result_usage(result: Dict[str, Any]) -> Dict[str, int]:
@@ -202,7 +199,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sae-average-l0", default=None)
     parser.add_argument(
         "--sae-canonical-map",
-        default=str(Path("model_download") / "canonical_map.txt"),
+        default=str(DEFAULT_CANONICAL_MAP_PATH),
         help="Path to canonical_map.txt for default SAE resolution.",
     )
     parser.add_argument("--device", default="cpu")
@@ -384,13 +381,13 @@ if __name__ == "__main__":
         print('execute experiments...')
         if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=4):
             if module is None:
-                sae_path = args.sae_path or _default_sae_path(
+                sae_path = args.sae_path or build_default_sae_path(
                     layer_id=layer_id,
                     width=args.width,
                     release=args.sae_release,
                     average_l0=args.sae_average_l0,
                     canonical_map_path=args.sae_canonical_map,
-                )
+                )[0]
                 module = ModelWithSAEModule(
                     llm_name=args.model_checkpoint_path,
                     sae_path=sae_path,
@@ -399,7 +396,7 @@ if __name__ == "__main__":
                     device=args.device,
                 )
             if control_results is None:
-                control_results = _load_control_results(args.control_result_files)
+                control_results = load_control_results(args.control_result_files)
             execution_result = execute_hypothesis_experiments(
                 experiments_result=experiments_result,
                 module=module,

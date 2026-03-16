@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from experiments_design import OUTPUT_SIDE_PLACEHOLDER
-from function import call_llm
+from function import DEFAULT_CANONICAL_MAP_PATH, build_default_sae_path, call_llm
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from model_with_sae import ModelWithSAEModule
 
@@ -65,37 +65,6 @@ class TokenDeltaJudgment:
     llm_is_correct: bool
 
 
-def _extract_average_l0_from_canonical_map(
-    *,
-    canonical_map_path: Path,
-    layer_id: str,
-    width: str,
-) -> Optional[str]:
-    if not canonical_map_path.exists():
-        return None
-
-    target_id = f"layer_{layer_id}/width_{width}/canonical"
-    in_target_block = False
-    path_pattern = re.compile(
-        rf"layer_{re.escape(layer_id)}/width_{re.escape(width)}/average_l0_([0-9]+(?:\.[0-9]+)?)"
-    )
-
-    with canonical_map_path.open("r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if line.startswith("- id:"):
-                current_id = line.split(":", 1)[1].strip()
-                in_target_block = current_id == target_id
-                continue
-
-            if in_target_block and line.startswith("path:"):
-                match = path_pattern.search(line.split(":", 1)[1].strip())
-                if match:
-                    return match.group(1)
-                return None
-    return None
-
-
 def _resolve_sae(
     *,
     sae_name: str,
@@ -106,20 +75,12 @@ def _resolve_sae(
     canonical_map_path: Path,
 ) -> Tuple[str, str, str]:
     release = (sae_release or SAE_RELEASE_BY_NAME.get(sae_name) or sae_name).strip()
-    resolved_average_l0 = average_l0
-    if not resolved_average_l0:
-        resolved_average_l0 = _extract_average_l0_from_canonical_map(
-            canonical_map_path=canonical_map_path,
-            layer_id=layer_id,
-            width=width,
-        )
-    if not resolved_average_l0:
-        resolved_average_l0 = "70"
-
-    sae_uri = (
-        "sae-lens://"
-        f"release={release};"
-        f"sae_id=layer_{layer_id}/width_{width}/average_l0_{resolved_average_l0}"
+    sae_uri, resolved_average_l0 = build_default_sae_path(
+        layer_id=layer_id,
+        width=width,
+        release=release,
+        average_l0=average_l0,
+        canonical_map_path=canonical_map_path,
     )
     return sae_uri, release, resolved_average_l0
 
@@ -420,7 +381,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sae-average-l0", default=None, help="Optional average_l0 override")
     parser.add_argument(
         "--sae-canonical-map",
-        default=str(PROJECT_ROOT / "model_download" / "canonical_map.txt"),
+        default=str(PROJECT_ROOT / DEFAULT_CANONICAL_MAP_PATH),
         help="Path to canonical_map.txt for resolving canonical average_l0",
     )
     parser.add_argument("--model-checkpoint-path", default="google/gemma-2-2b", help="Base model checkpoint path")

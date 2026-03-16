@@ -8,6 +8,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 from openai import OpenAI
 
+DEFAULT_CANONICAL_MAP_PATH = Path("support_info") / "canonical_map.txt"
+
 
 def _safe_int(value: Any) -> int:
     try:
@@ -61,6 +63,75 @@ def build_round_dir(
 ) -> Path:
     resolved_round_id = normalize_round_id(round_id, round_index=round_index)
     return Path("logs") / f"{layer_id}_{feature_id}" / str(timestamp) / resolved_round_id
+
+
+def extract_average_l0_from_canonical_map(
+    *,
+    canonical_map_path: Path,
+    layer_id: str,
+    width: str,
+) -> Optional[str]:
+    if not canonical_map_path.exists():
+        return None
+
+    target_id = f"layer_{layer_id}/width_{width}/canonical"
+    in_target_block = False
+    path_pattern = re.compile(
+        rf"layer_{re.escape(layer_id)}/width_{re.escape(width)}/average_l0_([0-9]+(?:\.[0-9]+)?)"
+    )
+
+    with canonical_map_path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if line.startswith("- id:"):
+                current_id = line.split(":", 1)[1].strip()
+                in_target_block = current_id == target_id
+                continue
+
+            if in_target_block and line.startswith("path:"):
+                match = path_pattern.search(line.split(":", 1)[1].strip())
+                if match:
+                    return match.group(1)
+                return None
+    return None
+
+
+def build_default_sae_path(
+    *,
+    layer_id: str,
+    width: str,
+    release: str,
+    average_l0: Optional[str],
+    canonical_map_path: Optional[Union[str, Path]],
+) -> Tuple[str, str]:
+    resolved_average_l0 = average_l0
+    if not resolved_average_l0 and canonical_map_path:
+        resolved_average_l0 = extract_average_l0_from_canonical_map(
+            canonical_map_path=Path(canonical_map_path),
+            layer_id=layer_id,
+            width=width,
+        )
+
+    if not resolved_average_l0:
+        # Keep backward-compatible fallback.
+        resolved_average_l0 = "70"
+
+    sae_uri = (
+        "sae-lens://"
+        f"release={release};"
+        f"sae_id=layer_{layer_id}/width_{width}/average_l0_{resolved_average_l0}"
+    )
+    return sae_uri, resolved_average_l0
+
+
+def load_control_results(control_result_files: Sequence[str]) -> list[str]:
+    texts: list[str] = []
+    for file_path in control_result_files:
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Cannot find control result file: {path}")
+        texts.append(path.read_text(encoding="utf-8").strip())
+    return texts
 
 
 @dataclass
