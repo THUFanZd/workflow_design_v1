@@ -269,7 +269,7 @@ def _design_boundary_experiments_for_input(
             explanation=hypothesis,
             boundary_case_count=num_sentences,
             max_tokens=max_tokens,
-            temperature=0.2,
+            temperature=0.0,
             token_counter=token_counter,
             llm_calls=llm_calls,
             call_metadata={
@@ -367,7 +367,7 @@ def design_hypothesis_experiments(
     llm_model: str = DEFAULT_MODEL_NAME,
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
     temperature: float = 0.2,
-    max_tokens: int = 1000,
+    max_tokens: int = 20000,
     run_side: RunSideType = "both",
 ) -> Dict[str, Any]:
     model_id = hypotheses_result.get("model_id", "unknown-model")
