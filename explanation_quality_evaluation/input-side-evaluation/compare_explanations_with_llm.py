@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import re
 import json
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from datetime import datetime
@@ -10,6 +11,11 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 from openai import OpenAI
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from function import DEFAULT_CANONICAL_MAP_PATH, build_default_sae_path
 from neuronpedia_feature_api import extract_explanations, fetch_feature_json
 
 Decision = Literal["ACTIVATE", "DO_NOT_ACTIVATE"]
@@ -20,6 +26,11 @@ DEFAULT_API_KEY_FILE = (
     "C:\\Users\\lzx\\Desktop\\\u7814\u4e00\u4e0b\\ppio_api_key.txt"
 )
 DEBUG_LLM_IO_PATH = Path("./outputs/llm_inout.md")
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "explanation_quality_evaluation" / "input-side-evaluation" / "outputs"
+
+SAE_RELEASE_BY_NAME: Dict[str, str] = {
+    "gemmascope-res": "gemma-scope-2b-pt-res",
+}
 
 
 # DEBUG LOGGING BLOCK (easy to remove): write full LLM input/output for each judge call.
@@ -86,24 +97,29 @@ def _sanitize_path_component(value: str) -> str:
 
 def _extract_output_layout_from_source(source: str) -> Tuple[str, str]:
     parts = [p for p in source.split("-") if p]
-    if len(parts) >= 3 and parts[0].isdigit():
-        layer_id = parts[0]
-        sae_name = "-".join(parts[1:-1]) or parts[1]
-        return layer_id, sae_name
     if parts and parts[0].isdigit():
-        return parts[0], source
+        layer_id = parts[0]
+        if len(parts) >= 3:
+            sae_name = "-".join(parts[1:-1]) or parts[1]
+            return layer_id, sae_name
+        if len(parts) >= 2:
+            return layer_id, parts[1]
+        return layer_id, source
     return "unknown", source
 
 
-def _prepare_run_output_paths(source: str, feature_id: str) -> Dict[str, Path]:
+def _prepare_run_output_paths(
+    source: str,
+    feature_id: str,
+    *,
+    output_root: Path,
+) -> Dict[str, Path]:
     layer_id, sae_name = _extract_output_layout_from_source(source)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = (
-        Path("outputs")
+        output_root
         / _sanitize_path_component(sae_name)
         / f"layer-{_sanitize_path_component(layer_id)}"
         / f"feature-{_sanitize_path_component(str(feature_id))}"
-        / timestamp
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     return {
@@ -111,6 +127,7 @@ def _prepare_run_output_paths(source: str, feature_id: str) -> Dict[str, Path]:
         "llm_io_log": run_dir / "llm_inout.md",
         "evaluation_record": run_dir / "evaluation_record.json",
         "result_json": run_dir / "result.json",
+        "result_md": run_dir / "result.md",
     }
 
 
@@ -466,14 +483,17 @@ def generate_boundary_contexts(
     return deduped[:boundary_case_count]
 
 
-def _parse_layer_width_from_source(source: str) -> Tuple[int, str]:
-    match = re.match(r"^(?P<layer>\d+)-gemmascope-res-(?P<width>[A-Za-z0-9_]+)$", source)
-    if not match:
+def _parse_source_layout(source: str) -> Tuple[int, str, str]:
+    parts = [p for p in source.split("-") if p]
+    if len(parts) < 3 or not parts[0].isdigit():
         raise ValueError(
-            "Cannot infer SAE layer/width from source. "
+            "Cannot infer SAE layer/sae/width from source. "
             "Provide --sae-path and --sae-layer explicitly."
         )
-    return int(match.group("layer")), match.group("width")
+    layer = int(parts[0])
+    width = parts[-1]
+    sae_name = "-".join(parts[1:-1]).strip() or "gemmascope-res"
+    return layer, sae_name, width
 
 
 def _normalize_hf_model_name(model_id: str, hf_model_name: Optional[str]) -> str:
@@ -503,17 +523,37 @@ def _resolve_sae_path(
     source: str,
     sae_path: Optional[str],
     sae_variant: str,
+    sae_name: Optional[str],
+    sae_release: Optional[str],
+    sae_average_l0: Optional[str],
+    sae_canonical_map: Optional[str],
 ) -> str:
     if sae_path:
         return sae_path
-    layer, width = _parse_layer_width_from_source(source)
-    release = _infer_gemma_scope_release(model_id)
-    if release is None:
-        raise ValueError(
-            f"Cannot infer SAE release from model_id='{model_id}'. "
-            "Please pass --sae-path explicitly."
-        )
-    return f"sae-lens://release={release};sae_id=layer_{layer}/width_{width}/{sae_variant}"
+    layer, source_sae_name, width = _parse_source_layout(source)
+    resolved_sae_name = (sae_name or source_sae_name).strip()
+    release = (
+        (sae_release or "").strip()
+        or SAE_RELEASE_BY_NAME.get(resolved_sae_name)
+        or _infer_gemma_scope_release(model_id)
+        or resolved_sae_name
+    )
+
+    resolved_average_l0 = (sae_average_l0 or "").strip() or None
+    if not resolved_average_l0:
+        match = re.search(r"average_l0_([0-9]+(?:\.[0-9]+)?)", str(sae_variant or ""))
+        if match:
+            resolved_average_l0 = match.group(1)
+
+    canonical_map = Path(sae_canonical_map) if sae_canonical_map else (PROJECT_ROOT / DEFAULT_CANONICAL_MAP_PATH)
+    sae_uri, _ = build_default_sae_path(
+        layer_id=str(layer),
+        width=width,
+        release=release,
+        average_l0=resolved_average_l0,
+        canonical_map_path=canonical_map,
+    )
+    return sae_uri
 
 
 def _resolve_sae_device(sae_device: str) -> str:
@@ -536,6 +576,10 @@ def build_boundary_sae_module(
     sae_path: Optional[str] = None,
     sae_layer: Optional[int] = None,
     sae_variant: str = "average_l0_70",
+    sae_name: Optional[str] = None,
+    sae_release: Optional[str] = None,
+    sae_average_l0: Optional[str] = None,
+    sae_canonical_map: Optional[str] = None,
     sae_device: str = "auto",
 ) -> Any:
     try:
@@ -546,11 +590,20 @@ def build_boundary_sae_module(
             "Please ensure model/SAE dependencies are installed."
         ) from exc
 
-    resolved_sae_path = _resolve_sae_path(model_id, source, sae_path=sae_path, sae_variant=sae_variant)
+    resolved_sae_path = _resolve_sae_path(
+        model_id,
+        source,
+        sae_path=sae_path,
+        sae_variant=sae_variant,
+        sae_name=sae_name,
+        sae_release=sae_release,
+        sae_average_l0=sae_average_l0,
+        sae_canonical_map=sae_canonical_map,
+    )
     resolved_sae_layer = sae_layer
     if resolved_sae_layer is None:
         try:
-            inferred_layer, _ = _parse_layer_width_from_source(source)
+            inferred_layer, _, _ = _parse_source_layout(source)
             resolved_sae_layer = inferred_layer
         except ValueError:
             resolved_sae_layer = None
@@ -749,17 +802,26 @@ def compare_with_neuronpedia_explanations(
     sae_path: Optional[str] = None,
     sae_layer: Optional[int] = None,
     sae_variant: str = "average_l0_70",
+    sae_name: Optional[str] = None,
+    sae_release: Optional[str] = None,
+    sae_average_l0: Optional[str] = None,
+    sae_canonical_map: Optional[str] = None,
     sae_device: str = "auto",
+    output_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     global DEBUG_LLM_IO_PATH
-    output_paths = _prepare_run_output_paths(source=source, feature_id=index)
+    output_paths = _prepare_run_output_paths(
+        source=source,
+        feature_id=index,
+        output_root=Path(output_root) if output_root is not None else DEFAULT_OUTPUT_ROOT,
+    )
     DEBUG_LLM_IO_PATH = output_paths["llm_io_log"]
 
     print("in comparing:")
     payload = fetch_feature_json(
         model_id=model_id,
         source=source,
-        index=index,
+        feature_id=index,
         api_key=neuronpedia_api_key,
         timeout=neuronpedia_timeout,
     )
@@ -823,6 +885,10 @@ def compare_with_neuronpedia_explanations(
             sae_path=sae_path,
             sae_layer=sae_layer,
             sae_variant=sae_variant,
+            sae_name=sae_name,
+            sae_release=sae_release,
+            sae_average_l0=sae_average_l0,
+            sae_canonical_map=sae_canonical_map,
             sae_device=sae_device,
         )
 
@@ -991,6 +1057,7 @@ def compare_with_neuronpedia_explanations(
             "llm_io_log": str(output_paths["llm_io_log"]),
             "evaluation_record": str(output_paths["evaluation_record"]),
             "result_json": str(output_paths["result_json"]),
+            "result_md": str(output_paths["result_md"]),
         },
     }
 
@@ -1071,6 +1138,11 @@ def compare_with_neuronpedia_explanations(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    _write_result_markdown(
+        output_paths["result_md"],
+        result=result,
+        record=record,
+    )
     return result
 
 
@@ -1082,6 +1154,59 @@ def _load_my_explanation(args: argparse.Namespace) -> str:
     if args.my_explanation_file:
         return Path(args.my_explanation_file).read_text(encoding="utf-8").strip()
     raise ValueError("Missing my explanation. Provide --my-explanation or --my-explanation-file.")
+
+
+def _write_result_markdown(path: Path, *, result: Dict[str, Any], record: Dict[str, Any]) -> None:
+    feature = result.get("feature", {})
+    scores = record.get("scores", {})
+    summary = record.get("summary", {})
+
+    lines: List[str] = []
+    lines.append("# Input-side Explanation Evaluation")
+    lines.append("")
+    lines.append("## Metadata")
+    lines.append(f"- generated_at: {record.get('timestamp')}")
+    lines.append(f"- model_id: {feature.get('model_id')}")
+    lines.append(f"- source: {feature.get('source')}")
+    lines.append(f"- feature_id: {feature.get('index')}")
+    lines.append("")
+    lines.append("## Hypothesis")
+    lines.append("```text")
+    lines.append(str(record.get("hypothesis", "")))
+    lines.append("```")
+    lines.append("")
+    lines.append("## Scores")
+    lines.append(f"- activation_relative_quality_score: {scores.get('activation_relative_quality_score')}")
+    lines.append(f"- activation_adherence: {scores.get('activation_adherence')}")
+    lines.append(f"- non_activation_relative_quality_score: {scores.get('non_activation_relative_quality_score')}")
+    lines.append(f"- non_activation_adherence: {scores.get('non_activation_adherence')}")
+    lines.append(f"- boundary_non_activation_rate: {scores.get('boundary_non_activation_rate')}")
+    lines.append(f"- boundary_relative_quality_score: {scores.get('boundary_relative_quality_score')}")
+    lines.append("")
+    lines.append("## Case Counts")
+    lines.append(f"- num_activation_cases: {summary.get('num_activation_cases')}")
+    lines.append(f"- num_non_activation_cases: {summary.get('num_non_activation_cases')}")
+    lines.append(f"- num_boundary_cases_my: {summary.get('num_boundary_cases_my')}")
+    lines.append(f"- num_boundary_cases_reference: {summary.get('num_boundary_cases_reference')}")
+    lines.append("")
+    lines.append("## Reference Comparison")
+    lines.append("| reference_explanation | activation_relative_quality | non_activation_relative_quality |")
+    lines.append("| --- | ---: | ---: |")
+    non_activation_map: Dict[str, Any] = {
+        str(item.get("reference_explanation", "")): item.get("relative_quality")
+        for item in result.get("non_activation_details", [])
+        if isinstance(item, dict)
+    }
+    for item in result.get("details", []):
+        if not isinstance(item, dict):
+            continue
+        reference_explanation = str(item.get("reference_explanation", ""))
+        escaped_reference = reference_explanation.replace("|", "\\|")
+        lines.append(
+            f"| {escaped_reference} | {item.get('relative_quality')} | {non_activation_map.get(reference_explanation)} |"
+        )
+    lines.append("")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1201,12 +1326,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sae-variant",
         default="average_l0_105",
-        help="SAE variant name when SAE path is inferred.",
+        help="Backward-compatible SAE variant name when SAE path is inferred.",
+    )
+    parser.add_argument(
+        "--sae-name",
+        default="gemmascope-res",
+        help="SAE family name used to resolve default release and output path.",
+    )
+    parser.add_argument(
+        "--sae-release",
+        default=None,
+        help="Optional explicit SAE release, e.g. gemma-scope-2b-pt-res.",
+    )
+    parser.add_argument(
+        "--sae-average-l0",
+        default=None,
+        help="Optional average_l0 suffix number (e.g. 105). If omitted, resolve from canonical map.",
+    )
+    parser.add_argument(
+        "--sae-canonical-map",
+        default=str(PROJECT_ROOT / DEFAULT_CANONICAL_MAP_PATH),
+        help="Path to canonical_map.txt used for default average_l0 resolution.",
     )
     parser.add_argument(
         "--sae-device",
         default="auto",
         help="Device for SAE scoring (auto/cpu/cuda).",
+    )
+    parser.add_argument(
+        "--output-root",
+        default=str(DEFAULT_OUTPUT_ROOT),
+        help="Output root directory. Results are saved under outputs/{sae}/layer-{id}/feature-{id}.",
     )
     parser.add_argument("--output-json", default=None, help="Optional path to write JSON output")
     return parser.parse_args()
@@ -1242,7 +1392,12 @@ def main() -> None:
         sae_path=args.sae_path,
         sae_layer=args.sae_layer,
         sae_variant=args.sae_variant,
+        sae_name=args.sae_name,
+        sae_release=args.sae_release,
+        sae_average_l0=args.sae_average_l0,
+        sae_canonical_map=args.sae_canonical_map,
         sae_device=args.sae_device,
+        output_root=Path(args.output_root),
     )
 
     text = json.dumps(result, ensure_ascii=False, indent=2)

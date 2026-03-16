@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from openai import OpenAI
@@ -21,7 +21,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from experiments_design import OUTPUT_SIDE_PLACEHOLDER
 from function import DEFAULT_CANONICAL_MAP_PATH, build_default_sae_path, call_llm
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
-from model_with_sae import ModelWithSAEModule
+
+if TYPE_CHECKING:
+    from model_with_sae import ModelWithSAEModule
 
 SAE_RELEASE_BY_NAME: Dict[str, str] = {
     "gemmascope-res": "gemma-scope-2b-pt-res",
@@ -286,11 +288,23 @@ def _build_token_rows(
 
 
 def _write_markdown(path: Path, payload: Dict[str, Any]) -> None:
+    metadata = payload.get("metadata", {})
+    runs = payload.get("runs", [])
+    positive_ratios = [
+        float(run.get("scores", {}).get("positive_topk_increase_ratio", 0.0))
+        for run in runs
+        if isinstance(run, dict)
+    ]
+    negative_ratios = [
+        float(run.get("scores", {}).get("negative_topk_decrease_ratio", 0.0))
+        for run in runs
+        if isinstance(run, dict)
+    ]
+
     lines: List[str] = []
-    lines.append("# Intervention Logit Top-K Score")
+    lines.append("# Output-side Logit Top-K Evaluation")
     lines.append("")
     lines.append("## Metadata")
-    metadata = payload.get("metadata", {})
     for key in [
         "generated_at",
         "sae_name",
@@ -305,8 +319,20 @@ def _write_markdown(path: Path, payload: Dict[str, Any]) -> None:
         lines.append(f"- {key}: {metadata.get(key)}")
     lines.append("")
     lines.append("## Hypothesis")
-    lines.append("")
+    lines.append("```text")
     lines.append(payload.get("explanation", ""))
+    lines.append("```")
+    lines.append("")
+    lines.append("## Scores")
+    lines.append(
+        f"- mean_positive_topk_increase_ratio: "
+        f"{(sum(positive_ratios) / len(positive_ratios)) if positive_ratios else None}"
+    )
+    lines.append(
+        f"- mean_negative_topk_decrease_ratio: "
+        f"{(sum(negative_ratios) / len(negative_ratios)) if negative_ratios else None}"
+    )
+    lines.append(f"- run_count: {len(runs)}")
     lines.append("")
     lines.append("## Run Summary")
     lines.append("| target_kl | clamp_value | actual_kl | cache_hit | positive_ratio | negative_ratio |")
@@ -350,17 +376,6 @@ def _write_markdown(path: Path, payload: Dict[str, Any]) -> None:
                 f"| {row.get('clean_logit'):.6f} | {row.get('steered_logit'):.6f} | {row.get('delta_logit'):.6f} "
                 f"| {row.get('llm_expected_effect')} | {row.get('llm_is_correct')} |"
             )
-        lines.append("")
-
-        lines.append("### LLM Judge Input")
-        lines.append("```json")
-        lines.append(json.dumps(run.get("llm_judge", {}).get("messages", []), ensure_ascii=False, indent=2))
-        lines.append("```")
-        lines.append("")
-        lines.append("### LLM Judge Output")
-        lines.append("```text")
-        lines.append(str(run.get("llm_judge", {}).get("raw_output", "")))
-        lines.append("```")
         lines.append("")
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -415,6 +430,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json-filename", default="intervention_logit_topk_score.json")
     parser.add_argument("--md-filename", default="intervention_logit_topk_score.md")
+    parser.add_argument(
+        "--prefer-existing",
+        dest="prefer_existing",
+        action="store_true",
+        help="Prefer existing intervention_logit_topk_score.json under output directory.",
+    )
+    parser.add_argument(
+        "--no-prefer-existing",
+        dest="prefer_existing",
+        action="store_false",
+        help="Do not load existing score json before recomputing.",
+    )
+    parser.add_argument(
+        "--force-refresh-score",
+        action="store_true",
+        help="Force recomputing score even if existing score json is present.",
+    )
+    parser.set_defaults(prefer_existing=True)
     return parser
 
 
@@ -434,6 +467,23 @@ def _resolve_target_dir(*, output_root: str, sae_name: str, layer_id: str, featu
     return target_dir
 
 
+def _try_load_existing_result(
+    *,
+    target_dir: Path,
+    json_filename: str,
+) -> Optional[Dict[str, Any]]:
+    json_path = target_dir / json_filename
+    if not json_path.exists():
+        return None
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
 def main() -> None:
     args = _build_parser().parse_args()
     layer_id = str(args.layer_id)
@@ -442,6 +492,44 @@ def main() -> None:
     target_kls = [float(x) for x in args.target_kl]
     top_k = int(args.top_k)
     prompts = _safe_prompt_list(args.prompts)
+    target_dir = _resolve_target_dir(
+        output_root=str(args.output_root),
+        sae_name=str(args.sae_name),
+        layer_id=layer_id,
+        feature_id=feature_id,
+    )
+
+    if bool(args.prefer_existing) and not bool(args.force_refresh_score):
+        existing_payload = _try_load_existing_result(
+            target_dir=target_dir,
+            json_filename=str(args.json_filename),
+        )
+        if existing_payload is not None:
+            md_path = target_dir / str(args.md_filename)
+            _write_markdown(md_path, existing_payload)
+            print(
+                json.dumps(
+                    {
+                        "output_dir": str(target_dir),
+                        "json_file": str(target_dir / str(args.json_filename)),
+                        "md_file": str(md_path),
+                        "loaded_from_cache": True,
+                        "runs": [
+                            {
+                                "target_kl": run.get("target_kl"),
+                                "positive_topk_increase_ratio": run.get("scores", {}).get("positive_topk_increase_ratio"),
+                                "negative_topk_decrease_ratio": run.get("scores", {}).get("negative_topk_decrease_ratio"),
+                            }
+                            for run in existing_payload.get("runs", [])
+                            if isinstance(run, dict)
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return
+
     explanation = _resolve_explanation(args)
 
     sae_uri, sae_release, resolved_average_l0 = _resolve_sae(
@@ -453,13 +541,9 @@ def main() -> None:
         canonical_map_path=Path(args.sae_canonical_map),
     )
 
-    target_dir = _resolve_target_dir(
-        output_root=str(args.output_root),
-        sae_name=str(args.sae_name),
-        layer_id=layer_id,
-        feature_id=feature_id,
-    )
     cache_path = target_dir / "kl_clamp_cache.json"
+
+    from model_with_sae import ModelWithSAEModule
 
     module = ModelWithSAEModule(
         llm_name=str(args.model_checkpoint_path),
@@ -492,6 +576,7 @@ def main() -> None:
     runs: List[Dict[str, Any]] = []
     clean_logits = module.run_logits(prompt_tokens)
     clean_mean_logits = clean_logits.mean(dim=(0, 1)).detach().float().cpu()
+    # Note all tokens or next token?
 
     for target_kl in target_kls:
         cache_hit_entry: Optional[Dict[str, Any]] = None

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import random
 import re
-from typing import Any, Dict, List, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Sequence
 
 from openai import OpenAI
 
 from function import TokenUsageAccumulator, call_llm
-from model_with_sae import ModelWithSAEModule
 from prompts.experiments_execution_prompt import build_output_judge_system_prompt, build_output_judge_user_prompt
+
+if TYPE_CHECKING:
+    from model_with_sae import ModelWithSAEModule
 
 KL_DIV_VALUES_DEFAULT = [0.25, 0.5, -0.25, -0.5]
 
