@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -108,6 +109,20 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _format_elapsed(total_seconds: float) -> str:
+    total = max(0, int(total_seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _log_stage(message: str, workflow_start_time: float) -> None:
+    elapsed = _format_elapsed(time.perf_counter() - workflow_start_time)
+    print(f"[elapsed {elapsed}] {message}")
 
 
 def _build_input_hypothesis_selection_payload(
@@ -375,6 +390,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
+    workflow_start_time = time.perf_counter()
 
     if args.max_rounds < 0:
         raise ValueError("--max-rounds must be >= 0.")
@@ -415,7 +431,7 @@ if __name__ == "__main__":
         round_index=0,
         kind="observation_input",
     )
-    print('collect observation...')
+    _log_stage("collect observation...", workflow_start_time)
     if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=1):
         observation = fetch_and_parse_feature_observation(
             model_id=args.model_id,
@@ -442,7 +458,7 @@ if __name__ == "__main__":
         round_index=0,
         kind="initial_hypotheses",
     )
-    print('generate initial hypotheses...')
+    _log_stage("generate initial hypotheses...", workflow_start_time)
     if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=2):
         initial_result = generate_initial_hypotheses(
             observation=observation,
@@ -510,7 +526,7 @@ if __name__ == "__main__":
         round_index=0,
         kind="experiments",
     )
-    print('design baseline experiments...')
+    _log_stage("design baseline experiments...", workflow_start_time)
     if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=3):
         baseline_experiments_result = design_hypothesis_experiments(
             hypotheses_result=current_hypotheses,
@@ -537,7 +553,7 @@ if __name__ == "__main__":
         round_index=0,
         kind="experiments_execution",
     )
-    print('execute baseline experiments...')
+    _log_stage("execute baseline experiments...", workflow_start_time)
     if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=4):
         if module is None:
             sae_path = args.sae_path or build_default_sae_path(
@@ -606,7 +622,7 @@ if __name__ == "__main__":
         kind="memory",
     )
     baseline_memory_md_path = baseline_memory_path.with_suffix(".md")
-    print('build baseline memory...')
+    _log_stage("build baseline memory...", workflow_start_time)
     if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=5):
         baseline_memory_result = build_hypothesis_memory(
             initial_hypotheses_result=current_hypotheses,
@@ -627,7 +643,7 @@ if __name__ == "__main__":
 
     for round_index in range(1, args.max_rounds + 1):
         round_id = _round_id_from_index(round_index)
-        print(f'round {round_index}...')
+        _log_stage(f"round {round_index}...", workflow_start_time)
 
         if previous_execution_result is None:
             prev_execution_path = _artifact_json_path(
@@ -656,7 +672,7 @@ if __name__ == "__main__":
             round_index=round_index,
             kind="refined_hypotheses",
         )
-        print('refine hypotheses...')
+        _log_stage("refine hypotheses...", workflow_start_time)
         if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=1):
             historical_memories: List[Dict[str, Any]] = []
             history_end = round_index - 1
@@ -718,7 +734,7 @@ if __name__ == "__main__":
             round_index=round_index,
             kind="experiments",
         )
-        print('design experiments...')
+        _log_stage("design experiments...", workflow_start_time)
         if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=2):
             experiments_result = design_hypothesis_experiments(
                 hypotheses_result=current_hypotheses,
@@ -745,7 +761,7 @@ if __name__ == "__main__":
             round_index=round_index,
             kind="experiments_execution",
         )
-        print('execute experiments...')
+        _log_stage("execute experiments...", workflow_start_time)
         if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=3):
             if module is None:
                 sae_path = args.sae_path or build_default_sae_path(
@@ -812,7 +828,7 @@ if __name__ == "__main__":
             kind="memory",
         )
         memory_md_path = memory_path.with_suffix(".md")
-        print('build memory...')
+        _log_stage("build memory...", workflow_start_time)
         if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=4):
             memory_result = build_hypothesis_memory(
                 initial_hypotheses_result=current_hypotheses,
