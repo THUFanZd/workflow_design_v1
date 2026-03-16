@@ -27,7 +27,7 @@ DEFAULT_API_KEY_FILE = (
 )
 DEBUG_LLM_IO_PATH = Path("./outputs/llm_inout.md")
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "explanation_quality_evaluation" / "input-side-evaluation" / "outputs"
-DEFAULT_REFERENCE_CACHE_ROOT = PROJECT_ROOT / "explanation_quality_evaluation" / "input-side-evaluation"
+DEFAULT_REFERENCE_CACHE_ROOT = DEFAULT_OUTPUT_ROOT
 
 SAE_RELEASE_BY_NAME: Dict[str, str] = {
     "gemmascope-res": "gemma-scope-2b-pt-res",

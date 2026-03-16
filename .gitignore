@@ -12,3 +12,5 @@ model_download/
 prompt_for_codeagent/
 explanation_quality_evaluation/output-side-evaluation/gemmascope-res
 explanation_quality_evaluation/output-side-evaluation/outputs
+explanation_quality_evaluation/input-side-evaluation/outputs
+explanation_quality_evaluation/input-side-evaluation/gemmascope-res

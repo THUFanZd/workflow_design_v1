@@ -191,7 +191,7 @@ def _run_command_with_progress(
     *,
     cwd: Path,
     step_name: str,
-    heartbeat_seconds: int = 30,
+    heartbeat_seconds: int = 60,
 ) -> None:
     _log_progress(f"Start step: {step_name}")
     _log_progress(f"Command: {' '.join(cmd)}")
@@ -353,7 +353,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--heartbeat-seconds",
         type=int,
-        default=30,
+        default=60,
         help="Progress heartbeat interval in seconds while a child process is running.",
     )
 
