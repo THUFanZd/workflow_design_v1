@@ -170,7 +170,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--num-input-sentences-per-hypothesis",
         type=int,
         default=5,
-        help="Input-side designed sentences per hypothesis.",
+        help="Input-side designed activation and boundary sentences per hypothesis.",
     )
     parser.add_argument("--top-m", type=int, default=None, help="Refine top-m hypotheses per side (default=all).")
     parser.add_argument(

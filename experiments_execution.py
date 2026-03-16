@@ -57,13 +57,29 @@ def _write_markdown_log(
     lines.append("## Input-side Execution")
     lines.append(f"- non_zero_threshold: {input_side['non_zero_threshold']}")
     lines.append(f"- overall_score_non_zero_rate: {input_side['overall_score_non_zero_rate']}")
+    lines.append(
+        "- overall_score_boundary_non_activation_rate: "
+        f"{input_side.get('overall_score_boundary_non_activation_rate')}"
+    )
     lines.append("")
     for hypothesis_result in input_side["hypothesis_results"]:
         lines.append(f"### Input Hypothesis {hypothesis_result['hypothesis_index']}")
         lines.append(f"- explanation_original: {hypothesis_result['hypothesis']}")
         lines.append(f"- score_non_zero_rate: {hypothesis_result['score_non_zero_rate']}")
+        lines.append(
+            "- score_boundary_non_activation_rate: "
+            f"{hypothesis_result.get('score_boundary_non_activation_rate')}"
+        )
         lines.append(f"- mean_summary_activation: {hypothesis_result['mean_summary_activation']}")
         lines.append(f"- max_summary_activation: {hypothesis_result['max_summary_activation']}")
+        lines.append(
+            "- mean_boundary_summary_activation: "
+            f"{hypothesis_result.get('mean_boundary_summary_activation')}"
+        )
+        lines.append(
+            "- max_boundary_summary_activation: "
+            f"{hypothesis_result.get('max_boundary_summary_activation')}"
+        )
         lines.append("")
         lines.append("#### Input Activation Context")
         lines.append("```text")
@@ -72,6 +88,20 @@ def _write_markdown_log(
         lines.append("| sentence_index | sentence | summary_activation | max_token | non_zero |")
         lines.append("| --- | --- | ---: | --- | --- |")
         for sentence_result in hypothesis_result["sentence_results"]:
+            sentence = str(sentence_result["sentence"]).replace("|", "\\|")
+            lines.append(
+                f"| {sentence_result['sentence_index']} | {sentence} | "
+                f"{sentence_result['summary_activation']} | {sentence_result['max_token']} | "
+                f"{sentence_result['is_non_zero']} |"
+            )
+        lines.append("")
+        lines.append("#### Input Boundary Context")
+        lines.append("```text")
+        lines.append(hypothesis_result.get("input_boundary_context", ""))
+        lines.append("```")
+        lines.append("| boundary_index | sentence | summary_activation | max_token | non_zero |")
+        lines.append("| --- | --- | ---: | --- | --- |")
+        for sentence_result in hypothesis_result.get("boundary_sentence_results", []):
             sentence = str(sentence_result["sentence"]).replace("|", "\\|")
             lines.append(
                 f"| {sentence_result['sentence_index']} | {sentence} | "
@@ -255,7 +285,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--num-input-sentences-per-hypothesis",
         type=int,
         default=5,
-        help="For each input-side hypothesis, generate this many activation sentences.",
+        help="For each input-side hypothesis, generate this many activation and boundary sentences.",
     )
     parser.add_argument("--width", default="16k", help="Neuronpedia source width")
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])

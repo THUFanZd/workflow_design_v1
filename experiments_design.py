@@ -5,7 +5,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
 from openai import OpenAI
 
@@ -13,6 +13,7 @@ from function import (
     TokenUsageAccumulator,
     build_round_dir,
     call_llm_stream,
+    extract_usage_counts,
     extract_json_object,
     normalize_round_id,
     read_api_key,
@@ -60,6 +61,144 @@ def _parse_sentence_list(raw_output: str, expected_count: int) -> List[str]:
             f"Expected {expected_count} sentences, but only parsed {len(sentences)}: {raw_output}"
         )
     return sentences[:expected_count]
+
+
+def _extract_json_any(text: str) -> Optional[Any]:
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    for pattern in (r"\{.*\}", r"\[.*\]"):
+        match = re.search(pattern, text, flags=re.DOTALL)
+        if not match:
+            continue
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            continue
+    return None
+
+
+def _extract_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        normalized = " ".join(value.split())
+        return [normalized] if normalized else []
+    if isinstance(value, list):
+        out: List[str] = []
+        for item in value:
+            out.extend(_extract_string_list(item))
+        return out
+    if isinstance(value, dict):
+        out: List[str] = []
+        for item in value.values():
+            out.extend(_extract_string_list(item))
+        return out
+    return []
+
+
+def generate_boundary_contexts(
+    client: OpenAI,
+    model: str,
+    explanation: str,
+    boundary_case_count: int = 5,
+    max_tokens: int = 5000,
+    temperature: float = 0.2,
+    token_counter: Optional[TokenUsageAccumulator] = None,
+    llm_calls: Optional[List[Dict[str, Any]]] = None,
+    call_metadata: Optional[Dict[str, Any]] = None,
+    llm_io_logger: Optional[Callable[[str, str, str], None]] = None,
+) -> List[str]:
+    if boundary_case_count <= 0:
+        raise ValueError("boundary_case_count must be a positive integer.")
+
+    system_prompt = (
+        "You are an expert at designing adversarial boundary test cases for SAE feature explanations."
+        " Return JSON only."
+    )
+    user_prompt = (
+        "Task: generate boundary contexts for the hypothesis below.\n\n"
+        "Definition of boundary case (critical):\n"
+        "- A boundary case is near the edge of the explained set by the feature explanation:\\\n"
+        "  it looks lexically/semantically similar,\n"
+        "  but should still fall OUTSIDE the true activation set, which means .\n"
+        "- The case should be tempting and confusable, but as long as it sticks closely to the explanation,\n"
+        "  the feature should NOT activate strongly on that case.\n"
+        "- Use multiple near-miss types when possible (context shift, minimal lexical edits,\n"
+        "  homophone/orthographic variants, same surface form in a different domain, etc.).\n\n"
+        f"Hypothesis / explanation:\n{explanation}\n\n"
+        f"Generate exactly {boundary_case_count} boundary contexts.\n"
+        "Each context should be a single natural sentence or short snippet.\n"
+        "Return JSON only in this format:\n"
+        "{\n"
+        '  "boundary_cases": ["case 1", "case 2", "case 3", "case 4", "case 5"]\n'
+        "}"
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        stream=False,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    content = (response.choices[0].message.content or "").strip().strip("`")
+    if llm_io_logger is not None:
+        llm_io_logger(system_prompt, user_prompt, content)
+
+    usage_counts = extract_usage_counts(getattr(response, "usage", None))
+    if token_counter is not None:
+        token_counter.add(getattr(response, "usage", None))
+    if llm_calls is not None:
+        record = {
+            "messages": messages,
+            "raw_output": content,
+            "usage": usage_counts,
+            "call_type": "input_boundary_context_generation",
+        }
+        if isinstance(call_metadata, dict):
+            record.update(call_metadata)
+        llm_calls.append(record)
+
+    parsed = _extract_json_any(content)
+    candidates: List[str] = []
+    if isinstance(parsed, dict):
+        for key in ("boundary_cases", "cases", "examples", "contexts", "items"):
+            if key in parsed:
+                candidates.extend(_extract_string_list(parsed[key]))
+        if not candidates:
+            candidates.extend(_extract_string_list(parsed))
+    elif parsed is not None:
+        candidates.extend(_extract_string_list(parsed))
+
+    if not candidates:
+        for line in content.splitlines():
+            cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+            if cleaned:
+                candidates.append(" ".join(cleaned.split()))
+
+    deduped: List[str] = []
+    seen = set()
+    for item in candidates:
+        if item and item not in seen:
+            seen.add(item)
+            deduped.append(item)
+
+    if len(deduped) < boundary_case_count:
+        raise ValueError(
+            f"Boundary case generator returned {len(deduped)} cases, "
+            f"but {boundary_case_count} are required. Raw output: {content}"
+        )
+    return deduped[:boundary_case_count]
 
 
 def _design_experiments_for_side(
@@ -111,6 +250,37 @@ def _design_experiments_for_side(
     return all_sentences
 
 
+def _design_boundary_experiments_for_input(
+    *,
+    hypotheses: Sequence[str],
+    num_sentences: int,
+    client: OpenAI,
+    model: str,
+    token_counter: TokenUsageAccumulator,
+    llm_calls: List[Dict[str, Any]],
+    max_tokens: int,
+) -> List[List[str]]:
+    all_sentences: List[List[str]] = []
+    for index, hypothesis in enumerate(hypotheses, start=1):
+        boundary_sentences = generate_boundary_contexts(
+            client=client,
+            model=model,
+            explanation=hypothesis,
+            boundary_case_count=num_sentences,
+            max_tokens=max_tokens,
+            temperature=0.2,
+            token_counter=token_counter,
+            llm_calls=llm_calls,
+            call_metadata={
+                "side": "input",
+                "hypothesis_index": index,
+                "hypothesis_text": hypothesis,
+            },
+        )
+        all_sentences.append(boundary_sentences)
+    return all_sentences
+
+
 def _write_markdown_log(
     path: Path,
     *,
@@ -129,6 +299,10 @@ def _write_markdown_log(
         lines.append(f"- round_id: {result['round_id']}")
     lines.append(f"- num_hypothesis: {result['num_hypothesis']}")
     lines.append(f"- num_input_sentences_per_hypothesis: {result['num_input_sentences_per_hypothesis']}")
+    lines.append(
+        f"- num_input_boundary_sentences_per_hypothesis: "
+        f"{result['num_input_boundary_sentences_per_hypothesis']}"
+    )
     lines.append(f"- llm_model: {result['llm_model']}")
     lines.append("")
     lines.append("## Token Usage (Experiments Generation)")
@@ -144,6 +318,9 @@ def _write_markdown_log(
         lines.append("- designed_sentences:")
         for sentence in pair["designed_sentences"]:
             lines.append(f"  - {sentence}")
+        lines.append("- boundary_sentences:")
+        for sentence in pair.get("boundary_sentences", []):
+            lines.append(f"  - {sentence}")
         lines.append("")
     lines.append("## Output-side Hypotheses And Designed Sentences")
     for idx, pair in enumerate(result["output_side_experiments"], start=1):
@@ -156,6 +333,8 @@ def _write_markdown_log(
     lines.append("## LLM Calls")
     for i, call in enumerate(llm_calls, start=1):
         lines.append(f"### Call {i}")
+        if "call_type" in call:
+            lines.append(f"- call_type: {call.get('call_type')}")
         lines.append(f"- side: {call['side']}")
         lines.append(f"- hypothesis_index: {call['hypothesis_index']}")
         lines.append(f"- hypothesis_text: {call['hypothesis_text']}")
@@ -219,6 +398,15 @@ def design_hypothesis_experiments(
         temperature=temperature,
         max_tokens=max_tokens,
     )
+    input_boundary_sentences = _design_boundary_experiments_for_input(
+        hypotheses=input_hypotheses,
+        num_sentences=num_input_sentences_per_hypothesis,
+        client=client,
+        model=llm_model,
+        token_counter=token_counter,
+        llm_calls=llm_calls,
+        max_tokens=max_tokens,
+    )
     output_sentences = _design_experiments_for_side(
         side="output",
         hypotheses=output_hypotheses,
@@ -249,10 +437,19 @@ def design_hypothesis_experiments(
         "num_hypothesis": num_hypothesis,
         "generation_mode": hypotheses_result.get("generation_mode"),
         "num_input_sentences_per_hypothesis": num_input_sentences_per_hypothesis,
+        "num_input_boundary_sentences_per_hypothesis": num_input_sentences_per_hypothesis,
         "llm_model": llm_model,
         "input_side_experiments": [
-            {"hypothesis": hyp, "designed_sentences": sentences}
-            for hyp, sentences in zip(input_hypotheses, input_sentences)
+            {
+                "hypothesis": hyp,
+                "designed_sentences": sentences,
+                "boundary_sentences": boundary_sentences,
+            }
+            for hyp, sentences, boundary_sentences in zip(
+                input_hypotheses,
+                input_sentences,
+                input_boundary_sentences,
+            )
         ],
         "output_side_experiments": [
             {"hypothesis": hyp, "designed_sentences": sentences}
@@ -288,7 +485,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--num-input-sentences-per-hypothesis",
         type=int,
         default=5,
-        help="For each input-side hypothesis, generate this many activation sentences.",
+        help="For each input-side hypothesis, generate this many activation and boundary sentences.",
     )
     parser.add_argument("--width", default="16k", help="Neuronpedia source width")
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])

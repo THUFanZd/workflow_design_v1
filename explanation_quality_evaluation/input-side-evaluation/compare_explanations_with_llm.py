@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from experiments_design import generate_boundary_contexts
 from function import DEFAULT_CANONICAL_MAP_PATH, build_default_sae_path
 from neuronpedia_feature_api import extract_explanations, fetch_feature_json
 
@@ -369,46 +370,6 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _extract_json_any(text: str) -> Optional[Any]:
-    text = text.strip()
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # Fallback: try to recover a dict/object payload.
-    for pattern in (r"\{.*\}", r"\[.*\]"):
-        match = re.search(pattern, text, flags=re.DOTALL)
-        if not match:
-            continue
-        try:
-            return json.loads(match.group(0))
-        except Exception:
-            continue
-    return None
-
-
-def _extract_string_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        normalized = " ".join(value.split())
-        return [normalized] if normalized else []
-    if isinstance(value, list):
-        out: List[str] = []
-        for item in value:
-            out.extend(_extract_string_list(item))
-        return out
-    if isinstance(value, dict):
-        out: List[str] = []
-        for item in value.values():
-            out.extend(_extract_string_list(item))
-        return out
-    return []
-
-
 def judge_should_activate(
     client: OpenAI,
     model: str,
@@ -463,85 +424,6 @@ def judge_should_activate(
                     return decision
 
     raise ValueError(f"Unexpected judge output: {content}")
-
-
-def generate_boundary_contexts(
-    client: OpenAI,
-    model: str,
-    explanation: str,
-    boundary_case_count: int = 5,
-    max_tokens: int = 5000,
-) -> List[str]:
-    if boundary_case_count <= 0:
-        raise ValueError("boundary_case_count must be a positive integer.")
-
-    system_prompt = (
-        "You are an expert at designing adversarial boundary test cases for SAE feature explanations."
-        " Return JSON only."
-    )
-    user_prompt = (
-        "Task: generate boundary contexts for the hypothesis below.\n\n"
-        "Definition of boundary case (critical):\n"
-        "- A boundary case is near the edge of the explained set by the feature explanation:\
-              it looks lexically/semantically similar,\n"
-        "  but should still fall OUTSIDE the true activation set, which means .\n"
-        "- The case should be tempting and confusable, but as long as it sticks closely to the explanation,\n"
-        "  the feature should NOT activate strongly on that case.\n"
-        "- Use multiple near-miss types when possible (context shift, minimal lexical edits,\n"
-        "  homophone/orthographic variants, same surface form in a different domain, etc.).\n\n"
-        f"Hypothesis / explanation:\n{explanation}\n\n"
-        f"Generate exactly {boundary_case_count} boundary contexts.\n"
-        "Each context should be a single natural sentence or short snippet.\n"
-        "Return JSON only in this format:\n"
-        "{\n"
-        '  "boundary_cases": ["case 1", "case 2", "case 3", "case 4", "case 5"]\n'
-        "}"
-    )
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        stream=False,
-        temperature=0.2,
-        max_tokens=max_tokens,
-    )
-    content = (response.choices[0].message.content or "").strip().strip("`")
-    _append_llm_io_log(system_prompt=system_prompt, user_prompt=user_prompt, raw_output=content)
-
-    parsed = _extract_json_any(content)
-    candidates: List[str] = []
-    if isinstance(parsed, dict):
-        for key in ("boundary_cases", "cases", "examples", "contexts", "items"):
-            if key in parsed:
-                candidates.extend(_extract_string_list(parsed[key]))
-        if not candidates:
-            candidates.extend(_extract_string_list(parsed))
-    elif parsed is not None:
-        candidates.extend(_extract_string_list(parsed))
-
-    if not candidates:
-        # Last-resort fallback for numbered plain-text lists.
-        for line in content.splitlines():
-            cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
-            if cleaned:
-                candidates.append(" ".join(cleaned.split()))
-
-    deduped: List[str] = []
-    seen = set()
-    for item in candidates:
-        if item and item not in seen:
-            seen.add(item)
-            deduped.append(item)
-
-    if len(deduped) < boundary_case_count:
-        raise ValueError(
-            f"Boundary case generator returned {len(deduped)} cases, "
-            f"but {boundary_case_count} are required. Raw output: {content}"
-        )
-    return deduped[:boundary_case_count]
 
 
 def _parse_source_layout(source: str) -> Tuple[int, str, str]:
@@ -1065,6 +947,7 @@ def compare_with_neuronpedia_explanations(
             explanation=my_explanation,
             boundary_case_count=boundary_case_count,
             max_tokens=boundary_max_tokens,
+            llm_io_logger=_append_llm_io_log,
         )
         boundary_score = evaluate_boundary_with_sae(
             contexts=boundary_contexts,
@@ -1095,6 +978,7 @@ def compare_with_neuronpedia_explanations(
                     explanation=exp,
                     boundary_case_count=boundary_case_count,
                     max_tokens=boundary_max_tokens,
+                    llm_io_logger=_append_llm_io_log,
                 )
                 ref_boundary_score = evaluate_boundary_with_sae(
                     contexts=ref_boundary_contexts,
