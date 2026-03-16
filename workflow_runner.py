@@ -96,6 +96,123 @@ def _result_usage(result: Dict[str, Any]) -> Dict[str, int]:
     return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_input_hypothesis_selection_payload(
+    *,
+    model_id: str,
+    layer_id: str,
+    feature_id: str,
+    timestamp: str,
+    round_executions: Dict[int, Dict[str, Any]],
+) -> Dict[str, Any]:
+    entries: List[Dict[str, Any]] = []
+
+    for round_index in sorted(round_executions.keys()):
+        execution_result = round_executions.get(round_index, {})
+        if not isinstance(execution_result, dict):
+            continue
+        input_side = execution_result.get("input_side_execution", {})
+        if not isinstance(input_side, dict):
+            continue
+
+        round_id = _clean_text(execution_result.get("round_id")) or _round_id_from_index(round_index)
+        hypothesis_results_raw = input_side.get("hypothesis_results", [])
+        hypothesis_results = (
+            [item for item in hypothesis_results_raw if isinstance(item, dict)]
+            if isinstance(hypothesis_results_raw, list)
+            else []
+        )
+        for item in hypothesis_results:
+            score_non_zero_rate = _safe_float(item.get("score_non_zero_rate"), 0.0)
+            boundary_score_raw = item.get("score_boundary_non_activation_rate")
+            boundary_score_for_ranking = (
+                _safe_float(boundary_score_raw, 0.0) if boundary_score_raw is not None else 0.0
+            )
+            combined_score = score_non_zero_rate + boundary_score_for_ranking
+            entries.append(
+                {
+                    "round_index": round_index,
+                    "round_id": round_id,
+                    "hypothesis_index": _safe_int(item.get("hypothesis_index"), 0),
+                    "hypothesis": _clean_text(item.get("hypothesis")),
+                    "score_non_zero_rate": score_non_zero_rate,
+                    "score_boundary_non_activation_rate": (
+                        _safe_float(boundary_score_raw, 0.0) if boundary_score_raw is not None else None
+                    ),
+                    "score_boundary_non_activation_rate_for_ranking": boundary_score_for_ranking,
+                    "combined_score": combined_score,
+                    "non_zero_count": _safe_int(item.get("non_zero_count"), 0),
+                    "total_sentences": _safe_int(item.get("total_sentences"), 0),
+                    "boundary_non_activation_count": _safe_int(item.get("boundary_non_activation_count"), 0),
+                    "total_boundary_sentences": _safe_int(item.get("total_boundary_sentences"), 0),
+                    "designed_sentences": (
+                        list(item.get("designed_sentences", []))
+                        if isinstance(item.get("designed_sentences"), list)
+                        else []
+                    ),
+                    "boundary_sentences": (
+                        list(item.get("boundary_sentences", []))
+                        if isinstance(item.get("boundary_sentences"), list)
+                        else []
+                    ),
+                    "sentence_results": (
+                        list(item.get("sentence_results", []))
+                        if isinstance(item.get("sentence_results"), list)
+                        else []
+                    ),
+                    "boundary_sentence_results": (
+                        list(item.get("boundary_sentence_results", []))
+                        if isinstance(item.get("boundary_sentence_results"), list)
+                        else []
+                    ),
+                    "source_execution_round_path": str(
+                        _artifact_json_path(
+                            layer_id=layer_id,
+                            feature_id=feature_id,
+                            timestamp=timestamp,
+                            round_index=round_index,
+                            kind="experiments_execution",
+                        )
+                    ),
+                }
+            )
+
+    ranked_entries = sorted(
+        entries,
+        key=lambda item: (
+            -_safe_float(item.get("combined_score"), 0.0),
+            -_safe_int(item.get("round_index"), -1),
+            _safe_int(item.get("hypothesis_index"), 10**9),
+        ),
+    )
+    best_hypothesis = ranked_entries[0] if ranked_entries else None
+
+    return {
+        "model_id": model_id,
+        "layer_id": layer_id,
+        "feature_id": feature_id,
+        "timestamp": timestamp,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "score_formula": "score_non_zero_rate + score_boundary_non_activation_rate",
+        "total_candidates": len(ranked_entries),
+        "best_hypothesis": best_hypothesis,
+        "hypotheses": ranked_entries,
+    }
+
+
 def _extract_reason_map(hypotheses_result: Dict[str, Any]) -> Dict[str, Any]:
     input_reasons = hypotheses_result.get("input_side_hypothesis_reasons", [])
     output_reasons = hypotheses_result.get("output_side_hypothesis_reasons", [])
@@ -338,6 +455,7 @@ if __name__ == "__main__":
     previous_memory_result: Optional[Dict[str, Any]] = None
     round_memories: Dict[int, Dict[str, Any]] = {}
     round_refinements: Dict[int, Dict[str, Any]] = {}
+    round_executions: Dict[int, Dict[str, Any]] = {}
     module: Optional[ModelWithSAEModule] = None
     converged = False
     converged_round: Optional[int] = None
@@ -457,6 +575,7 @@ if __name__ == "__main__":
         default_score_name=last_output_score_name,
         default_logit_top_k=last_output_logit_top_k,
     )
+    round_executions[0] = baseline_execution_result
     last_executed_hypotheses = current_hypotheses
     previous_execution_result = baseline_execution_result
 
@@ -657,6 +776,7 @@ if __name__ == "__main__":
             default_score_name=last_output_score_name,
             default_logit_top_k=last_output_logit_top_k,
         )
+        round_executions[round_index] = execution_result
 
         memory_path = _artifact_json_path(
             layer_id=layer_id,
@@ -704,6 +824,31 @@ if __name__ == "__main__":
     ts_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts
     ts_dir.mkdir(parents=True, exist_ok=True)
 
+    input_hypothesis_cache_path = (
+        ts_dir / f"layer{layer_id}-feature{feature_id}-input-side-hypotheses-cache.json"
+    )
+    input_hypothesis_cache = _build_input_hypothesis_selection_payload(
+        model_id=_clean_text(final_hypotheses_source.get("model_id") or args.model_id),
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=ts,
+        round_executions=round_executions,
+    )
+    _save_json(input_hypothesis_cache_path, input_hypothesis_cache)
+    best_input_hypothesis = input_hypothesis_cache.get("best_hypothesis")
+    if not isinstance(best_input_hypothesis, dict):
+        fallback_hypothesis = final_input_hypotheses[0] if final_input_hypotheses else ""
+        best_input_hypothesis = {
+            "source": "final_input_hypotheses_fallback",
+            "round_index": last_round_executed if last_round_executed > 0 else 0,
+            "round_id": _round_id_from_index(last_round_executed if last_round_executed > 0 else 0),
+            "hypothesis_index": 1 if fallback_hypothesis else 0,
+            "hypothesis": fallback_hypothesis,
+            "score_non_zero_rate": None,
+            "score_boundary_non_activation_rate": None,
+            "combined_score": None,
+        }
+
     workflow_memory_md = ts_dir / f"layer{layer_id}-feature{feature_id}-workflow-memory.md"
     memory_lines: List[str] = []
     memory_lines.append("# SAE Workflow Memory (All Rounds)")
@@ -746,6 +891,9 @@ if __name__ == "__main__":
         "output_intervention_method": last_output_intervention_method,
         "output_score_name": last_output_score_name,
         "output_logit_top_k": last_output_logit_top_k,
+        "input_side_hypothesis_cache_path": str(input_hypothesis_cache_path),
+        "input_side_hypothesis_scoring_formula": input_hypothesis_cache.get("score_formula"),
+        "input_side_best_hypothesis": best_input_hypothesis,
         "token_usage_total": total_tokens.as_dict(),
         "token_usage_this_run": run_tokens.as_dict(),
         "executed_steps": executed_steps,
@@ -771,6 +919,7 @@ if __name__ == "__main__":
     lines.append(f"- output_intervention_method: {final_result.get('output_intervention_method')}")
     lines.append(f"- output_score_name: {final_result.get('output_score_name')}")
     lines.append(f"- output_logit_top_k: {final_result.get('output_logit_top_k')}")
+    lines.append(f"- input_side_hypothesis_cache_path: {final_result.get('input_side_hypothesis_cache_path')}")
     lines.append("")
     lines.append("## Token Usage (Workflow)")
     lines.append(f"- total_prompt_tokens: {final_result['token_usage_total']['prompt_tokens']}")
@@ -783,6 +932,18 @@ if __name__ == "__main__":
     lines.append("## Input-side Final Hypotheses")
     for idx, hypothesis in enumerate(final_input_hypotheses, start=1):
         lines.append(f"{idx}. {hypothesis}")
+    lines.append("")
+    lines.append("## Best Input Hypothesis For Final Evaluation")
+    lines.append(f"- round_id: {best_input_hypothesis.get('round_id')}")
+    lines.append(f"- hypothesis_index: {best_input_hypothesis.get('hypothesis_index')}")
+    lines.append(f"- score_non_zero_rate: {best_input_hypothesis.get('score_non_zero_rate')}")
+    lines.append(
+        f"- score_boundary_non_activation_rate: {best_input_hypothesis.get('score_boundary_non_activation_rate')}"
+    )
+    lines.append(f"- combined_score: {best_input_hypothesis.get('combined_score')}")
+    lines.append("```text")
+    lines.append(str(best_input_hypothesis.get("hypothesis", "")))
+    lines.append("```")
     lines.append("")
     lines.append("## Output-side Final Hypotheses")
     for idx, hypothesis in enumerate(final_output_hypotheses, start=1):
@@ -808,6 +969,8 @@ if __name__ == "__main__":
                 "converged_round": converged_round,
                 "output_intervention_method": final_result.get("output_intervention_method"),
                 "output_score_name": final_result.get("output_score_name"),
+                "input_side_hypothesis_cache_path": final_result.get("input_side_hypothesis_cache_path"),
+                "input_side_best_hypothesis": best_input_hypothesis,
                 "input_final_hypothesis_count": len(final_input_hypotheses),
                 "output_final_hypothesis_count": len(final_output_hypotheses),
                 "token_usage_total": total_tokens.as_dict(),

@@ -74,6 +74,110 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _resolve_candidate_path(path_text: str, *, base_dir: Path) -> Path:
+    path = Path(path_text)
+    if path.is_absolute():
+        return path
+    return base_dir / path
+
+
+def _normalize_cached_input_hypothesis(
+    cached: Dict[str, Any],
+    *,
+    source: str,
+) -> Optional[Dict[str, Any]]:
+    hypothesis = str(cached.get("hypothesis", "")).strip()
+    if not hypothesis:
+        return None
+    score_non_zero_raw = cached.get("score_non_zero_rate")
+    score_boundary_raw = cached.get("score_boundary_non_activation_rate")
+    score_non_zero = _safe_float(score_non_zero_raw, 0.0) if score_non_zero_raw is not None else None
+    score_boundary = _safe_float(score_boundary_raw, 0.0) if score_boundary_raw is not None else None
+    combined_raw = cached.get("combined_score")
+    combined_score = (
+        _safe_float(combined_raw, 0.0)
+        if combined_raw is not None
+        else _safe_float(score_non_zero, 0.0) + _safe_float(score_boundary, 0.0)
+    )
+    return {
+        "source": source,
+        "hypothesis_index": _safe_int(cached.get("hypothesis_index"), 0),
+        "hypothesis": hypothesis,
+        "round_index": _safe_int(cached.get("round_index"), 0),
+        "round_id": str(cached.get("round_id", "")).strip() or None,
+        "score_name": "combined_input_score",
+        "score_value": combined_score,
+        "score_non_zero_rate": score_non_zero,
+        "score_boundary_non_activation_rate": score_boundary,
+        "combined_score": combined_score,
+    }
+
+
+def _load_input_hypothesis_cache(
+    *,
+    final_result_payload: Dict[str, Any],
+    workflow_timestamp_dir: Path,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Path]]:
+    candidate_paths: List[Path] = []
+    configured_path = str(final_result_payload.get("input_side_hypothesis_cache_path", "")).strip()
+    if configured_path:
+        candidate_paths.append(_resolve_candidate_path(configured_path, base_dir=PROJECT_ROOT))
+
+    layer_id = str(final_result_payload.get("layer_id", "")).strip()
+    feature_id = str(final_result_payload.get("feature_id", "")).strip()
+    if layer_id and feature_id:
+        candidate_paths.append(
+            workflow_timestamp_dir / f"layer{layer_id}-feature{feature_id}-input-side-hypotheses-cache.json"
+        )
+
+    seen: set[str] = set()
+    deduped_paths: List[Path] = []
+    for candidate in candidate_paths:
+        key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_paths.append(candidate)
+
+    for path in deduped_paths:
+        if not path.exists():
+            continue
+        payload = _load_json(path)
+        if isinstance(payload, dict):
+            return payload, path
+    return None, None
+
+
+def _pick_best_input_hypothesis_from_workflow(
+    *,
+    final_result_payload: Dict[str, Any],
+    workflow_timestamp_dir: Path,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Path]]:
+    best_raw = final_result_payload.get("input_side_best_hypothesis")
+    if isinstance(best_raw, dict):
+        normalized = _normalize_cached_input_hypothesis(
+            best_raw,
+            source="workflow_final_result.input_side_best_hypothesis",
+        )
+        if normalized is not None:
+            return normalized, best_raw, None
+
+    cache_payload, cache_path = _load_input_hypothesis_cache(
+        final_result_payload=final_result_payload,
+        workflow_timestamp_dir=workflow_timestamp_dir,
+    )
+    if isinstance(cache_payload, dict):
+        cache_best = cache_payload.get("best_hypothesis")
+        if isinstance(cache_best, dict):
+            normalized = _normalize_cached_input_hypothesis(
+                cache_best,
+                source="workflow_input_side_cache.best_hypothesis",
+            )
+            if normalized is not None:
+                return normalized, cache_best, cache_path
+    return None, None, cache_path
+
+
 def _pick_best_hypothesis_from_refined(
     refined_payload: Dict[str, Any],
     *,
@@ -281,9 +385,14 @@ def _write_summary_markdown(path: Path, *, payload: Dict[str, Any]) -> None:
     lines.append("```")
     lines.append("")
     lines.append("## Input-side Metrics")
+    lines.append(f"- status: {input_eval.get('status')}")
+    lines.append(f"- used_workflow_cached_scores: {input_eval.get('used_workflow_cached_scores')}")
     lines.append(f"- relative_quality_score: {input_eval.get('relative_quality_score')}")
     lines.append(f"- non_activation_relative_quality_score: {input_eval.get('non_activation_relative_quality_score')}")
     lines.append(f"- boundary_relative_quality_score: {input_eval.get('boundary_relative_quality_score')}")
+    lines.append(f"- score_non_zero_rate: {input_eval.get('score_non_zero_rate')}")
+    lines.append(f"- score_boundary_non_activation_rate: {input_eval.get('score_boundary_non_activation_rate')}")
+    lines.append(f"- combined_input_score: {input_eval.get('combined_input_score')}")
     lines.append("")
     lines.append("## Output-side Metrics")
     lines.append(f"- mode: {output_eval.get('mode')}")
@@ -340,6 +449,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-ppio-base-url", default="https://api.ppio.com/openai")
     parser.add_argument("--input-ppio-api-key-file", default=None)
     parser.add_argument("--input-disable-boundary-score", action="store_true")
+    parser.add_argument(
+        "--force-run-input-eval",
+        action="store_true",
+        help="Force rerun input-side evaluation script even when workflow cached input scores exist.",
+    )
     parser.add_argument("--sae-release", default=None)
     parser.add_argument("--sae-average-l0", default=None)
     parser.add_argument("--sae-canonical-map", default=str(PROJECT_ROOT / "support_info" / "canonical_map.txt"))
@@ -430,12 +544,19 @@ def main() -> None:
     if execution_path.exists():
         execution_payload = _load_json(execution_path)
 
-    selected_input = _pick_best_hypothesis(
+    selected_input_from_workflow, selected_input_cache_raw, input_cache_path = _pick_best_input_hypothesis_from_workflow(
         final_result_payload=final_result,
-        refined_payload=refined_payload,
-        execution_payload=execution_payload,
-        side="input",
+        workflow_timestamp_dir=workflow_timestamp_dir,
     )
+    if selected_input_from_workflow is not None:
+        selected_input = selected_input_from_workflow
+    else:
+        selected_input = _pick_best_hypothesis(
+            final_result_payload=final_result,
+            refined_payload=refined_payload,
+            execution_payload=execution_payload,
+            side="input",
+        )
     selected_output = _pick_best_hypothesis(
         final_result_payload=final_result,
         refined_payload=refined_payload,
@@ -474,71 +595,105 @@ def main() -> None:
 
     input_result_path: Optional[Path] = None
     input_result: Dict[str, Any] = {}
+    input_eval_status = "skipped"
+    used_cached_input_scores = False
     if run_input:
-        input_cmd: List[str] = [
-            sys.executable,
-            str(input_script),
-            "--model-id",
-            model_id,
-            "--layer-id",
-            layer_id,
-            "--width",
-            str(args.width),
-            "--source",
-            source,
-            "--feature-id",
-            str(feature_id),
-            "--my-explanation",
-            str(selected_input["hypothesis"]),
-            "--max-explanations",
-            str(args.input_max_explanations),
-            "--selection-method",
-            str(args.input_selection_method),
-            "--m",
-            str(args.input_m),
-            "--n",
-            str(args.input_n),
-            "--non-activation-context-count",
-            str(args.input_non_activation_context_count),
-            "--llm-model",
-            str(args.input_llm_model),
-            "--ppio-base-url",
-            str(args.input_ppio_base_url),
-            "--sae-name",
-            str(args.sae_name),
-            "--sae-device",
-            str(args.sae_device),
-            "--output-root",
-            str(args.input_output_root),
-            "--timestamp",
-            evaluation_timestamp,
-        ]
-        if args.input_ppio_api_key_file:
-            input_cmd.extend(["--ppio-api-key-file", str(args.input_ppio_api_key_file)])
-        if args.sae_release:
-            input_cmd.extend(["--sae-release", str(args.sae_release)])
-        if args.sae_average_l0:
-            input_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
-        if args.sae_canonical_map:
-            input_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
-        if args.input_disable_boundary_score:
-            input_cmd.append("--disable-boundary-score")
+        has_cached_score_values = (
+            selected_input.get("combined_score") is not None
+            or selected_input.get("score_non_zero_rate") is not None
+            or selected_input.get("score_boundary_non_activation_rate") is not None
+        )
+        if (
+            selected_input_cache_raw is not None
+            and has_cached_score_values
+            and not args.force_run_input_eval
+        ):
+            used_cached_input_scores = True
+            input_eval_status = "completed_from_workflow_cache"
+            _log_progress(
+                "Using cached input-side activation/boundary scores from workflow logs; "
+                "skip compare_explanations_with_llm.py."
+            )
+            cached_non_zero = selected_input.get("score_non_zero_rate")
+            cached_boundary = selected_input.get("score_boundary_non_activation_rate")
+            cached_combined = selected_input.get("combined_score", selected_input.get("score_value"))
+            input_result = {
+                "relative_quality_score": cached_combined,
+                "non_activation_relative_quality_score": cached_non_zero,
+                "boundary_relative_quality_score": cached_boundary,
+                "score_non_zero_rate": cached_non_zero,
+                "score_boundary_non_activation_rate": cached_boundary,
+                "combined_input_score": cached_combined,
+                "from_workflow_cache": True,
+                "score_formula": "score_non_zero_rate + score_boundary_non_activation_rate",
+            }
+            input_result_path = input_cache_path or final_result_path
+        else:
+            input_cmd: List[str] = [
+                sys.executable,
+                str(input_script),
+                "--model-id",
+                model_id,
+                "--layer-id",
+                layer_id,
+                "--width",
+                str(args.width),
+                "--source",
+                source,
+                "--feature-id",
+                str(feature_id),
+                "--my-explanation",
+                str(selected_input["hypothesis"]),
+                "--max-explanations",
+                str(args.input_max_explanations),
+                "--selection-method",
+                str(args.input_selection_method),
+                "--m",
+                str(args.input_m),
+                "--n",
+                str(args.input_n),
+                "--non-activation-context-count",
+                str(args.input_non_activation_context_count),
+                "--llm-model",
+                str(args.input_llm_model),
+                "--ppio-base-url",
+                str(args.input_ppio_base_url),
+                "--sae-name",
+                str(args.sae_name),
+                "--sae-device",
+                str(args.sae_device),
+                "--output-root",
+                str(args.input_output_root),
+                "--timestamp",
+                evaluation_timestamp,
+            ]
+            if args.input_ppio_api_key_file:
+                input_cmd.extend(["--ppio-api-key-file", str(args.input_ppio_api_key_file)])
+            if args.sae_release:
+                input_cmd.extend(["--sae-release", str(args.sae_release)])
+            if args.sae_average_l0:
+                input_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
+            if args.sae_canonical_map:
+                input_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
+            if args.input_disable_boundary_score:
+                input_cmd.append("--disable-boundary-score")
 
-        _run_command_with_progress(
-            input_cmd,
-            cwd=PROJECT_ROOT,
-            step_name="input-side evaluation",
-            heartbeat_seconds=int(args.heartbeat_seconds),
-        )
-        input_result_path = (
-            Path(args.input_output_root)
-            / str(args.sae_name)
-            / f"layer-{layer_id}"
-            / f"feature-{feature_id}"
-            / evaluation_timestamp
-            / "result.json"
-        )
-        input_result = _load_json(input_result_path)
+            _run_command_with_progress(
+                input_cmd,
+                cwd=PROJECT_ROOT,
+                step_name="input-side evaluation",
+                heartbeat_seconds=int(args.heartbeat_seconds),
+            )
+            input_result_path = (
+                Path(args.input_output_root)
+                / str(args.sae_name)
+                / f"layer-{layer_id}"
+                / f"feature-{feature_id}"
+                / evaluation_timestamp
+                / "result.json"
+            )
+            input_result = _load_json(input_result_path)
+            input_eval_status = "completed"
     else:
         _log_progress("Skip input-side evaluation.")
 
@@ -689,13 +844,26 @@ def main() -> None:
             "output": selected_output,
         },
         "input_evaluation": {
-            "status": "completed" if run_input else "skipped",
+            "status": input_eval_status,
+            "used_workflow_cached_scores": used_cached_input_scores,
             "relative_quality_score": input_result.get("relative_quality_score") if run_input else None,
             "non_activation_relative_quality_score": (
                 input_result.get("non_activation_relative_quality_score") if run_input else None
             ),
             "boundary_relative_quality_score": input_result.get("boundary_relative_quality_score") if run_input else None,
-            "raw_result": input_result if run_input else None,
+            "score_non_zero_rate": input_result.get("score_non_zero_rate") if run_input else None,
+            "score_boundary_non_activation_rate": (
+                input_result.get("score_boundary_non_activation_rate") if run_input else None
+            ),
+            "combined_input_score": input_result.get("combined_input_score") if run_input else None,
+            "raw_result": (
+                {
+                    "input_result": input_result,
+                    "selected_input_cache_entry": selected_input_cache_raw,
+                }
+                if run_input and used_cached_input_scores
+                else (input_result if run_input else None)
+            ),
         },
         "output_evaluation": {
             "mode": str(args.output_eval_mode),
