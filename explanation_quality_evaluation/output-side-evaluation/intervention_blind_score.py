@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import hashlib
 import json
 import random
 import re
@@ -11,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from openai import OpenAI
+import torch
 
 # Allow importing project modules when this script is launched from any directory.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -178,6 +181,69 @@ def _resolve_api_key(api_key: Optional[str], api_key_file: Optional[str]) -> Opt
     return None
 
 
+def _hash_prompts(prompts: Sequence[str]) -> str:
+    payload = json.dumps([str(x) for x in prompts], ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_clamp_cache(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"version": 1, "entries": []}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "entries": []}
+    if not isinstance(payload, dict):
+        return {"version": 1, "entries": []}
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        payload["entries"] = []
+    payload.setdefault("version", 1)
+    return payload
+
+
+def _find_cached_clamp(
+    *,
+    cache_payload: Dict[str, Any],
+    target_kl: float,
+    prompt_hash: str,
+) -> Optional[Dict[str, Any]]:
+    entries = cache_payload.get("entries", [])
+    if not isinstance(entries, list):
+        return None
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_target_kl = float(item.get("target_kl"))
+        except Exception:
+            continue
+        if abs(item_target_kl - float(target_kl)) > 1e-9:
+            continue
+        if str(item.get("prompt_hash", "")) != prompt_hash:
+            continue
+        if "clamp_value" not in item:
+            continue
+        return item
+    return None
+
+
+def _save_clamp_cache(path: Path, cache_payload: Dict[str, Any]) -> None:
+    path.write_text(json.dumps(cache_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _resolve_feature_dir(
+    *,
+    output_root: Path,
+    sae_name: str,
+    layer_id: str,
+    feature_id: int,
+) -> Path:
+    feature_dir = output_root / sae_name / f"layer-{layer_id}" / f"feature-{feature_id}"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    return feature_dir
+
+
 def _resolve_target_dir(
     *,
     output_root: Path,
@@ -186,7 +252,12 @@ def _resolve_target_dir(
     feature_id: int,
     timestamp: Optional[str] = None,
 ) -> Path:
-    target_dir = output_root / sae_name / f"layer-{layer_id}" / f"feature-{feature_id}"
+    target_dir = _resolve_feature_dir(
+        output_root=output_root,
+        sae_name=sae_name,
+        layer_id=layer_id,
+        feature_id=feature_id,
+    )
     if timestamp and str(timestamp).strip():
         target_dir = target_dir / str(timestamp).strip()
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -253,6 +324,45 @@ def _resolve_sae_uri(
     return sae_uri
 
 
+@torch.no_grad()
+def _generate_steered_completions_with_clamp(
+    *,
+    module: "ModelWithSAEModule",
+    prompts_tokens: torch.Tensor,
+    feature_id: int,
+    sae_obj: Any,
+    clamp_value: float,
+    max_new_tokens: int,
+    generation_temperature: float,
+) -> List[str]:
+    if module.model is None:
+        raise RuntimeError("Model must be loaded for steering generation.")
+
+    clamp_values = [float(clamp_value)] * int(prompts_tokens.shape[0])
+    clamp_tensor = torch.tensor(clamp_values, device=prompts_tokens.device, dtype=torch.float32)
+    module.model.reset_hooks()
+    try:
+        module.model.add_hook(
+            module.hook_name,
+            functools.partial(module._gen_hook, feature=int(feature_id), value=clamp_tensor, sae=sae_obj),
+        )
+        steered_outputs = module.model.generate(
+            prompts_tokens,
+            max_new_tokens=max_new_tokens,
+            verbose=False,
+            temperature=generation_temperature,
+        )
+    finally:
+        module.model.reset_hooks()
+
+    prompt_texts = module.model.to_string(prompts_tokens)
+    full_texts = module.model.to_string(steered_outputs)
+    return [
+        str(full_texts[idx])[len(str(prompt_texts[idx])) :].replace("\n", "\\n").replace("\r", "\\r")
+        for idx in range(len(prompt_texts))
+    ]
+
+
 def build_intervention_result_from_checkpoint(
     *,
     model_checkpoint_path: str,
@@ -268,6 +378,9 @@ def build_intervention_result_from_checkpoint(
     max_new_tokens: int = 25,
     generation_temperature: float = 0.75,
     kl_values: Sequence[float] = tuple(KL_DIV_VALUES),
+    clamp_cache_path: Optional[Path] = None,
+    kl_tolerance: float = 0.1,
+    kl_max_steps: int = 12,
 ) -> str:
     from model_with_sae import ModelWithSAEModule
 
@@ -286,25 +399,79 @@ def build_intervention_result_from_checkpoint(
         feature_index=int(feature_id),
         device=device,
     )
+    if module.model is None or module.tokenizer is None:
+        raise RuntimeError("Model/tokenizer failed to load.")
+    if not module.use_hooked_transformer:
+        raise RuntimeError("This flow requires HookedSAETransformer mode (sae-lens URI).")
+    if "__sae_lens_obj__" not in module.sae:
+        raise RuntimeError("SAE object not found. Please use sae-lens SAE.")
+
+    prompts_list = [str(x) for x in prompts]
+    prompts_tokens = module.model.to_tokens(prompts_list)
+    if not isinstance(prompts_tokens, torch.Tensor) or prompts_tokens.ndim != 2:
+        raise RuntimeError("Unexpected prompt token shape from model.to_tokens.")
+    prompt_hash = _hash_prompts(prompts_list)
+    cache_path = clamp_cache_path
+    cache_writable = cache_path is not None
+    cache_payload = _load_clamp_cache(cache_path) if cache_path is not None else {"version": 1, "entries": []}
+    cache_dirty = False
+    sae_obj = module.sae["__sae_lens_obj__"]
 
     completions_by_kl: Dict[float, Sequence[str]] = {}
     for kl in kl_values:
         kl_float = float(kl)
-        out = module.generate_steered_completions(
-            prompts=list(prompts),
-            feature_index=int(feature_id),
-            max_new_tokens=max_new_tokens,
-            temperature=generation_temperature,
+        cache_hit_entry = _find_cached_clamp(
+            cache_payload=cache_payload,
             target_kl=kl_float,
+            prompt_hash=prompt_hash,
         )
-        completions = out.get("steered_completion")
-        if not isinstance(completions, list):
-            raise RuntimeError(f"Unexpected steered output format for KL={kl_float}: {out}")
+        if cache_hit_entry is not None:
+            clamp_value = float(cache_hit_entry["clamp_value"])
+        else:
+            clamp_values, kl_found_values = module._find_clamp_values_for_kl(
+                prompts_tokens,
+                int(feature_id),
+                sae_obj,
+                target_kl=kl_float,
+                tolerance=float(kl_tolerance),
+                max_steps=int(kl_max_steps),
+            )
+            if not clamp_values:
+                raise RuntimeError(f"Failed to find clamp value for target KL={kl_float}.")
+            clamp_value = float(clamp_values[0])
+            actual_kl = float(kl_found_values[0]) if kl_found_values else 0.0
+            cache_payload.setdefault("entries", [])
+            cache_payload["entries"].append(
+                {
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "target_kl": kl_float,
+                    "prompt_hash": prompt_hash,
+                    "prompts": prompts_list,
+                    "clamp_value": clamp_value,
+                    "actual_kl": actual_kl,
+                    "kl_tolerance": float(kl_tolerance),
+                    "kl_max_steps": int(kl_max_steps),
+                }
+            )
+            cache_dirty = True
+
+        completions = _generate_steered_completions_with_clamp(
+            module=module,
+            prompts_tokens=prompts_tokens,
+            feature_id=int(feature_id),
+            sae_obj=sae_obj,
+            clamp_value=clamp_value,
+            max_new_tokens=max_new_tokens,
+            generation_temperature=generation_temperature,
+        )
         completions_by_kl[kl_float] = [str(x) for x in completions]
+
+    if cache_dirty and cache_writable and cache_path is not None:
+        _save_clamp_cache(cache_path, cache_payload)
 
     return format_intervention_result(
         completions_by_kl=completions_by_kl,
-        prompts=list(prompts),
+        prompts=prompts_list,
         kl_values=list(kl_values),
     )
 
@@ -518,6 +685,12 @@ def evaluate_intervention_blind(
     json_filename: str,
     md_filename: str,
 ) -> Dict[str, Any]:
+    feature_dir = _resolve_feature_dir(
+        output_root=output_root,
+        sae_name=sae_name,
+        layer_id=layer_id,
+        feature_id=feature_id,
+    )
     target_dir = _resolve_target_dir(
         output_root=output_root,
         sae_name=sae_name,
@@ -557,6 +730,7 @@ def evaluate_intervention_blind(
             max_new_tokens=max_new_tokens,
             generation_temperature=generation_temperature,
             kl_values=kl_values,
+            clamp_cache_path=feature_dir / "kl_clamp_cache.json",
         )
         intervention_source = "checkpoint_generation"
 

@@ -495,11 +495,28 @@ def _resolve_target_dir(
     feature_id: int,
     timestamp: Optional[str] = None,
 ) -> Path:
-    target_dir = Path(output_root) / sae_name / f"layer-{layer_id}" / f"feature-{feature_id}"
+    target_dir = _resolve_feature_dir(
+        output_root=output_root,
+        sae_name=sae_name,
+        layer_id=layer_id,
+        feature_id=feature_id,
+    )
     if timestamp and str(timestamp).strip():
         target_dir = target_dir / str(timestamp).strip()
     target_dir.mkdir(parents=True, exist_ok=True)
     return target_dir
+
+
+def _resolve_feature_dir(
+    *,
+    output_root: str,
+    sae_name: str,
+    layer_id: str,
+    feature_id: int,
+) -> Path:
+    feature_dir = Path(output_root) / sae_name / f"layer-{layer_id}" / f"feature-{feature_id}"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    return feature_dir
 
 
 def _try_load_existing_result(
@@ -527,6 +544,12 @@ def main() -> None:
     target_kls = [float(x) for x in args.target_kl]
     top_k = int(args.top_k)
     prompts = _safe_prompt_list(args.prompts)
+    feature_dir = _resolve_feature_dir(
+        output_root=str(args.output_root),
+        sae_name=str(args.sae_name),
+        layer_id=layer_id,
+        feature_id=feature_id,
+    )
     target_dir = _resolve_target_dir(
         output_root=str(args.output_root),
         sae_name=str(args.sae_name),
@@ -577,7 +600,7 @@ def main() -> None:
         canonical_map_path=Path(args.sae_canonical_map),
     )
 
-    cache_path = target_dir / "kl_clamp_cache.json"
+    cache_path = feature_dir / "kl_clamp_cache.json"
 
     from model_with_sae import ModelWithSAEModule
 
