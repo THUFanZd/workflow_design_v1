@@ -313,7 +313,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--history-rounds",
         type=int,
-        default=None,
+        default=1,
         help=(
             "Use at most previous n historical memory rounds during refinement. "
             "Default: all available historical rounds."

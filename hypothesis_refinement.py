@@ -192,12 +192,30 @@ def _extract_execution_evidence(
         successes = [item for item in sentence_results if bool(item.get("is_non_zero", False))]
         successes.sort(key=lambda item: _safe_float(item.get("summary_activation"), 0.0), reverse=True)
         failed = [item for item in sentence_results if not bool(item.get("is_non_zero", False))]
+        boundary_results_raw = target.get("boundary_sentence_results", [])
+        boundary_results = (
+            [item for item in boundary_results_raw if isinstance(item, dict)]
+            if isinstance(boundary_results_raw, list)
+            else []
+        )
+        boundary_successes = [item for item in boundary_results if not bool(item.get("is_non_zero", False))]
+        boundary_successes.sort(key=lambda item: _safe_float(item.get("summary_activation"), 0.0))
+        boundary_failed = [item for item in boundary_results if bool(item.get("is_non_zero", False))]
         return {
             "score_non_zero_rate": _safe_float(target.get("score_non_zero_rate"), 0.0),
             "non_zero_count": _safe_int(target.get("non_zero_count"), 0),
             "total_sentences": _safe_int(target.get("total_sentences"), len(sentence_results)),
             "successful_example": dict(successes[0]) if successes else {},
             "failed_examples": [dict(item) for item in failed],
+            "score_boundary_non_activation_rate": (
+                _safe_float(target.get("score_boundary_non_activation_rate"), 0.0)
+                if target.get("score_boundary_non_activation_rate") is not None
+                else None
+            ),
+            "boundary_non_activation_count": _safe_int(target.get("boundary_non_activation_count"), 0),
+            "total_boundary_sentences": _safe_int(target.get("total_boundary_sentences"), len(boundary_results)),
+            "boundary_successful_example": dict(boundary_successes[0]) if boundary_successes else {},
+            "boundary_failed_examples": [dict(item) for item in boundary_failed],
         }
 
     output_score_name = _clean_text(side_data.get("output_score_name")) or "score_blind_accuracy"
@@ -283,8 +301,10 @@ def _build_history_evidence(
     side: SideType,
     hypothesis_index: int,
     history_scope: HistoryScope,
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     evidence: List[Dict[str, Any]] = []
+    same_hypothesis_history: List[Dict[str, Any]] = []
+    peer_hypotheses_history: List[Dict[str, Any]] = []
     for memory in historical_memories:
         if history_scope == "same_hypothesis":
             round_view = extract_refinement_evidence_from_memory(
@@ -292,11 +312,54 @@ def _build_history_evidence(
                 side=side,
                 hypothesis_index=hypothesis_index,
             )
-        else:
-            round_view = extract_refinement_evidence_from_memory(memory=memory, side=side)
-        if round_view.get("hypotheses"):
-            evidence.append(round_view)
-    return evidence
+            if round_view.get("hypotheses"):
+                evidence.append(round_view)
+            continue
+
+        round_view = extract_refinement_evidence_from_memory(memory=memory, side=side)
+        hypotheses = round_view.get("hypotheses", [])
+        if not isinstance(hypotheses, list) or not hypotheses:
+            continue
+
+        own_items = [
+            dict(item)
+            for item in hypotheses
+            if isinstance(item, dict) and _safe_int(item.get("hypothesis_index"), -1) == hypothesis_index
+        ]
+        peer_items = [
+            dict(item)
+            for item in hypotheses
+            if isinstance(item, dict) and _safe_int(item.get("hypothesis_index"), -1) != hypothesis_index
+        ]
+        common_meta = {
+            "round_index": round_view.get("round_index"),
+            "round_id": round_view.get("round_id"),
+            "timestamp": round_view.get("timestamp"),
+            "side": round_view.get("side"),
+        }
+        if own_items:
+            same_hypothesis_history.append({**common_meta, "hypotheses": own_items})
+        if peer_items:
+            peer_hypotheses_history.append({**common_meta, "hypotheses": peer_items})
+
+    if history_scope == "same_hypothesis":
+        return {
+            "history_scope": history_scope,
+            "same_hypothesis_history": evidence,
+        }
+    return {
+        "history_scope": history_scope,
+        "same_hypothesis_history": same_hypothesis_history,
+        "peer_hypotheses_history": peer_hypotheses_history,
+    }
+
+
+def _is_input_full_score(execution_evidence: Dict[str, Any]) -> bool:
+    score_activation = execution_evidence.get("score_non_zero_rate")
+    score_boundary = execution_evidence.get("score_boundary_non_activation_rate")
+    if score_activation is None or score_boundary is None:
+        return False
+    return _safe_float(score_activation, 0.0) >= 1.0 and _safe_float(score_boundary, 0.0) >= 1.0
 
 
 def refine_hypotheses_for_side(
@@ -336,6 +399,34 @@ def refine_hypotheses_for_side(
             side=side,
             hypothesis_index=hypothesis_index,
         )
+        current_memory_evidence: Dict[str, Any] = {
+            "successful_example": current_success_example if isinstance(current_success_example, dict) else {},
+            "failed_examples": current_failed_examples if isinstance(current_failed_examples, list) else [],
+        }
+        # current_memory is derived from current_execution; avoid duplicated evidence in prompt/log.
+        if current_execution_evidence:
+            current_memory_evidence = {}
+
+        if side == "input" and _is_input_full_score(current_execution_evidence):
+            refined_item = {
+                "side": side,
+                "hypothesis_index": hypothesis_index,
+                "original_hypothesis": current_hypothesis,
+                "original_reason": current_reason,
+                "score_name": current_score_name,
+                "score_value": current_score,
+                "evidence": {
+                    "current_memory": current_memory_evidence,
+                    "current_execution": current_execution_evidence,
+                    "historical_memory": history_evidence,
+                    "history_scope": history_scope,
+                    "status": "skipped_full_score",
+                },
+                "refined_reason": current_reason,
+                "refined_hypothesis": current_hypothesis,
+            }
+            refined.append(refined_item)
+            continue
 
         system_prompt = build_system_prompt(side)
         user_prompt = build_user_prompt(
@@ -345,8 +436,7 @@ def refine_hypotheses_for_side(
             current_reason=current_reason,
             current_score_name=current_score_name,
             current_score=current_score,
-            current_success_example=current_success_example if isinstance(current_success_example, dict) else {},
-            current_failed_examples=current_failed_examples if isinstance(current_failed_examples, list) else [],
+            current_memory_evidence=current_memory_evidence,
             history_scope=history_scope,
             historical_evidence=history_evidence,
             current_execution_evidence=current_execution_evidence,
@@ -377,10 +467,7 @@ def refine_hypotheses_for_side(
             "score_name": current_score_name,
             "score_value": current_score,
             "evidence": {
-                "current_memory": {
-                    "successful_example": current_success_example,
-                    "failed_examples": current_failed_examples,
-                },
+                "current_memory": current_memory_evidence,
                 "current_execution": current_execution_evidence,
                 "historical_memory": history_evidence,
                 "history_scope": history_scope,
