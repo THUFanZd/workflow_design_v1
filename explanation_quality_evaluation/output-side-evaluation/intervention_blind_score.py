@@ -18,12 +18,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from experiments_design import OUTPUT_SIDE_PLACEHOLDER
-from experiments_execution_output import (
-    KL_DIV_VALUES_DEFAULT,
-    _extract_choice,
-    format_intervention_result,
-    prepare_control_results,
-)
 from function import (
     DEFAULT_CANONICAL_MAP_PATH,
     TokenUsageAccumulator,
@@ -36,6 +30,7 @@ from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 if TYPE_CHECKING:
     from model_with_sae import ModelWithSAEModule
 
+KL_DIV_VALUES_DEFAULT = [0.25, 0.5, -0.25, -0.5]
 KL_DIV_VALUES = [float(x) for x in KL_DIV_VALUES_DEFAULT]
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "explanation_quality_evaluation" / "output-side-evaluation" / "outputs"
 DEFAULT_SAE_RELEASE_BY_NAME: Dict[str, str] = {
@@ -65,6 +60,95 @@ class InterventionBlindScore:
 
 def _normalize_result_text(text: str) -> str:
     return text.strip().replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _reverse_kl_blocks(control_text: str) -> str:
+    block_pattern = re.compile(r"(<[+-]?\d+(?:\.\d+)?>.*?)(?=(?:\n<[+-]?\d)|\Z)", re.DOTALL)
+    blocks = [x.strip() for x in block_pattern.findall(control_text) if x.strip()]
+    if len(blocks) < 2:
+        return control_text
+    return "\n".join(reversed(blocks))
+
+
+def prepare_control_results(control_results: Sequence[str], *, num_required: int) -> List[str]:
+    if num_required <= 0:
+        return []
+
+    controls = [_normalize_result_text(x) for x in control_results if isinstance(x, str) and x.strip()]
+    if not controls:
+        raise ValueError("At least one non-empty control result is required.")
+
+    if len(controls) == 1 and num_required > 1:
+        controls.append(_reverse_kl_blocks(controls[0]))
+
+    cursor = 0
+    while len(controls) < num_required:
+        controls.append(controls[cursor % len(controls)])
+        cursor += 1
+
+    return controls[:num_required]
+
+
+def _extract_choice(judge_response: str, *, num_choices: int) -> int:
+    if num_choices < 2:
+        raise ValueError("num_choices must be at least 2.")
+
+    lines = [line.strip() for line in judge_response.splitlines() if line.strip()]
+    normalize_table = str.maketrans(
+        {
+            "\uFF11": "1",
+            "\uFF12": "2",
+            "\uFF13": "3",
+            "\u4E00": "1",
+            "\u4E8C": "2",
+            "\u4E09": "3",
+            "\u2460": "1",
+            "\u2461": "2",
+            "\u2462": "3",
+        }
+    )
+    normalized = judge_response.translate(normalize_table)
+    integer_pattern = re.compile(r"\b(\d+)\b")
+
+    for line in reversed(lines):
+        normalized_line = line.translate(normalize_table)
+        match = integer_pattern.search(normalized_line)
+        if not match:
+            continue
+        value = int(match.group(1))
+        if 1 <= value <= num_choices:
+            return value
+
+    match = integer_pattern.search(normalized)
+    if match:
+        value = int(match.group(1))
+        if 1 <= value <= num_choices:
+            return value
+
+    raise ValueError(f"Could not parse a valid choice in [1, {num_choices}] from: {judge_response!r}")
+
+
+def format_intervention_result(
+    *,
+    completions_by_kl: Dict[float, Sequence[str]],
+    prompts: Sequence[str],
+    kl_values: Sequence[float],
+) -> str:
+    lines: List[str] = []
+    for kl in kl_values:
+        kl_float = float(kl)
+        if kl_float not in completions_by_kl:
+            raise ValueError(f"Missing completion list for KL={kl_float}.")
+        completions = list(completions_by_kl[kl_float])
+        if len(completions) != len(prompts):
+            raise ValueError(
+                f"KL={kl_float} completion size mismatch: got {len(completions)}, expected {len(prompts)}."
+            )
+        amp_tag = f"{kl_float:+g}"
+        for index, prompt in enumerate(prompts):
+            completion = str(completions[index]).replace("\n", "\\n").replace("\r", "\\r")
+            lines.append(f"<{amp_tag}>'{prompt}': '{completion}'")
+    return "\n".join(lines)
 
 
 def generate_explanation_from_result(intervention_result: str) -> str:

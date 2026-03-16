@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import random
-import re
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Sequence
 
 from openai import OpenAI
@@ -12,11 +14,33 @@ from prompts.experiments_execution_prompt import build_output_judge_system_promp
 if TYPE_CHECKING:
     from model_with_sae import ModelWithSAEModule
 
-KL_DIV_VALUES_DEFAULT = [0.25, 0.5, -0.25, -0.5]
+PROJECT_ROOT = Path(__file__).resolve().parent
+INTERVENTION_BLIND_SCORE_PATH = (
+    PROJECT_ROOT
+    / "explanation_quality_evaluation"
+    / "output-side-evaluation"
+    / "intervention_blind_score.py"
+)
 
 
-def _normalize_text(text: str) -> str:
-    return text.strip().replace("\r\n", "\n").replace("\r", "\n")
+def _load_intervention_blind_score_module() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "intervention_blind_score_shared",
+        str(INTERVENTION_BLIND_SCORE_PATH),
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load module spec from {INTERVENTION_BLIND_SCORE_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_shared_blind_score = _load_intervention_blind_score_module()
+KL_DIV_VALUES_DEFAULT = list(getattr(_shared_blind_score, "KL_DIV_VALUES_DEFAULT"))
+prepare_control_results = getattr(_shared_blind_score, "prepare_control_results")
+format_intervention_result = getattr(_shared_blind_score, "format_intervention_result")
+_extract_choice = getattr(_shared_blind_score, "_extract_choice")
 
 
 def _extract_designed_prompts(experiment_item: Dict[str, Any]) -> List[str]:
@@ -30,95 +54,6 @@ def _extract_designed_prompts(experiment_item: Dict[str, Any]) -> List[str]:
     if not prompts:
         raise ValueError("Output-side designed_sentences must contain at least one non-empty prompt.")
     return prompts
-
-
-def _reverse_kl_blocks(control_text: str) -> str:
-    block_pattern = re.compile(r"(<[+-]?\d+(?:\.\d+)?>.*?)(?=(?:\n<[+-]?\d)|\Z)", re.DOTALL)
-    blocks = [x.strip() for x in block_pattern.findall(control_text) if x.strip()]
-    if len(blocks) < 2:
-        return control_text
-    return "\n".join(reversed(blocks))
-
-
-def prepare_control_results(control_results: Sequence[str], *, num_required: int) -> List[str]:
-    if num_required <= 0:
-        return []
-
-    controls = [_normalize_text(x) for x in control_results if isinstance(x, str) and x.strip()]
-    if not controls:
-        raise ValueError("At least one non-empty control result is required.")
-
-    if len(controls) == 1 and num_required > 1:
-        controls.append(_reverse_kl_blocks(controls[0]))
-
-    cursor = 0
-    while len(controls) < num_required:
-        controls.append(controls[cursor % len(controls)])
-        cursor += 1
-
-    return controls[:num_required]
-
-
-def _extract_choice(judge_response: str, *, num_choices: int) -> int:
-    if num_choices < 2:
-        raise ValueError("num_choices must be at least 2.")
-
-    lines = [line.strip() for line in judge_response.splitlines() if line.strip()]
-    normalize_table = str.maketrans(
-        {
-            "\uFF11": "1",
-            "\uFF12": "2",
-            "\uFF13": "3",
-            "\u4E00": "1",
-            "\u4E8C": "2",
-            "\u4E09": "3",
-            "\u2460": "1",
-            "\u2461": "2",
-            "\u2462": "3",
-        }
-    )
-    normalized = judge_response.translate(normalize_table)
-    integer_pattern = re.compile(r"\b(\d+)\b")
-
-    for line in reversed(lines):
-        normalized_line = line.translate(normalize_table)
-        match = integer_pattern.search(normalized_line)
-        if not match:
-            continue
-        value = int(match.group(1))
-        if 1 <= value <= num_choices:
-            return value
-
-    match = integer_pattern.search(normalized)
-    if match:
-        value = int(match.group(1))
-        if 1 <= value <= num_choices:
-            return value
-
-    raise ValueError(f"Could not parse a valid choice in [1, {num_choices}] from: {judge_response!r}")
-
-
-def format_intervention_result(
-    *,
-    completions_by_kl: Dict[float, Sequence[str]],
-    prompts: Sequence[str],
-    kl_values: Sequence[float],
-) -> str:
-    lines: List[str] = []
-    for kl in kl_values:
-        kl_float = float(kl)
-        if kl_float not in completions_by_kl:
-            raise ValueError(f"Missing completion list for KL={kl_float}.")
-        completions = list(completions_by_kl[kl_float])
-        if len(completions) != len(prompts):
-            raise ValueError(
-                f"KL={kl_float} completion size mismatch: got {len(completions)}, expected {len(prompts)}."
-            )
-        amp_tag = f"{kl_float:+g}"
-        for index, prompt in enumerate(prompts):
-            completion = str(completions[index]).replace("\n", "\\n").replace("\r", "\\r")
-            lines.append(f"<{amp_tag}>'{prompt}': '{completion}'")
-    return "\n".join(lines)
 
 
 def _run_single_blind_trial(

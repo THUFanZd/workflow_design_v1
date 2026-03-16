@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 from model_with_sae import ModelWithSAEModule
@@ -7,6 +10,27 @@ from prompts.experiments_execution_prompt import (
     build_input_activation_context,
     build_input_boundary_context,
 )
+
+
+def _load_compare_generate_boundary_contexts():
+    compare_path = (
+        Path(__file__).resolve().parent
+        / "explanation_quality_evaluation"
+        / "input-side-evaluation"
+        / "compare_explanations_with_llm.py"
+    )
+    spec = importlib.util.spec_from_file_location("compare_explanations_with_llm_shared", str(compare_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load module spec from {compare_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return getattr(module, "generate_boundary_contexts")
+
+
+def generate_boundary_contexts(*args: Any, **kwargs: Any) -> List[str]:
+    compare_generate_boundary_contexts = _load_compare_generate_boundary_contexts()
+    return compare_generate_boundary_contexts(*args, **kwargs)
 
 
 def _extract_designed_sentences(experiment_item: Dict[str, Any]) -> List[str]:
