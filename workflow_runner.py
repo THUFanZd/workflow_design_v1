@@ -143,15 +143,30 @@ def _should_run(*, start_round: int, start_step: int, round_index: int, step_ind
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run SAE explanation workflow (step 1-7) with round/step resume support.",
+        description="Run SAE explanation workflow with baseline phase and refinement rounds (resume supported).",
     )
     parser.add_argument("--model-id", default="gemma-2-2b", help="Neuronpedia model id")
     parser.add_argument("--layer-id", required=True, help="Layer id")
     parser.add_argument("--feature-id", required=True, help="Feature id")
     parser.add_argument("--timestamp", default=None, help="Timestamp directory under logs/{layer}_{feature}/")
-    parser.add_argument("--max-rounds", type=int, default=1, help="Maximum refinement calls (step 6 iterations).")
-    parser.add_argument("--start-round", type=int, default=0, help="Round index to start real execution from.")
-    parser.add_argument("--start-step", type=int, default=1, help="Step index to start real execution from.")
+    parser.add_argument("--max-rounds", type=int, default=1, help="Maximum refinement rounds (round_1..round_n).")
+    parser.add_argument(
+        "--start-round",
+        type=int,
+        default=0,
+        help="Round index to start real execution from. round_0 is baseline (not counted in max-rounds).",
+    )
+    parser.add_argument(
+        "--start-step",
+        type=int,
+        default=1,
+        help=(
+            "When --start-round=0, valid steps are 1..5 "
+            "(observation, initial, design, execution, memory). "
+            "When --start-round>=1, valid steps are 1..4 "
+            "(refinement, design, execution, memory)."
+        ),
+    )
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
@@ -233,10 +248,10 @@ if __name__ == "__main__":
         raise ValueError("--max-rounds must be >= 0.")
     if args.start_round < 0:
         raise ValueError("--start-round must be >= 0.")
-    if args.start_round == 0 and args.start_step not in (1, 2):
-        raise ValueError("When --start-round=0, --start-step must be 1 or 2.")
-    if args.start_round >= 1 and args.start_step not in (3, 4, 5, 6):
-        raise ValueError("When --start-round>=1, --start-step must be one of 3/4/5/6.")
+    if args.start_round == 0 and args.start_step not in (1, 2, 3, 4, 5):
+        raise ValueError("When --start-round=0, --start-step must be one of 1/2/3/4/5.")
+    if args.start_round >= 1 and args.start_step not in (1, 2, 3, 4):
+        raise ValueError("When --start-round>=1, --start-step must be one of 1/2/3/4.")
     if args.start_round > args.max_rounds and args.start_round > 0:
         raise ValueError("--start-round cannot be greater than --max-rounds.")
     if (args.start_round != 0 or args.start_step != 1) and not args.reuse_from_logs:
@@ -318,6 +333,9 @@ if __name__ == "__main__":
         track_usage(initial_result, executed=False)
 
     current_hypotheses = initial_result
+    last_executed_hypotheses = initial_result
+    previous_execution_result: Optional[Dict[str, Any]] = None
+    previous_memory_result: Optional[Dict[str, Any]] = None
     round_memories: Dict[int, Dict[str, Any]] = {}
     round_refinements: Dict[int, Dict[str, Any]] = {}
     module: Optional[ModelWithSAEModule] = None
@@ -328,26 +346,227 @@ if __name__ == "__main__":
     last_output_score_name = "score_blind_accuracy"
     last_output_logit_top_k = args.output_logit_top_k
 
+    def update_last_output_meta(
+        execution_result_payload: Dict[str, Any],
+        *,
+        default_method: str,
+        default_score_name: str,
+        default_logit_top_k: int,
+    ) -> tuple[str, str, int]:
+        output_exec_meta = execution_result_payload.get("output_side_execution", {})
+        if not isinstance(output_exec_meta, dict):
+            return default_method, default_score_name, default_logit_top_k
+        method = str(output_exec_meta.get("output_intervention_method", default_method))
+        score_name = str(output_exec_meta.get("output_score_name", default_score_name))
+        logit_top_k = default_logit_top_k
+        if output_exec_meta.get("logit_top_k") is not None:
+            try:
+                logit_top_k = int(output_exec_meta.get("logit_top_k"))
+            except (TypeError, ValueError):
+                pass
+        return method, score_name, logit_top_k
+
+    # Baseline phase (round_0): initial hypotheses -> design -> execution -> memory.
+    baseline_round_id = _round_id_from_index(0)
+    baseline_experiments_path = _artifact_json_path(
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=ts,
+        round_index=0,
+        kind="experiments",
+    )
+    print('design baseline experiments...')
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=3):
+        baseline_experiments_result = design_hypothesis_experiments(
+            hypotheses_result=current_hypotheses,
+            num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
+            round_id=baseline_round_id,
+            llm_base_url=args.llm_base_url,
+            llm_model=args.llm_model,
+            llm_api_key_file=args.llm_api_key_file,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+        )
+        executed_steps.append("round_0_step_3_experiments_design")
+        track_usage(baseline_experiments_result, executed=True)
+    else:
+        baseline_experiments_result = _load_json_or_raise(baseline_experiments_path)
+        loaded_steps.append("round_0_step_3_experiments_design")
+        track_usage(baseline_experiments_result, executed=False)
+
+    baseline_execution_path = _artifact_json_path(
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=ts,
+        round_index=0,
+        kind="experiments_execution",
+    )
+    print('execute baseline experiments...')
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=4):
+        if module is None:
+            sae_path = args.sae_path or build_default_sae_path(
+                layer_id=layer_id,
+                width=args.width,
+                release=args.sae_release,
+                average_l0=args.sae_average_l0,
+                canonical_map_path=args.sae_canonical_map,
+            )[0]
+            module = ModelWithSAEModule(
+                llm_name=args.model_checkpoint_path,
+                sae_path=sae_path,
+                sae_layer=int(layer_id),
+                feature_index=int(feature_id),
+                device=args.device,
+            )
+        baseline_execution_result = execute_hypothesis_experiments(
+            experiments_result=baseline_experiments_result,
+            module=module,
+            round_id=baseline_round_id,
+            llm_base_url=args.llm_base_url,
+            llm_model=args.llm_model,
+            llm_api_key_file=args.llm_api_key_file,
+            input_non_zero_threshold=args.input_non_zero_threshold,
+            output_judge_num_choices=args.output_judge_num_choices,
+            output_judge_trials=args.output_judge_trials,
+            output_judge_seed=args.output_judge_seed,
+            output_max_new_tokens=args.output_max_new_tokens,
+            output_generation_temperature=args.output_generation_temperature,
+            output_judge_temperature=args.output_judge_temperature,
+            output_judge_max_tokens=args.output_judge_max_tokens,
+            output_kl_values=args.output_kl_values,
+            output_intervention_method=args.output_intervention_method,
+            output_logit_top_k=args.output_logit_top_k,
+            output_logit_kl_tolerance=args.output_logit_kl_tolerance,
+            output_logit_kl_max_steps=args.output_logit_kl_max_steps,
+            output_logit_force_refresh_kl_cache=args.output_logit_force_refresh_kl_cache,
+            output_logit_include_special_tokens=args.output_logit_include_special_tokens,
+        )
+        executed_steps.append("round_0_step_4_experiments_execution")
+        track_usage(baseline_execution_result, executed=True)
+    else:
+        baseline_execution_result = _load_json_or_raise(baseline_execution_path)
+        loaded_steps.append("round_0_step_4_experiments_execution")
+        track_usage(baseline_execution_result, executed=False)
+    (
+        last_output_intervention_method,
+        last_output_score_name,
+        last_output_logit_top_k,
+    ) = update_last_output_meta(
+        baseline_execution_result,
+        default_method=last_output_intervention_method,
+        default_score_name=last_output_score_name,
+        default_logit_top_k=last_output_logit_top_k,
+    )
+    last_executed_hypotheses = current_hypotheses
+    previous_execution_result = baseline_execution_result
+
+    baseline_memory_path = _artifact_json_path(
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=ts,
+        round_index=0,
+        kind="memory",
+    )
+    baseline_memory_md_path = baseline_memory_path.with_suffix(".md")
+    print('build baseline memory...')
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=5):
+        baseline_memory_result = build_hypothesis_memory(
+            initial_hypotheses_result=current_hypotheses,
+            experiments_result=baseline_experiments_result,
+            execution_result=baseline_execution_result,
+            hypothesis_reasons=_extract_reason_map(current_hypotheses),
+            round_index=0,
+            round_id=baseline_round_id,
+        )
+        _save_json(baseline_memory_path, baseline_memory_result)
+        write_hypothesis_memory_markdown(baseline_memory_md_path, memory=baseline_memory_result)
+        executed_steps.append("round_0_step_5_memory")
+    else:
+        baseline_memory_result = _load_json_or_raise(baseline_memory_path)
+        loaded_steps.append("round_0_step_5_memory")
+    round_memories[0] = baseline_memory_result
+    previous_memory_result = baseline_memory_result
+
     for round_index in range(1, args.max_rounds + 1):
         round_id = _round_id_from_index(round_index)
         print(f'round {round_index}...')
-        if round_index > 1:
-            prev_refinement = round_refinements.get(round_index - 1)
-            if prev_refinement is None:
-                prev_refine_path = _artifact_json_path(
-                    layer_id=layer_id,
-                    feature_id=feature_id,
-                    timestamp=ts,
-                    round_index=round_index - 1,
-                    kind="refined_hypotheses",
-                )
-                prev_refinement = _load_json_or_raise(prev_refine_path)
-                round_refinements[round_index - 1] = prev_refinement
-                track_usage(prev_refinement, executed=False)
-            current_hypotheses = _to_next_round_hypotheses(
-                refinement_result=prev_refinement,
-                round_index=round_index,
+
+        if previous_execution_result is None:
+            prev_execution_path = _artifact_json_path(
+                layer_id=layer_id,
+                feature_id=feature_id,
+                timestamp=ts,
+                round_index=round_index - 1,
+                kind="experiments_execution",
             )
+            previous_execution_result = _load_json_or_raise(prev_execution_path)
+        if previous_memory_result is None:
+            prev_memory_path = _artifact_json_path(
+                layer_id=layer_id,
+                feature_id=feature_id,
+                timestamp=ts,
+                round_index=round_index - 1,
+                kind="memory",
+            )
+            previous_memory_result = _load_json_or_raise(prev_memory_path)
+            round_memories[round_index - 1] = previous_memory_result
+
+        refine_path = _artifact_json_path(
+            layer_id=layer_id,
+            feature_id=feature_id,
+            timestamp=ts,
+            round_index=round_index,
+            kind="refined_hypotheses",
+        )
+        print('refine hypotheses...')
+        if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=1):
+            historical_memories: List[Dict[str, Any]] = []
+            for hist_round in range(0, round_index - 1):
+                if hist_round not in round_memories:
+                    hist_memory_path = _artifact_json_path(
+                        layer_id=layer_id,
+                        feature_id=feature_id,
+                        timestamp=ts,
+                        round_index=hist_round,
+                        kind="memory",
+                    )
+                    round_memories[hist_round] = _load_json_or_raise(hist_memory_path)
+                historical_memories.append(round_memories[hist_round])
+
+            top_m = args.top_m
+            if top_m is None:
+                top_m = len(list(current_hypotheses.get("input_side_hypotheses", [])))
+            refinement_result = refine_hypotheses(
+                current_memory=previous_memory_result,
+                current_execution_result=previous_execution_result,
+                historical_memories=historical_memories,
+                model_id=str(current_hypotheses.get("model_id", args.model_id)),
+                layer_id=layer_id,
+                feature_id=feature_id,
+                top_m=top_m,
+                history_scope=args.history_scope,
+                timestamp=ts,
+                round_id=round_id,
+                llm_base_url=args.llm_base_url,
+                llm_model=args.llm_model,
+                llm_api_key_file=args.llm_api_key_file,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+            )
+            executed_steps.append(f"{round_id}_step_1_refinement")
+            track_usage(refinement_result, executed=True)
+        else:
+            refinement_result = _load_json_or_raise(refine_path)
+            loaded_steps.append(f"{round_id}_step_1_refinement")
+            track_usage(refinement_result, executed=False)
+        round_refinements[round_index] = refinement_result
+
+        converged_this_round = _same_hypotheses(current_hypotheses, refinement_result)
+        current_hypotheses = _to_next_round_hypotheses(
+            refinement_result=refinement_result,
+            round_index=round_index,
+        )
+        last_executed_hypotheses = current_hypotheses
 
         experiments_path = _artifact_json_path(
             layer_id=layer_id,
@@ -357,7 +576,7 @@ if __name__ == "__main__":
             kind="experiments",
         )
         print('design experiments...')
-        if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=3):
+        if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=2):
             experiments_result = design_hypothesis_experiments(
                 hypotheses_result=current_hypotheses,
                 num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
@@ -368,11 +587,11 @@ if __name__ == "__main__":
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
             )
-            executed_steps.append(f"{round_id}_step_3_experiments_design")
+            executed_steps.append(f"{round_id}_step_2_experiments_design")
             track_usage(experiments_result, executed=True)
         else:
             experiments_result = _load_json_or_raise(experiments_path)
-            loaded_steps.append(f"{round_id}_step_3_experiments_design")
+            loaded_steps.append(f"{round_id}_step_2_experiments_design")
             track_usage(experiments_result, executed=False)
 
         execution_path = _artifact_json_path(
@@ -383,7 +602,7 @@ if __name__ == "__main__":
             kind="experiments_execution",
         )
         print('execute experiments...')
-        if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=4):
+        if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=3):
             if module is None:
                 sae_path = args.sae_path or build_default_sae_path(
                     layer_id=layer_id,
@@ -422,23 +641,22 @@ if __name__ == "__main__":
                 output_logit_force_refresh_kl_cache=args.output_logit_force_refresh_kl_cache,
                 output_logit_include_special_tokens=args.output_logit_include_special_tokens,
             )
-            executed_steps.append(f"{round_id}_step_4_experiments_execution")
+            executed_steps.append(f"{round_id}_step_3_experiments_execution")
             track_usage(execution_result, executed=True)
         else:
             execution_result = _load_json_or_raise(execution_path)
-            loaded_steps.append(f"{round_id}_step_4_experiments_execution")
+            loaded_steps.append(f"{round_id}_step_3_experiments_execution")
             track_usage(execution_result, executed=False)
-        output_exec_meta = execution_result.get("output_side_execution", {})
-        if isinstance(output_exec_meta, dict):
-            last_output_intervention_method = str(
-                output_exec_meta.get("output_intervention_method", last_output_intervention_method)
-            )
-            last_output_score_name = str(output_exec_meta.get("output_score_name", last_output_score_name))
-            if output_exec_meta.get("logit_top_k") is not None:
-                try:
-                    last_output_logit_top_k = int(output_exec_meta.get("logit_top_k"))
-                except (TypeError, ValueError):
-                    pass
+        (
+            last_output_intervention_method,
+            last_output_score_name,
+            last_output_logit_top_k,
+        ) = update_last_output_meta(
+            execution_result,
+            default_method=last_output_intervention_method,
+            default_score_name=last_output_score_name,
+            default_logit_top_k=last_output_logit_top_k,
+        )
 
         memory_path = _artifact_json_path(
             layer_id=layer_id,
@@ -449,7 +667,7 @@ if __name__ == "__main__":
         )
         memory_md_path = memory_path.with_suffix(".md")
         print('build memory...')
-        if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=5):
+        if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=4):
             memory_result = build_hypothesis_memory(
                 initial_hypotheses_result=current_hypotheses,
                 experiments_result=experiments_result,
@@ -460,81 +678,28 @@ if __name__ == "__main__":
             )
             _save_json(memory_path, memory_result)
             write_hypothesis_memory_markdown(memory_md_path, memory=memory_result)
-            executed_steps.append(f"{round_id}_step_5_memory")
+            executed_steps.append(f"{round_id}_step_4_memory")
         else:
             memory_result = _load_json_or_raise(memory_path)
-            loaded_steps.append(f"{round_id}_step_5_memory")
+            loaded_steps.append(f"{round_id}_step_4_memory")
         round_memories[round_index] = memory_result
-
-        refine_path = _artifact_json_path(
-            layer_id=layer_id,
-            feature_id=feature_id,
-            timestamp=ts,
-            round_index=round_index,
-            kind="refined_hypotheses",
-        )
-        print('refine hypotheses...')
-        if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=6):
-            historical_memories: List[Dict[str, Any]] = []
-            for hist_round in range(1, round_index):
-                if hist_round not in round_memories:
-                    hist_memory_path = _artifact_json_path(
-                        layer_id=layer_id,
-                        feature_id=feature_id,
-                        timestamp=ts,
-                        round_index=hist_round,
-                        kind="memory",
-                    )
-                    round_memories[hist_round] = _load_json_or_raise(hist_memory_path)
-                historical_memories.append(round_memories[hist_round])
-
-            top_m = args.top_m
-            if top_m is None:
-                top_m = len(list(current_hypotheses.get("input_side_hypotheses", [])))
-            refinement_result = refine_hypotheses(
-                current_memory=memory_result,
-                current_execution_result=execution_result,
-                historical_memories=historical_memories,
-                model_id=str(current_hypotheses.get("model_id", args.model_id)),
-                layer_id=layer_id,
-                feature_id=feature_id,
-                top_m=top_m,
-                history_scope=args.history_scope,
-                timestamp=ts,
-                round_id=round_id,
-                llm_base_url=args.llm_base_url,
-                llm_model=args.llm_model,
-                llm_api_key_file=args.llm_api_key_file,
-                temperature=args.temperature,
-                max_tokens=args.max_tokens,
-            )
-            executed_steps.append(f"{round_id}_step_6_refinement")
-            track_usage(refinement_result, executed=True)
-        else:
-            refinement_result = _load_json_or_raise(refine_path)
-            loaded_steps.append(f"{round_id}_step_6_refinement")
-            track_usage(refinement_result, executed=False)
-
-        round_refinements[round_index] = refinement_result
+        previous_execution_result = execution_result
+        previous_memory_result = memory_result
         last_round_executed = round_index
 
-        if _same_hypotheses(current_hypotheses, refinement_result):
+        if converged_this_round:
             converged = True
             converged_round = round_index
             break
 
     if last_round_executed > 0:
-        final_hypotheses_source = round_refinements[last_round_executed]
-        final_input_hypotheses = list(final_hypotheses_source.get("input_side_hypotheses", []))
-        final_output_hypotheses = list(final_hypotheses_source.get("output_side_hypotheses", []))
-        final_input_reasons = list(final_hypotheses_source.get("input_side_hypothesis_reasons", []))
-        final_output_reasons = list(final_hypotheses_source.get("output_side_hypothesis_reasons", []))
+        final_hypotheses_source = last_executed_hypotheses
     else:
         final_hypotheses_source = initial_result
-        final_input_hypotheses = list(initial_result.get("input_side_hypotheses", []))
-        final_output_hypotheses = list(initial_result.get("output_side_hypotheses", []))
-        final_input_reasons = list(initial_result.get("input_side_hypothesis_reasons", []))
-        final_output_reasons = list(initial_result.get("output_side_hypothesis_reasons", []))
+    final_input_hypotheses = list(final_hypotheses_source.get("input_side_hypotheses", []))
+    final_output_hypotheses = list(final_hypotheses_source.get("output_side_hypotheses", []))
+    final_input_reasons = list(final_hypotheses_source.get("input_side_hypothesis_reasons", []))
+    final_output_reasons = list(final_hypotheses_source.get("output_side_hypothesis_reasons", []))
 
     ts_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts
     ts_dir.mkdir(parents=True, exist_ok=True)

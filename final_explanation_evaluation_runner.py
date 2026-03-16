@@ -420,14 +420,15 @@ def main() -> None:
 
     refined_payload: Optional[Dict[str, Any]] = None
     execution_payload: Optional[Dict[str, Any]] = None
+    target_round = executed_rounds if executed_rounds > 0 else 0
+    round_dir = workflow_timestamp_dir / f"round_{target_round}"
     if executed_rounds > 0:
-        round_dir = workflow_timestamp_dir / f"round_{executed_rounds}"
         refined_path = round_dir / f"layer{layer_id}-feature{feature_id}-refined-hypotheses.json"
-        execution_path = round_dir / f"layer{layer_id}-feature{feature_id}-experiments-execution.json"
         if refined_path.exists():
             refined_payload = _load_json(refined_path)
-        if execution_path.exists():
-            execution_payload = _load_json(execution_path)
+    execution_path = round_dir / f"layer{layer_id}-feature{feature_id}-experiments-execution.json"
+    if execution_path.exists():
+        execution_payload = _load_json(execution_path)
 
     selected_input = _pick_best_hypothesis(
         final_result_payload=final_result,
