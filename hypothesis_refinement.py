@@ -16,7 +16,6 @@ from function import (
     build_round_dir,
     call_llm,
     extract_json_object,
-    load_control_results,
     normalize_round_id,
     read_api_key,
 )
@@ -711,14 +710,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-judge-temperature", type=float, default=0.0)
     parser.add_argument("--output-judge-max-tokens", type=int, default=10000)
     parser.add_argument("--output-kl-values", type=float, nargs="*", default=KL_DIV_VALUES_DEFAULT)
-    parser.add_argument(
-        "--control-result-files",
-        nargs="*",
-        default=[
-            "explanation_quality_evaluation/output-side-evaluation/intervention_example_2.txt",
-            "explanation_quality_evaluation/output-side-evaluation/intervention_example_3.txt",
-        ],
-    )
     return parser
 
 if __name__ == "__main__":
@@ -854,11 +845,9 @@ if __name__ == "__main__":
             feature_index=int(feature_id),
             device=args.device,
         )
-        control_results = load_control_results(args.control_result_files)
         execution_result = execute_hypothesis_experiments(
             experiments_result=experiments_result,
             module=module,
-            control_results=control_results,
             round_id=target_round_id,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,

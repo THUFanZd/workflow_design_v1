@@ -124,16 +124,6 @@ def build_default_sae_path(
     return sae_uri, resolved_average_l0
 
 
-def load_control_results(control_result_files: Sequence[str]) -> list[str]:
-    texts: list[str] = []
-    for file_path in control_result_files:
-        path = Path(file_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Cannot find control result file: {path}")
-        texts.append(path.read_text(encoding="utf-8").strip())
-    return texts
-
-
 @dataclass
 class TokenUsageAccumulator:
     prompt_tokens: int = 0

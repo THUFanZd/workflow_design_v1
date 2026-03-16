@@ -209,7 +209,6 @@ def execute_output_side_experiments(
     llm_model: str,
     token_counter: TokenUsageAccumulator,
     llm_calls: List[Dict[str, Any]],
-    control_results: Sequence[str],
     num_choices: int = 3,
     trials: int = 1,
     seed: int = 42,
@@ -226,9 +225,7 @@ def execute_output_side_experiments(
     if not kl_values:
         raise ValueError("kl_values must not be empty.")
 
-    selected_controls = prepare_control_results(control_results, num_required=num_choices - 1)
-    hypothesis_results: List[Dict[str, Any]] = []
-
+    staged_results: List[Dict[str, Any]] = []
     for hypothesis_index, item in enumerate(output_side_experiments, start=1):
         hypothesis_text = str(item.get("hypothesis", "")).strip()
         prompts = _extract_designed_prompts(item)
@@ -262,6 +259,30 @@ def execute_output_side_experiments(
             prompts=prompts,
             kl_values=kl_values,
         )
+        staged_results.append(
+            {
+                "hypothesis_index": hypothesis_index,
+                "hypothesis_text": hypothesis_text,
+                "prompts": prompts,
+                "steering_runs": steering_runs,
+                "intervention_result": intervention_result,
+            }
+        )
+
+    hypothesis_results: List[Dict[str, Any]] = []
+    for current in staged_results:
+        hypothesis_index = int(current["hypothesis_index"])
+        hypothesis_text = str(current["hypothesis_text"])
+        prompts = list(current["prompts"])
+        steering_runs = dict(current["steering_runs"])
+        intervention_result = str(current["intervention_result"])
+
+        control_pool = [
+            str(candidate["intervention_result"])
+            for candidate in staged_results
+            if int(candidate["hypothesis_index"]) != hypothesis_index
+        ]
+        selected_controls = prepare_control_results(control_pool, num_required=num_choices - 1)
 
         rng = random.Random(seed + hypothesis_index * 10007)
         trial_results: List[Dict[str, Any]] = []

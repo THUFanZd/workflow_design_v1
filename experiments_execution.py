@@ -16,7 +16,6 @@ from function import (
     TokenUsageAccumulator,
     build_default_sae_path,
     build_round_dir,
-    load_control_results,
     normalize_round_id,
     read_api_key,
 )
@@ -172,7 +171,6 @@ def execute_hypothesis_experiments(
     *,
     experiments_result: Dict[str, Any],
     module: ModelWithSAEModule,
-    control_results: Sequence[str],
     round_id: Optional[str] = None,
     llm_base_url: str = DEFAULT_BASE_URL,
     llm_model: str = DEFAULT_MODEL_NAME,
@@ -227,7 +225,6 @@ def execute_hypothesis_experiments(
         llm_model=llm_model,
         token_counter=token_counter,
         llm_calls=llm_calls,
-        control_results=control_results,
         num_choices=output_judge_num_choices,
         trials=output_judge_trials,
         seed=output_judge_seed,
@@ -335,14 +332,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-judge-temperature", type=float, default=0.0)
     parser.add_argument("--output-judge-max-tokens", type=int, default=10000)
     parser.add_argument("--output-kl-values", type=float, nargs="*", default=KL_DIV_VALUES_DEFAULT)
-    parser.add_argument(
-        "--control-result-files",
-        nargs="*",
-        default=[
-            "explanation_quality_evaluation/output-side-evaluation/intervention_example_2.txt",
-            "explanation_quality_evaluation/output-side-evaluation/intervention_example_3.txt",
-        ],
-    )
     return parser
 
 
@@ -427,11 +416,9 @@ if __name__ == "__main__":
         device=args.device,
     )
 
-    control_results = load_control_results(args.control_result_files)
     execution_result = execute_hypothesis_experiments(
         experiments_result=experiments_result,
         module=module,
-        control_results=control_results,
         round_id=args.round_id,
         llm_base_url=args.llm_base_url,
         llm_model=args.llm_model,
