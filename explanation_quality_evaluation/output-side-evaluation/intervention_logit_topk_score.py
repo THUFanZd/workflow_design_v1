@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from experiments_design import OUTPUT_SIDE_PLACEHOLDER
-from function import DEFAULT_CANONICAL_MAP_PATH, build_default_sae_path, call_llm
+from function import DEFAULT_CANONICAL_MAP_PATH, build_default_sae_path, call_llm, extract_usage_counts
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 
 if TYPE_CHECKING:
@@ -534,6 +534,252 @@ def _try_load_existing_result(
     if not isinstance(payload, dict):
         return None
     return payload
+
+
+def score_logit_topk_for_hypothesis(
+    *,
+    module: "ModelWithSAEModule",
+    feature_id: int,
+    hypothesis_index: Optional[int] = None,
+    explanation: str,
+    prompts: Sequence[str],
+    target_kls: Sequence[float],
+    top_k: int,
+    judge_client: OpenAI,
+    judge_model: str,
+    judge_max_tokens: int = 10000,
+    include_special_tokens: bool = False,
+    kl_tolerance: float = 0.1,
+    kl_max_steps: int = 12,
+    force_refresh_kl_cache: bool = False,
+    clamp_cache_path: Optional[Path] = None,
+    llm_calls: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    if module.model is None or module.tokenizer is None:
+        raise RuntimeError("Model/tokenizer failed to load.")
+    if not module.use_hooked_transformer:
+        raise RuntimeError("This score requires HookedSAETransformer mode (sae-lens URI).")
+    if "__sae_lens_obj__" not in module.sae:
+        raise RuntimeError("SAE object not found. Please use sae-lens SAE.")
+
+    prompt_list = _safe_prompt_list(prompts)
+    target_kl_values = [float(x) for x in target_kls]
+    if not target_kl_values:
+        raise ValueError("target_kls must not be empty.")
+    if top_k <= 0:
+        raise ValueError("top_k must be a positive integer.")
+
+    prompt_tokens = module.model.to_tokens(prompt_list)
+    if not isinstance(prompt_tokens, torch.Tensor) or prompt_tokens.ndim != 2:
+        raise RuntimeError("Unexpected prompt token shape from model.to_tokens.")
+
+    prompt_hash = _hash_prompts(prompt_list)
+    if clamp_cache_path is not None:
+        cache_payload = _load_clamp_cache(clamp_cache_path)
+    else:
+        cache_payload = {"version": 1, "entries": []}
+
+    sae_obj = module.sae["__sae_lens_obj__"]
+    clean_logits = module.run_logits(prompt_tokens)
+    clean_mean_logits = clean_logits.mean(dim=(0, 1)).detach().float().cpu()
+    runs: List[Dict[str, Any]] = []
+
+    for target_kl in target_kl_values:
+        cache_hit_entry: Optional[Dict[str, Any]] = None
+        if not bool(force_refresh_kl_cache):
+            cache_hit_entry = _find_cached_clamp(
+                cache_payload=cache_payload,
+                target_kl=target_kl,
+                prompt_hash=prompt_hash,
+            )
+
+        if cache_hit_entry is not None:
+            clamp_value = float(cache_hit_entry["clamp_value"])
+            actual_kl = float(cache_hit_entry.get("actual_kl", 0.0))
+            clamp_cache_hit = True
+        else:
+            clamp_values, kl_values = module._find_clamp_values_for_kl(
+                prompt_tokens,
+                feature_id,
+                sae_obj,
+                target_kl=target_kl,
+                tolerance=float(kl_tolerance),
+                max_steps=int(kl_max_steps),
+            )
+            if not clamp_values:
+                raise RuntimeError(f"Failed to find clamp value for target KL={target_kl}.")
+            clamp_value = float(clamp_values[0])
+            actual_kl = float(kl_values[0]) if kl_values else 0.0
+            clamp_cache_hit = False
+
+            cache_payload.setdefault("entries", [])
+            cache_payload["entries"].append(
+                {
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "target_kl": target_kl,
+                    "prompt_hash": prompt_hash,
+                    "prompts": prompt_list,
+                    "clamp_value": clamp_value,
+                    "actual_kl": actual_kl,
+                    "kl_tolerance": float(kl_tolerance),
+                    "kl_max_steps": int(kl_max_steps),
+                }
+            )
+
+        steered_logits = module.run_logits_with_feature_intervention(
+            input_ids=prompt_tokens,
+            feature_index=feature_id,
+            value=float(clamp_value),
+            mode="clamp",
+        )
+        steered_mean_logits = steered_logits.mean(dim=(0, 1)).detach().float().cpu()
+        delta_logits = steered_mean_logits - clean_mean_logits
+
+        pos_ids, neg_ids = _select_topk_token_ids(
+            delta=delta_logits,
+            top_k=int(top_k),
+            tokenizer=module.tokenizer,
+            skip_special_tokens=not bool(include_special_tokens),
+        )
+
+        unique_ordered_ids: List[int] = []
+        for token_id in pos_ids + neg_ids:
+            if token_id not in unique_ordered_ids:
+                unique_ordered_ids.append(token_id)
+        candidate_tokens = (
+            module.tokenizer.convert_ids_to_tokens(unique_ordered_ids)
+            if module.tokenizer is not None
+            else [str(x) for x in unique_ordered_ids]
+        )
+        token_items = [{"token_id": int(i), "token": str(t)} for i, t in zip(unique_ordered_ids, candidate_tokens)]
+
+        judge_user_prompt = (
+            "Hypothesis:\n"
+            f"{explanation}\n\n"
+            f"Target KL: {target_kl}\n"
+            "Candidate tokens (id + token text):\n"
+            f"{json.dumps(token_items, ensure_ascii=False, indent=2)}\n\n"
+            "Classify every token with expected_effect in {increase, decrease, no_change}."
+        )
+        judge_messages = [
+            {"role": "system", "content": TOKEN_JUDGE_SYSTEM_PROMPT},
+            {"role": "user", "content": judge_user_prompt},
+        ]
+        judge_raw_output, judge_usage_obj, judge_debug = call_llm(
+            client=judge_client,
+            model=str(judge_model),
+            messages=judge_messages,
+            temperature=0.0,
+            max_tokens=int(judge_max_tokens),
+            stream=False,
+            response_format_text=True,
+            return_debug=True,
+        )
+        judge_usage = extract_usage_counts(judge_usage_obj)
+        judge_payload = _extract_json_payload(judge_raw_output)
+        judgment_map = _judgment_map_from_payload(judge_payload)
+
+        positive_rows = _build_token_rows(
+            token_ids=pos_ids,
+            clean_mean_logits=clean_mean_logits,
+            steered_mean_logits=steered_mean_logits,
+            delta_logits=delta_logits,
+            tokenizer=module.tokenizer,
+            judgments=judgment_map,
+            expected_effect="increase",
+        )
+        negative_rows = _build_token_rows(
+            token_ids=neg_ids,
+            clean_mean_logits=clean_mean_logits,
+            steered_mean_logits=steered_mean_logits,
+            delta_logits=delta_logits,
+            tokenizer=module.tokenizer,
+            judgments=judgment_map,
+            expected_effect="decrease",
+        )
+
+        pos_correct = sum(1 for row in positive_rows if row.llm_is_correct)
+        neg_correct = sum(1 for row in negative_rows if row.llm_is_correct)
+        pos_total = len(positive_rows)
+        neg_total = len(negative_rows)
+        pos_ratio = (pos_correct / pos_total) if pos_total > 0 else 0.0
+        neg_ratio = (neg_correct / neg_total) if neg_total > 0 else 0.0
+
+        run = {
+            "target_kl": target_kl,
+            "clamp_value": clamp_value,
+            "actual_kl": actual_kl,
+            "clamp_cache_hit": clamp_cache_hit,
+            "scores": {
+                "positive_topk_increase_ratio": pos_ratio,
+                "negative_topk_decrease_ratio": neg_ratio,
+                "positive_correct_count": pos_correct,
+                "positive_total": pos_total,
+                "negative_correct_count": neg_correct,
+                "negative_total": neg_total,
+                "mean_signed_topk_accuracy": (pos_ratio + neg_ratio) / 2.0,
+            },
+            "positive_topk_tokens": [row.__dict__ for row in positive_rows],
+            "negative_topk_tokens": [row.__dict__ for row in negative_rows],
+            "llm_judge": {
+                "messages": judge_messages,
+                "raw_output": judge_raw_output,
+                "parsed_output": judge_payload,
+                "debug": judge_debug,
+                "usage": judge_usage,
+            },
+        }
+        runs.append(run)
+
+        if isinstance(llm_calls, list):
+            call_record = {
+                "call_type": "output_logit_token_judge",
+                "target_kl": target_kl,
+                "messages": judge_messages,
+                "raw_output": judge_raw_output,
+                "usage": judge_usage,
+                "response_debug": judge_debug,
+            }
+            if hypothesis_index is not None:
+                call_record["hypothesis_index"] = int(hypothesis_index)
+            llm_calls.append(call_record)
+
+    if clamp_cache_path is not None:
+        _save_clamp_cache(clamp_cache_path, cache_payload)
+
+    positive_ratios = [
+        float(run.get("scores", {}).get("positive_topk_increase_ratio", 0.0))
+        for run in runs
+        if isinstance(run, dict)
+    ]
+    negative_ratios = [
+        float(run.get("scores", {}).get("negative_topk_decrease_ratio", 0.0))
+        for run in runs
+        if isinstance(run, dict)
+    ]
+    mean_signed = [
+        float(run.get("scores", {}).get("mean_signed_topk_accuracy", 0.0))
+        for run in runs
+        if isinstance(run, dict)
+    ]
+
+    return {
+        "prompts": prompt_list,
+        "prompt_hash": prompt_hash,
+        "target_kls": target_kl_values,
+        "top_k": int(top_k),
+        "runs": runs,
+        "summary": {
+            "run_count": len(runs),
+            "mean_positive_topk_increase_ratio": (sum(positive_ratios) / len(positive_ratios))
+            if positive_ratios
+            else None,
+            "mean_negative_topk_decrease_ratio": (sum(negative_ratios) / len(negative_ratios))
+            if negative_ratios
+            else None,
+            "mean_signed_topk_accuracy": (sum(mean_signed) / len(mean_signed)) if mean_signed else None,
+        },
+    }
 
 
 def main() -> None:

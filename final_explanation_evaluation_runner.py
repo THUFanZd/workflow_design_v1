@@ -110,19 +110,24 @@ def _pick_best_hypothesis_from_execution(
 ) -> Optional[Dict[str, Any]]:
     if side == "input":
         section = execution_payload.get("input_side_execution", {})
-        score_name = "score_non_zero_rate"
     else:
         section = execution_payload.get("output_side_execution", {})
-        score_name = "score_blind_accuracy"
     if not isinstance(section, dict):
         return None
+    if side == "input":
+        score_name = "score_non_zero_rate"
+    else:
+        score_name = str(section.get("output_score_name", "score_blind_accuracy")).strip() or "score_blind_accuracy"
     results_raw = section.get("hypothesis_results", [])
     results = [item for item in results_raw if isinstance(item, dict)]
     if not results:
         return None
+    def _item_score(item: Dict[str, Any]) -> float:
+        return _safe_float(item.get(score_name, item.get("score_primary", item.get("score", 0.0))), 0.0)
+
     results.sort(
         key=lambda item: (
-            -_safe_float(item.get(score_name), 0.0),
+            -_item_score(item),
             _safe_int(item.get("hypothesis_index"), 10**9),
         )
     )
@@ -132,7 +137,7 @@ def _pick_best_hypothesis_from_execution(
         "hypothesis_index": _safe_int(best.get("hypothesis_index"), 0),
         "hypothesis": str(best.get("hypothesis", "")).strip(),
         "score_name": score_name,
-        "score_value": _safe_float(best.get(score_name), 0.0),
+        "score_value": _item_score(best),
     }
 
 

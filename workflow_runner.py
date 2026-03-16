@@ -212,6 +212,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-judge-temperature", type=float, default=0.0)
     parser.add_argument("--output-judge-max-tokens", type=int, default=10000)
     parser.add_argument("--output-kl-values", type=float, nargs="*", default=KL_DIV_VALUES_DEFAULT)
+    parser.add_argument(
+        "--output-intervention-method",
+        choices=["blind", "logit"],
+        default="blind",
+        help="Output-side intervention scoring method used in experiments execution.",
+    )
+    parser.add_argument("--output-logit-top-k", type=int, default=5)
+    parser.add_argument("--output-logit-kl-tolerance", type=float, default=0.1)
+    parser.add_argument("--output-logit-kl-max-steps", type=int, default=12)
+    parser.add_argument("--output-logit-force-refresh-kl-cache", action="store_true")
+    parser.add_argument("--output-logit-include-special-tokens", action="store_true")
     return parser
 
 
@@ -313,6 +324,9 @@ if __name__ == "__main__":
     converged = False
     converged_round: Optional[int] = None
     last_round_executed = 0
+    last_output_intervention_method = str(args.output_intervention_method)
+    last_output_score_name = "score_blind_accuracy"
+    last_output_logit_top_k = args.output_logit_top_k
 
     for round_index in range(1, args.max_rounds + 1):
         round_id = _round_id_from_index(round_index)
@@ -401,6 +415,12 @@ if __name__ == "__main__":
                 output_judge_temperature=args.output_judge_temperature,
                 output_judge_max_tokens=args.output_judge_max_tokens,
                 output_kl_values=args.output_kl_values,
+                output_intervention_method=args.output_intervention_method,
+                output_logit_top_k=args.output_logit_top_k,
+                output_logit_kl_tolerance=args.output_logit_kl_tolerance,
+                output_logit_kl_max_steps=args.output_logit_kl_max_steps,
+                output_logit_force_refresh_kl_cache=args.output_logit_force_refresh_kl_cache,
+                output_logit_include_special_tokens=args.output_logit_include_special_tokens,
             )
             executed_steps.append(f"{round_id}_step_4_experiments_execution")
             track_usage(execution_result, executed=True)
@@ -408,6 +428,17 @@ if __name__ == "__main__":
             execution_result = _load_json_or_raise(execution_path)
             loaded_steps.append(f"{round_id}_step_4_experiments_execution")
             track_usage(execution_result, executed=False)
+        output_exec_meta = execution_result.get("output_side_execution", {})
+        if isinstance(output_exec_meta, dict):
+            last_output_intervention_method = str(
+                output_exec_meta.get("output_intervention_method", last_output_intervention_method)
+            )
+            last_output_score_name = str(output_exec_meta.get("output_score_name", last_output_score_name))
+            if output_exec_meta.get("logit_top_k") is not None:
+                try:
+                    last_output_logit_top_k = int(output_exec_meta.get("logit_top_k"))
+                except (TypeError, ValueError):
+                    pass
 
         memory_path = _artifact_json_path(
             layer_id=layer_id,
@@ -547,6 +578,9 @@ if __name__ == "__main__":
         "input_side_final_reasons": final_input_reasons,
         "output_side_final_hypotheses": final_output_hypotheses,
         "output_side_final_reasons": final_output_reasons,
+        "output_intervention_method": last_output_intervention_method,
+        "output_score_name": last_output_score_name,
+        "output_logit_top_k": last_output_logit_top_k,
         "token_usage_total": total_tokens.as_dict(),
         "token_usage_this_run": run_tokens.as_dict(),
         "executed_steps": executed_steps,
@@ -569,6 +603,9 @@ if __name__ == "__main__":
     lines.append(f"- executed_rounds: {last_round_executed}")
     lines.append(f"- converged: {converged}")
     lines.append(f"- converged_round: {converged_round}")
+    lines.append(f"- output_intervention_method: {final_result.get('output_intervention_method')}")
+    lines.append(f"- output_score_name: {final_result.get('output_score_name')}")
+    lines.append(f"- output_logit_top_k: {final_result.get('output_logit_top_k')}")
     lines.append("")
     lines.append("## Token Usage (Workflow)")
     lines.append(f"- total_prompt_tokens: {final_result['token_usage_total']['prompt_tokens']}")
@@ -604,6 +641,8 @@ if __name__ == "__main__":
                 "workflow_memory_md_path": str(workflow_memory_md),
                 "converged": converged,
                 "converged_round": converged_round,
+                "output_intervention_method": final_result.get("output_intervention_method"),
+                "output_score_name": final_result.get("output_score_name"),
                 "input_final_hypothesis_count": len(final_input_hypotheses),
                 "output_final_hypothesis_count": len(final_output_hypotheses),
                 "token_usage_total": total_tokens.as_dict(),

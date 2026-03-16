@@ -237,6 +237,7 @@ def _build_output_hypothesis_memory(
     reason: str,
     experiments_item: Dict[str, Any],
     execution_item: Dict[str, Any],
+    default_score_name: str = "score_blind_accuracy",
 ) -> Dict[str, Any]:
     designed_prompts = _extract_string_list(experiments_item.get("designed_sentences"))
     if not designed_prompts:
@@ -250,12 +251,44 @@ def _build_output_hypothesis_memory(
         for index, prompt in enumerate(designed_prompts, start=1)
     ]
 
-    trial_results_raw = execution_item.get("trial_results")
-    trial_results: List[Dict[str, Any]] = (
-        [item for item in trial_results_raw if isinstance(item, dict)]
-        if isinstance(trial_results_raw, list)
-        else []
+    score_name = _clean_text(execution_item.get("score_name")) or _clean_text(default_score_name) or "score_blind_accuracy"
+    score_value = _safe_float(
+        execution_item.get(score_name, execution_item.get("score_primary", execution_item.get("score", 0.0))),
+        0.0,
     )
+
+    trial_results_raw = execution_item.get("trial_results")
+    trial_results: List[Dict[str, Any]]
+    if isinstance(trial_results_raw, list):
+        trial_results = [item for item in trial_results_raw if isinstance(item, dict)]
+    else:
+        trial_results = []
+
+    if not trial_results and score_name == "score_logit_topk":
+        logit_runs_raw = execution_item.get("logit_topk_result", {}).get("runs", [])
+        logit_runs = [item for item in logit_runs_raw if isinstance(item, dict)] if isinstance(logit_runs_raw, list) else []
+        synthetic_trials: List[Dict[str, Any]] = []
+        for run_index, run in enumerate(logit_runs, start=1):
+            run_score = _safe_float(run.get("scores", {}).get("mean_signed_topk_accuracy"), 0.0)
+            synthetic_trials.append(
+                {
+                    "trial_index": run_index,
+                    "correct_choice": -1,
+                    "chosen_choice": -1,
+                    "success": run_score >= 0.5,
+                    "judge_response": json.dumps(
+                        {
+                            "target_kl": run.get("target_kl"),
+                            "mean_signed_topk_accuracy": run_score,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "target_kl": run.get("target_kl"),
+                    "mean_signed_topk_accuracy": run_score,
+                }
+            )
+        trial_results = synthetic_trials
+
     normalized_trials: List[Dict[str, Any]] = []
     failed_trials: List[Dict[str, Any]] = []
     for trial in trial_results:
@@ -270,7 +303,8 @@ def _build_output_hypothesis_memory(
         if not normalized["success"]:
             failed_trials.append(normalized)
 
-    score_blind_accuracy = _safe_float(execution_item.get("score_blind_accuracy"), 0.0)
+    score_blind_accuracy = execution_item.get("score_blind_accuracy")
+    score_logit_topk = execution_item.get("score_logit_topk")
     kl_values = execution_item.get("kl_values")
     normalized_kl_values = [_safe_float(x) for x in kl_values] if isinstance(kl_values, list) else []
 
@@ -279,13 +313,17 @@ def _build_output_hypothesis_memory(
         "hypothesis_index": hypothesis_index,
         "hypothesis": hypothesis_text,
         "reason": reason,
-        "score": score_blind_accuracy,
+        "score": score_value,
+        "score_name": score_name,
+        "score_value": score_value,
         "score_blind_accuracy": score_blind_accuracy,
+        "score_logit_topk": score_logit_topk,
         "blind_judge_successes": _safe_int(execution_item.get("blind_judge_successes"), 0),
         "blind_judge_trials": _safe_int(execution_item.get("blind_judge_trials"), len(normalized_trials)),
         "kl_values": normalized_kl_values,
         "test_cases": test_cases,
         "intervention_result": _clean_text(execution_item.get("intervention_result")),
+        "logit_topk_summary": execution_item.get("logit_topk_result", {}).get("summary", {}),
         "trial_results": normalized_trials,
         "failed_test_cases": failed_trials,
     }
@@ -359,6 +397,7 @@ def build_hypothesis_memory(
         if isinstance(output_execution_raw, list)
         else []
     )
+    output_score_name = _clean_text(output_execution.get("output_score_name")) or "score_blind_accuracy"
 
     input_count = max(len(input_hypotheses), len(input_experiments), len(input_execution_list), len(reasons["input"]))
     output_count = max(
@@ -403,6 +442,7 @@ def build_hypothesis_memory(
                 reason=_reason_at(reasons["output"], index),
                 experiments_item=experiments_item,
                 execution_item=execution_item,
+                default_score_name=output_score_name,
             )
         )
 
@@ -412,7 +452,11 @@ def build_hypothesis_memory(
             "hypotheses": input_memories,
         },
         "output": {
+            "output_intervention_method": _clean_text(output_execution.get("output_intervention_method")),
+            "output_score_name": output_score_name,
+            "overall_score_primary": _safe_float(output_execution.get("overall_score_primary"), 0.0),
             "overall_score_blind_accuracy": _safe_float(output_execution.get("overall_score_blind_accuracy"), 0.0),
+            "overall_score_logit_topk": _safe_float(output_execution.get("overall_score_logit_topk"), 0.0),
             "hypotheses": output_memories,
         },
     }
@@ -504,7 +548,11 @@ def write_hypothesis_memory_markdown(path: Path, *, memory: Dict[str, Any]) -> N
         lines.append("")
 
     lines.append("## Output-side Memory")
+    lines.append(f"- output_intervention_method: {output_side.get('output_intervention_method', '')}")
+    lines.append(f"- output_score_name: {output_side.get('output_score_name', '')}")
+    lines.append(f"- overall_score_primary: {output_side.get('overall_score_primary', 0.0)}")
     lines.append(f"- overall_score_blind_accuracy: {output_side.get('overall_score_blind_accuracy', 0.0)}")
+    lines.append(f"- overall_score_logit_topk: {output_side.get('overall_score_logit_topk', 0.0)}")
     lines.append("")
     output_hypotheses = output_side.get("hypotheses", []) if isinstance(output_side, dict) else []
     for item in output_hypotheses:
@@ -513,11 +561,17 @@ def write_hypothesis_memory_markdown(path: Path, *, memory: Dict[str, Any]) -> N
         lines.append(f"### Output Hypothesis {item.get('hypothesis_index', '')}")
         lines.append(f"- hypothesis: {item.get('hypothesis', '')}")
         lines.append(f"- reason: {item.get('reason', '')}")
-        lines.append(f"- score_blind_accuracy: {item.get('score_blind_accuracy', 0.0)}")
+        lines.append(f"- score_name: {item.get('score_name', '')}")
+        lines.append(f"- score_value: {item.get('score_value', 0.0)}")
+        lines.append(f"- score_blind_accuracy: {item.get('score_blind_accuracy', None)}")
+        lines.append(f"- score_logit_topk: {item.get('score_logit_topk', None)}")
         lines.append(f"- kl_values: {item.get('kl_values', [])}")
         failed_cases = item.get("failed_test_cases", [])
         failed_count = len(failed_cases) if isinstance(failed_cases, list) else 0
         lines.append(f"- failed_trial_count: {failed_count}")
+        lines.append(
+            f"- logit_topk_summary: {json.dumps(item.get('logit_topk_summary', {}), ensure_ascii=False)}"
+        )
         lines.append("")
         lines.append("#### Designed Prompts")
         test_cases = item.get("test_cases", [])

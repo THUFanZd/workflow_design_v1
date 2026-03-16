@@ -59,8 +59,8 @@ def _load_json(path: Path) -> Dict[str, Any]:
     return payload
 
 
-def _score_key(side: SideType) -> str:
-    return "score_non_zero_rate" if side == "input" else "score_blind_accuracy"
+def _score_key(side: SideType, *, output_score_name: str = "score_blind_accuracy") -> str:
+    return "score_non_zero_rate" if side == "input" else (str(output_score_name).strip() or "score_blind_accuracy")
 
 
 def _find_success_example(hypothesis_memory: Dict[str, Any], side: SideType) -> Dict[str, Any]:
@@ -125,6 +125,11 @@ def extract_refinement_evidence_from_memory(
     side_data = sides.get(side, {})
     hypotheses_raw = side_data.get("hypotheses", []) if isinstance(side_data, dict) else []
     hypotheses_list = [item for item in hypotheses_raw if isinstance(item, dict)] if isinstance(hypotheses_raw, list) else []
+    output_score_name = (
+        _clean_text(side_data.get("output_score_name"))
+        if side == "output" and isinstance(side_data, dict)
+        else "score_blind_accuracy"
+    )
 
     compact_hypotheses: List[Dict[str, Any]] = []
     for item in hypotheses_list:
@@ -132,7 +137,7 @@ def extract_refinement_evidence_from_memory(
         if hypothesis_index is not None and index != hypothesis_index:
             continue
 
-        score_name = _score_key(side)
+        score_name = _clean_text(item.get("score_name")) or _score_key(side, output_score_name=output_score_name)
         score_value = _safe_float(item.get(score_name, item.get("score", 0.0)), 0.0)
         compact_hypotheses.append(
             {
@@ -194,11 +199,39 @@ def _extract_execution_evidence(
             "failed_examples": [dict(item) for item in failed],
         }
 
+    output_score_name = _clean_text(side_data.get("output_score_name")) or "score_blind_accuracy"
+    score_value = _safe_float(
+        target.get(output_score_name, target.get("score_primary", target.get("score", 0.0))),
+        0.0,
+    )
+    if output_score_name == "score_logit_topk":
+        runs_raw = target.get("logit_topk_result", {}).get("runs", [])
+        runs = [item for item in runs_raw if isinstance(item, dict)] if isinstance(runs_raw, list) else []
+        enriched_runs: List[Dict[str, Any]] = []
+        for run in runs:
+            run_score = _safe_float(run.get("scores", {}).get("mean_signed_topk_accuracy"), 0.0)
+            item = dict(run)
+            item["success"] = run_score >= 0.5
+            item["score"] = run_score
+            enriched_runs.append(item)
+        enriched_runs.sort(key=lambda item: _safe_float(item.get("score"), 0.0), reverse=True)
+        success_example = dict(enriched_runs[0]) if enriched_runs else {}
+        failed_examples = [dict(item) for item in enriched_runs if not bool(item.get("success", False))]
+        return {
+            "score_name": output_score_name,
+            "score_value": score_value,
+            "successful_example": success_example,
+            "failed_examples": failed_examples,
+            "run_count": len(enriched_runs),
+        }
+
     trials_raw = target.get("trial_results", [])
     trials = [item for item in trials_raw if isinstance(item, dict)] if isinstance(trials_raw, list) else []
     success_example = next((dict(item) for item in trials if bool(item.get("success", False))), {})
     failed_examples = [dict(item) for item in trials if not bool(item.get("success", False))]
     return {
+        "score_name": output_score_name,
+        "score_value": score_value,
         "score_blind_accuracy": _safe_float(target.get("score_blind_accuracy"), 0.0),
         "blind_judge_successes": _safe_int(target.get("blind_judge_successes"), 0),
         "blind_judge_trials": _safe_int(target.get("blind_judge_trials"), len(trials)),

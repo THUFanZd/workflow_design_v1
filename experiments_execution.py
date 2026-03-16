@@ -45,7 +45,7 @@ def _write_markdown_log(
         lines.append(f"- round_id: {result['round_id']}")
     lines.append(f"- output_judge_llm_model: {result['output_judge_llm_model']}")
     lines.append("")
-    lines.append("## Token Usage (Output-side Blind Judge)")
+    lines.append("## Token Usage (Output-side Judge)")
     token_usage = result["token_usage"]
     lines.append(f"- prompt_tokens: {token_usage['prompt_tokens']}")
     lines.append(f"- completion_tokens: {token_usage['completion_tokens']}")
@@ -111,17 +111,25 @@ def _write_markdown_log(
 
     output_side = result["output_side_execution"]
     lines.append("## Output-side Execution")
-    lines.append(f"- blind_judge_num_choices: {output_side['blind_judge_num_choices']}")
-    lines.append(f"- blind_judge_trials: {output_side['blind_judge_trials']}")
-    lines.append(f"- overall_score_blind_accuracy: {output_side['overall_score_blind_accuracy']}")
+    lines.append(f"- output_intervention_method: {output_side.get('output_intervention_method')}")
+    lines.append(f"- output_score_name: {output_side.get('output_score_name')}")
+    lines.append(f"- overall_score_primary: {output_side.get('overall_score_primary')}")
+    lines.append(f"- overall_score_blind_accuracy: {output_side.get('overall_score_blind_accuracy')}")
+    lines.append(f"- overall_score_logit_topk: {output_side.get('overall_score_logit_topk')}")
+    lines.append(f"- blind_judge_num_choices: {output_side.get('blind_judge_num_choices')}")
+    lines.append(f"- blind_judge_trials: {output_side.get('blind_judge_trials')}")
+    lines.append(f"- logit_top_k: {output_side.get('logit_top_k')}")
     lines.append(f"- kl_values: {output_side['kl_values']}")
     lines.append("")
     for hypothesis_result in output_side["hypothesis_results"]:
         lines.append(f"### Output Hypothesis {hypothesis_result['hypothesis_index']}")
         lines.append(f"- explanation_original: {hypothesis_result['hypothesis']}")
-        lines.append(f"- score_blind_accuracy: {hypothesis_result['score_blind_accuracy']}")
-        lines.append(f"- blind_judge_successes: {hypothesis_result['blind_judge_successes']}")
-        lines.append(f"- blind_judge_trials: {hypothesis_result['blind_judge_trials']}")
+        lines.append(f"- score_name: {hypothesis_result.get('score_name')}")
+        lines.append(f"- score_primary: {hypothesis_result.get('score_primary')}")
+        lines.append(f"- score_blind_accuracy: {hypothesis_result.get('score_blind_accuracy')}")
+        lines.append(f"- score_logit_topk: {hypothesis_result.get('score_logit_topk')}")
+        lines.append(f"- blind_judge_successes: {hypothesis_result.get('blind_judge_successes')}")
+        lines.append(f"- blind_judge_trials: {hypothesis_result.get('blind_judge_trials')}")
         lines.append("")
         lines.append("#### Designed Sentences")
         for sentence in hypothesis_result["designed_sentences"]:
@@ -132,6 +140,20 @@ def _write_markdown_log(
         lines.append(hypothesis_result["intervention_result"])
         lines.append("```")
         lines.append("")
+        if hypothesis_result.get("logit_topk_result"):
+            logit_summary = hypothesis_result.get("logit_topk_result", {}).get("summary", {})
+            lines.append("#### Logit Top-K Summary")
+            lines.append(f"- run_count: {logit_summary.get('run_count')}")
+            lines.append(
+                "- mean_positive_topk_increase_ratio: "
+                f"{logit_summary.get('mean_positive_topk_increase_ratio')}"
+            )
+            lines.append(
+                "- mean_negative_topk_decrease_ratio: "
+                f"{logit_summary.get('mean_negative_topk_decrease_ratio')}"
+            )
+            lines.append(f"- mean_signed_topk_accuracy: {logit_summary.get('mean_signed_topk_accuracy')}")
+            lines.append("")
         lines.append("#### Trial Results")
         for trial_result in hypothesis_result["trial_results"]:
             lines.append(
@@ -184,6 +206,12 @@ def execute_hypothesis_experiments(
     output_judge_temperature: float = 0.0,
     output_judge_max_tokens: int = 1024,
     output_kl_values: Sequence[float] = KL_DIV_VALUES_DEFAULT,
+    output_intervention_method: str = "blind",
+    output_logit_top_k: int = 5,
+    output_logit_kl_tolerance: float = 0.1,
+    output_logit_kl_max_steps: int = 12,
+    output_logit_force_refresh_kl_cache: bool = False,
+    output_logit_include_special_tokens: bool = False,
 ) -> Dict[str, Any]:
     model_id = str(experiments_result.get("model_id", "unknown-model"))
     layer_id = str(experiments_result["layer_id"])
@@ -233,6 +261,12 @@ def execute_hypothesis_experiments(
         judge_temperature=output_judge_temperature,
         judge_max_tokens=output_judge_max_tokens,
         kl_values=output_kl_values,
+        intervention_method=output_intervention_method,
+        logit_top_k=output_logit_top_k,
+        logit_kl_tolerance=output_logit_kl_tolerance,
+        logit_kl_max_steps=output_logit_kl_max_steps,
+        logit_force_refresh_kl_cache=output_logit_force_refresh_kl_cache,
+        logit_include_special_tokens=output_logit_include_special_tokens,
     )
 
     result: Dict[str, Any] = {
@@ -242,6 +276,8 @@ def execute_hypothesis_experiments(
         "timestamp": ts,
         "round_id": resolved_round_id,
         "output_judge_llm_model": llm_model,
+        "output_intervention_method": output_side_execution.get("output_intervention_method"),
+        "output_score_name": output_side_execution.get("output_score_name"),
         "input_side_execution": input_side_execution,
         "output_side_execution": output_side_execution,
         "token_usage": token_counter.as_dict(),
@@ -332,6 +368,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-judge-temperature", type=float, default=0.0)
     parser.add_argument("--output-judge-max-tokens", type=int, default=10000)
     parser.add_argument("--output-kl-values", type=float, nargs="*", default=KL_DIV_VALUES_DEFAULT)
+    parser.add_argument(
+        "--output-intervention-method",
+        choices=["blind", "logit"],
+        default="blind",
+        help="Output-side intervention scoring method.",
+    )
+    parser.add_argument("--output-logit-top-k", type=int, default=5)
+    parser.add_argument("--output-logit-kl-tolerance", type=float, default=0.1)
+    parser.add_argument("--output-logit-kl-max-steps", type=int, default=12)
+    parser.add_argument("--output-logit-force-refresh-kl-cache", action="store_true")
+    parser.add_argument("--output-logit-include-special-tokens", action="store_true")
     return parser
 
 
@@ -432,5 +479,11 @@ if __name__ == "__main__":
         output_judge_temperature=args.output_judge_temperature,
         output_judge_max_tokens=args.output_judge_max_tokens,
         output_kl_values=args.output_kl_values,
+        output_intervention_method=args.output_intervention_method,
+        output_logit_top_k=args.output_logit_top_k,
+        output_logit_kl_tolerance=args.output_logit_kl_tolerance,
+        output_logit_kl_max_steps=args.output_logit_kl_max_steps,
+        output_logit_force_refresh_kl_cache=args.output_logit_force_refresh_kl_cache,
+        output_logit_include_special_tokens=args.output_logit_include_special_tokens,
     )
     print(json.dumps(execution_result, ensure_ascii=False, indent=2))
