@@ -25,6 +25,7 @@ from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
 from prompts.refine_prompt import HistoryScope, build_system_prompt, build_user_prompt
 
 SideType = Literal["input", "output"]
+RunSideType = Literal["input", "output", "both"]
 KL_DIV_VALUES_DEFAULT = [0.25, 0.5, -0.25, -0.5]
 
 
@@ -512,6 +513,48 @@ def _write_memory_markdown(path: Path, *, memory: Dict[str, Any]) -> None:
     lines.append("```")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+
+def _extract_side_state_from_memory(
+    *,
+    current_memory: Dict[str, Any],
+    side: SideType,
+) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
+    sides = current_memory.get("sides", {})
+    side_data = sides.get(side, {}) if isinstance(sides, dict) else {}
+    hypotheses_raw = side_data.get("hypotheses", []) if isinstance(side_data, dict) else []
+    hypotheses_list = [item for item in hypotheses_raw if isinstance(item, dict)] if isinstance(hypotheses_raw, list) else []
+
+    hypotheses: List[str] = []
+    reasons: List[str] = []
+    items: List[Dict[str, Any]] = []
+    default_score_name = "score_non_zero_rate" if side == "input" else (
+        _clean_text(side_data.get("output_score_name")) if isinstance(side_data, dict) else "score_blind_accuracy"
+    )
+    if not default_score_name:
+        default_score_name = "score_blind_accuracy"
+
+    for index, item in enumerate(hypotheses_list, start=1):
+        hypothesis_index = _safe_int(item.get("hypothesis_index"), index)
+        hypothesis = _clean_text(item.get("hypothesis"))
+        reason = _clean_text(item.get("reason"))
+        hypotheses.append(hypothesis)
+        reasons.append(reason)
+        score_name = _clean_text(item.get("score_name")) or default_score_name
+        score_value = _safe_float(item.get(score_name, item.get("score_value", item.get("score"))), 0.0)
+        items.append(
+            {
+                "hypothesis_index": hypothesis_index,
+                "original_hypothesis": hypothesis,
+                "original_reason": reason,
+                "score_name": score_name,
+                "score_value": score_value,
+                "refined_reason": reason,
+                "refined_hypothesis": hypothesis,
+                "evidence": {"status": "unchanged_skipped_side"},
+            }
+        )
+    return hypotheses, reasons, items
+
 def refine_hypotheses(
     *,
     current_memory: Dict[str, Any],
@@ -529,6 +572,7 @@ def refine_hypotheses(
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
     temperature: float = 0.0,
     max_tokens: int = 2000,
+    run_side: RunSideType = "both",
 ) -> Dict[str, Any]:
     ts = timestamp or _clean_text(current_memory.get("timestamp")) or datetime.now().strftime("%Y%m%d_%H%M%S")
     round_index = _safe_int(current_memory.get("round_index"), 1)
@@ -544,34 +588,44 @@ def refine_hypotheses(
     token_counter = TokenUsageAccumulator()
     llm_calls: List[Dict[str, Any]] = []
 
-    refined_input = refine_hypotheses_for_side(
-        side="input",
-        current_memory=current_memory,
-        current_execution_result=current_execution_result,
-        historical_memories=historical_memories,
-        top_m=top_m,
-        history_scope=history_scope,
-        client=client,
-        llm_model=llm_model,
-        token_counter=token_counter,
-        llm_calls=llm_calls,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    refined_output = refine_hypotheses_for_side(
-        side="output",
-        current_memory=current_memory,
-        current_execution_result=current_execution_result,
-        historical_memories=historical_memories,
-        top_m=top_m,
-        history_scope=history_scope,
-        client=client,
-        llm_model=llm_model,
-        token_counter=token_counter,
-        llm_calls=llm_calls,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    run_input = run_side in ("input", "both")
+    run_output = run_side in ("output", "both")
+
+    if run_input:
+        refined_input = refine_hypotheses_for_side(
+            side="input",
+            current_memory=current_memory,
+            current_execution_result=current_execution_result,
+            historical_memories=historical_memories,
+            top_m=top_m,
+            history_scope=history_scope,
+            client=client,
+            llm_model=llm_model,
+            token_counter=token_counter,
+            llm_calls=llm_calls,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    else:
+        _, _, refined_input = _extract_side_state_from_memory(current_memory=current_memory, side="input")
+
+    if run_output:
+        refined_output = refine_hypotheses_for_side(
+            side="output",
+            current_memory=current_memory,
+            current_execution_result=current_execution_result,
+            historical_memories=historical_memories,
+            top_m=top_m,
+            history_scope=history_scope,
+            client=client,
+            llm_model=llm_model,
+            token_counter=token_counter,
+            llm_calls=llm_calls,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    else:
+        _, _, refined_output = _extract_side_state_from_memory(current_memory=current_memory, side="output")
 
     result: Dict[str, Any] = {
         "model_id": model_id,
@@ -580,6 +634,7 @@ def refine_hypotheses(
         "timestamp": ts,
         "round_id": resolved_round_id,
         "top_m": top_m,
+        "run_side": run_side,
         "history_rounds": len(historical_memories),
         "history_scope": history_scope,
         "llm_model": llm_model,

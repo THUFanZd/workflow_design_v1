@@ -4,7 +4,7 @@ import argparse
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence
 
 from openai import OpenAI
 
@@ -25,6 +25,48 @@ from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
 from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
 from model_with_sae import ModelWithSAEModule
 from neuronpedia_feature_api import fetch_and_parse_feature_observation
+
+RunSideType = Literal["input", "output", "both"]
+
+
+def _empty_input_side_execution(*, non_zero_threshold: float) -> Dict[str, Any]:
+    return {
+        "side": "input",
+        "non_zero_threshold": non_zero_threshold,
+        "hypothesis_results": [],
+        "overall_score_non_zero_rate": 0.0,
+        "overall_score_boundary_non_activation_rate": None,
+    }
+
+
+def _empty_output_side_execution(
+    *,
+    output_intervention_method: str,
+    output_score_name: str,
+    output_kl_values: Sequence[float],
+    output_judge_num_choices: int,
+    output_judge_trials: int,
+    output_logit_top_k: int,
+) -> Dict[str, Any]:
+    method = str(output_intervention_method).strip().lower()
+    score_name = str(output_score_name).strip() or "score_blind_accuracy"
+    if score_name not in ("score_blind_accuracy", "score_logit_topk"):
+        score_name = "score_blind_accuracy" if method != "logit" else "score_logit_topk"
+    return {
+        "side": "output",
+        "output_intervention_method": method if method in ("blind", "logit") else "blind",
+        "output_score_name": score_name,
+        "kl_values": [float(x) for x in output_kl_values],
+        "blind_judge_num_choices": output_judge_num_choices if method == "blind" else None,
+        "blind_judge_trials": output_judge_trials if method == "blind" else None,
+        "logit_top_k": int(output_logit_top_k) if method == "logit" else None,
+        "hypothesis_results": [],
+        "overall_score_blind_accuracy": None,
+        "overall_score_logit_topk": None,
+        "overall_score_primary": None,
+        "blind_evaluation": {},
+        "logit_evaluation": {},
+    }
 
 
 def _write_markdown_log(
@@ -212,6 +254,7 @@ def execute_hypothesis_experiments(
     output_logit_kl_max_steps: int = 12,
     output_logit_force_refresh_kl_cache: bool = False,
     output_logit_include_special_tokens: bool = False,
+    run_side: RunSideType = "both",
 ) -> Dict[str, Any]:
     model_id = str(experiments_result.get("model_id", "unknown-model"))
     layer_id = str(experiments_result["layer_id"])
@@ -223,51 +266,77 @@ def execute_hypothesis_experiments(
     )
     input_side_experiments = list(experiments_result.get("input_side_experiments", []))
     output_side_experiments = list(experiments_result.get("output_side_experiments", []))
+    run_input = run_side in ("input", "both")
+    run_output = run_side in ("output", "both")
+    output_score_name = "score_blind_accuracy" if output_intervention_method == "blind" else "score_logit_topk"
 
-    input_side_execution = execute_input_side_experiments(
-        input_side_experiments=input_side_experiments,
-        module=module,
-        non_zero_threshold=input_non_zero_threshold,
-    )
+    if run_input:
+        input_side_execution = execute_input_side_experiments(
+            input_side_experiments=input_side_experiments,
+            module=module,
+            non_zero_threshold=input_non_zero_threshold,
+        )
+    else:
+        input_side_execution = _empty_input_side_execution(non_zero_threshold=input_non_zero_threshold)
 
     llm_calls: List[Dict[str, Any]] = []
     token_counter = TokenUsageAccumulator()
 
-    if output_side_experiments and (
-        not isinstance(getattr(module, "sae", None), dict) or "__sae_lens_obj__" not in module.sae
-    ):
-        raise RuntimeError(
-            "Output-side execution requires a loaded SAE-Lens object for KL-guided steering. "
-            "Current SAE is unavailable or not SAE-Lens format. "
-            "Please provide a valid --sae-path (sae-lens URI or compatible checkpoint)."
-        )
+    if run_output:
+        if output_side_experiments and (
+            not isinstance(getattr(module, "sae", None), dict) or "__sae_lens_obj__" not in module.sae
+        ):
+            raise RuntimeError(
+                "Output-side execution requires a loaded SAE-Lens object for KL-guided steering. "
+                "Current SAE is unavailable or not SAE-Lens format. "
+                "Please provide a valid --sae-path (sae-lens URI or compatible checkpoint)."
+            )
 
-    client = OpenAI(
-        base_url=llm_base_url,
-        api_key=read_api_key(llm_api_key_file),
-    )
-    output_side_execution = execute_output_side_experiments(
-        output_side_experiments=output_side_experiments,
-        module=module,
-        client=client,
-        llm_model=llm_model,
-        token_counter=token_counter,
-        llm_calls=llm_calls,
-        num_choices=output_judge_num_choices,
-        trials=output_judge_trials,
-        seed=output_judge_seed,
-        max_new_tokens=output_max_new_tokens,
-        generation_temperature=output_generation_temperature,
-        judge_temperature=output_judge_temperature,
-        judge_max_tokens=output_judge_max_tokens,
-        kl_values=output_kl_values,
-        intervention_method=output_intervention_method,
-        logit_top_k=output_logit_top_k,
-        logit_kl_tolerance=output_logit_kl_tolerance,
-        logit_kl_max_steps=output_logit_kl_max_steps,
-        logit_force_refresh_kl_cache=output_logit_force_refresh_kl_cache,
-        logit_include_special_tokens=output_logit_include_special_tokens,
-    )
+        if output_side_experiments:
+            client = OpenAI(
+                base_url=llm_base_url,
+                api_key=read_api_key(llm_api_key_file),
+            )
+            output_side_execution = execute_output_side_experiments(
+                output_side_experiments=output_side_experiments,
+                module=module,
+                client=client,
+                llm_model=llm_model,
+                token_counter=token_counter,
+                llm_calls=llm_calls,
+                num_choices=output_judge_num_choices,
+                trials=output_judge_trials,
+                seed=output_judge_seed,
+                max_new_tokens=output_max_new_tokens,
+                generation_temperature=output_generation_temperature,
+                judge_temperature=output_judge_temperature,
+                judge_max_tokens=output_judge_max_tokens,
+                kl_values=output_kl_values,
+                intervention_method=output_intervention_method,
+                logit_top_k=output_logit_top_k,
+                logit_kl_tolerance=output_logit_kl_tolerance,
+                logit_kl_max_steps=output_logit_kl_max_steps,
+                logit_force_refresh_kl_cache=output_logit_force_refresh_kl_cache,
+                logit_include_special_tokens=output_logit_include_special_tokens,
+            )
+        else:
+            output_side_execution = _empty_output_side_execution(
+                output_intervention_method=output_intervention_method,
+                output_score_name=output_score_name,
+                output_kl_values=output_kl_values,
+                output_judge_num_choices=output_judge_num_choices,
+                output_judge_trials=output_judge_trials,
+                output_logit_top_k=output_logit_top_k,
+            )
+    else:
+        output_side_execution = _empty_output_side_execution(
+            output_intervention_method=output_intervention_method,
+            output_score_name=output_score_name,
+            output_kl_values=output_kl_values,
+            output_judge_num_choices=output_judge_num_choices,
+            output_judge_trials=output_judge_trials,
+            output_logit_top_k=output_logit_top_k,
+        )
 
     result: Dict[str, Any] = {
         "model_id": model_id,
@@ -276,6 +345,7 @@ def execute_hypothesis_experiments(
         "timestamp": ts,
         "round_id": resolved_round_id,
         "output_judge_llm_model": llm_model,
+        "run_side": run_side,
         "output_intervention_method": output_side_execution.get("output_intervention_method"),
         "output_score_name": output_side_execution.get("output_score_name"),
         "input_side_execution": input_side_execution,

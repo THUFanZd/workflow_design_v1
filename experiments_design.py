@@ -26,6 +26,7 @@ from neuronpedia_feature_api import fetch_and_parse_feature_observation
 from prompts.experiments_generation_prompt import build_system_prompt, build_user_prompt
 
 SideType = Literal["input", "output"]
+RunSideType = Literal["input", "output", "both"]
 
 OUTPUT_SIDE_PLACEHOLDER = ["The explanation is simple:", "I think", "We"]
 
@@ -367,6 +368,7 @@ def design_hypothesis_experiments(
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
     temperature: float = 0.2,
     max_tokens: int = 1000,
+    run_side: RunSideType = "both",
 ) -> Dict[str, Any]:
     model_id = hypotheses_result.get("model_id", "unknown-model")
     layer_id = str(hypotheses_result["layer_id"])
@@ -376,48 +378,58 @@ def design_hypothesis_experiments(
         round_id or str(hypotheses_result.get("round_id", "")).strip() or None,
         round_index=1,
     )
-    input_hypotheses = list(hypotheses_result["input_side_hypotheses"])
-    output_hypotheses = list(hypotheses_result["output_side_hypotheses"])
-    num_hypothesis = len(input_hypotheses)
+    input_hypotheses = list(hypotheses_result.get("input_side_hypotheses", []))
+    output_hypotheses = list(hypotheses_result.get("output_side_hypotheses", []))
+    num_hypothesis = max(len(input_hypotheses), len(output_hypotheses))
+    run_input = run_side in ("input", "both")
+    run_output = run_side in ("output", "both")
 
+    token_counter = TokenUsageAccumulator()
+    llm_calls: List[Dict[str, Any]] = []
     client = OpenAI(
         base_url=llm_base_url,
         api_key=read_api_key(llm_api_key_file),
     )
-    token_counter = TokenUsageAccumulator()
-    llm_calls: List[Dict[str, Any]] = []
 
-    input_sentences = _design_experiments_for_side(
-        side="input",
-        hypotheses=input_hypotheses,
-        num_sentences=num_input_sentences_per_hypothesis,
-        client=client,
-        model=llm_model,
-        token_counter=token_counter,
-        llm_calls=llm_calls,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    input_boundary_sentences = _design_boundary_experiments_for_input(
-        hypotheses=input_hypotheses,
-        num_sentences=num_input_sentences_per_hypothesis,
-        client=client,
-        model=llm_model,
-        token_counter=token_counter,
-        llm_calls=llm_calls,
-        max_tokens=max_tokens,
-    )
-    output_sentences = _design_experiments_for_side(
-        side="output",
-        hypotheses=output_hypotheses,
-        num_sentences=num_input_sentences_per_hypothesis,
-        client=client,
-        model=llm_model,
-        token_counter=token_counter,
-        llm_calls=llm_calls,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    if run_input:
+        input_sentences = _design_experiments_for_side(
+            side="input",
+            hypotheses=input_hypotheses,
+            num_sentences=num_input_sentences_per_hypothesis,
+            client=client,
+            model=llm_model,
+            token_counter=token_counter,
+            llm_calls=llm_calls,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        input_boundary_sentences = _design_boundary_experiments_for_input(
+            hypotheses=input_hypotheses,
+            num_sentences=num_input_sentences_per_hypothesis,
+            client=client,
+            model=llm_model,
+            token_counter=token_counter,
+            llm_calls=llm_calls,
+            max_tokens=max_tokens,
+        )
+    else:
+        input_sentences = []
+        input_boundary_sentences = []
+
+    if run_output:
+        output_sentences = _design_experiments_for_side(
+            side="output",
+            hypotheses=output_hypotheses,
+            num_sentences=num_input_sentences_per_hypothesis,
+            client=client,
+            model=llm_model,
+            token_counter=token_counter,
+            llm_calls=llm_calls,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    else:
+        output_sentences = []
 
     base_dir = build_round_dir(
         layer_id=layer_id,
@@ -436,6 +448,7 @@ def design_hypothesis_experiments(
         "round_id": resolved_round_id,
         "num_hypothesis": num_hypothesis,
         "generation_mode": hypotheses_result.get("generation_mode"),
+        "run_side": run_side,
         "num_input_sentences_per_hypothesis": num_input_sentences_per_hypothesis,
         "num_input_boundary_sentences_per_hypothesis": num_input_sentences_per_hypothesis,
         "llm_model": llm_model,

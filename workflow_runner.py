@@ -292,6 +292,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--num-hypothesis", type=int, default=3, help="Hypothesis count n for each side")
     parser.add_argument(
+        "--side",
+        choices=["input", "output", "both"],
+        default="both",
+        help="Run only input-side or output-side hypothesis iteration, or both.",
+    )
+    parser.add_argument(
         "--generation-mode",
         choices=["single_call", "iterative"],
         default="single_call",
@@ -304,6 +310,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Input-side designed activation and boundary sentences per hypothesis.",
     )
     parser.add_argument("--top-m", type=int, default=None, help="Refine top-m hypotheses per side (default=all).")
+    parser.add_argument(
+        "--history-rounds",
+        type=int,
+        default=None,
+        help=(
+            "Use at most previous n historical memory rounds during refinement. "
+            "Default: all available historical rounds."
+        ),
+    )
     parser.add_argument(
         "--history-scope",
         choices=["same_hypothesis", "all_hypotheses"],
@@ -371,6 +386,8 @@ if __name__ == "__main__":
         raise ValueError("When --start-round>=1, --start-step must be one of 1/2/3/4.")
     if args.start_round > args.max_rounds and args.start_round > 0:
         raise ValueError("--start-round cannot be greater than --max-rounds.")
+    if args.history_rounds is not None and args.history_rounds < 0:
+        raise ValueError("--history-rounds must be >= 0 when provided.")
     if (args.start_round != 0 or args.start_step != 1) and not args.reuse_from_logs:
         raise ValueError("Resume from middle requires --reuse-from-logs.")
     if args.reuse_from_logs and args.timestamp is None:
@@ -498,6 +515,7 @@ if __name__ == "__main__":
         baseline_experiments_result = design_hypothesis_experiments(
             hypotheses_result=current_hypotheses,
             num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
+            run_side=args.side,
             round_id=baseline_round_id,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,
@@ -539,6 +557,7 @@ if __name__ == "__main__":
         baseline_execution_result = execute_hypothesis_experiments(
             experiments_result=baseline_experiments_result,
             module=module,
+            run_side=args.side,
             round_id=baseline_round_id,
             llm_base_url=args.llm_base_url,
             llm_model=args.llm_model,
@@ -640,7 +659,11 @@ if __name__ == "__main__":
         print('refine hypotheses...')
         if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=1):
             historical_memories: List[Dict[str, Any]] = []
-            for hist_round in range(0, round_index - 1):
+            history_end = round_index - 1
+            history_start = 0
+            if args.history_rounds is not None:
+                history_start = max(0, history_end - args.history_rounds)
+            for hist_round in range(history_start, history_end):
                 if hist_round not in round_memories:
                     hist_memory_path = _artifact_json_path(
                         layer_id=layer_id,
@@ -659,6 +682,7 @@ if __name__ == "__main__":
                 current_memory=previous_memory_result,
                 current_execution_result=previous_execution_result,
                 historical_memories=historical_memories,
+                run_side=args.side,
                 model_id=str(current_hypotheses.get("model_id", args.model_id)),
                 layer_id=layer_id,
                 feature_id=feature_id,
@@ -699,6 +723,7 @@ if __name__ == "__main__":
             experiments_result = design_hypothesis_experiments(
                 hypotheses_result=current_hypotheses,
                 num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
+                run_side=args.side,
                 round_id=round_id,
                 llm_base_url=args.llm_base_url,
                 llm_model=args.llm_model,
@@ -740,6 +765,7 @@ if __name__ == "__main__":
             execution_result = execute_hypothesis_experiments(
                 experiments_result=experiments_result,
                 module=module,
+                run_side=args.side,
                 round_id=round_id,
                 llm_base_url=args.llm_base_url,
                 llm_model=args.llm_model,
@@ -888,6 +914,8 @@ if __name__ == "__main__":
         "input_side_final_reasons": final_input_reasons,
         "output_side_final_hypotheses": final_output_hypotheses,
         "output_side_final_reasons": final_output_reasons,
+        "run_side": args.side,
+        "history_rounds": args.history_rounds,
         "output_intervention_method": last_output_intervention_method,
         "output_score_name": last_output_score_name,
         "output_logit_top_k": last_output_logit_top_k,
