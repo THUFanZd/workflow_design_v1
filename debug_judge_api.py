@@ -8,9 +8,9 @@ from typing import Any, Dict, List, Optional
 from openai import OpenAI
 
 from function import read_api_key
-from llm_api.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
-from llm_api.llm_api_info import base_url as DEFAULT_BASE_URL
-from llm_api.llm_api_info import model_name as DEFAULT_MODEL_NAME
+from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
+from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
+from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
 
 
 def _safe_preview(obj: Any, limit: int = 1000) -> str:

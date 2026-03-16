@@ -17,9 +17,9 @@ from function import (
     normalize_round_id,
     read_api_key,
 )
-from llm_api.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
-from llm_api.llm_api_info import base_url as DEFAULT_BASE_URL
-from llm_api.llm_api_info import model_name as DEFAULT_MODEL_NAME
+from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
+from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
+from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
 from neuronpedia_feature_api import fetch_and_parse_feature_observation
 from prompts.hypothesis_generation_prompt import (
     build_iterative_user_prompt,

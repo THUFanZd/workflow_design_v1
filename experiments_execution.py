@@ -14,9 +14,9 @@ from experiments_execution_output import KL_DIV_VALUES_DEFAULT, execute_output_s
 from experiments_design import design_hypothesis_experiments
 from function import TokenUsageAccumulator, build_round_dir, normalize_round_id, read_api_key
 from initial_hypothesis_generation import generate_initial_hypotheses
-from llm_api.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
-from llm_api.llm_api_info import base_url as DEFAULT_BASE_URL
-from llm_api.llm_api_info import model_name as DEFAULT_MODEL_NAME
+from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
+from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
+from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
 from model_with_sae import ModelWithSAEModule
 from neuronpedia_feature_api import fetch_and_parse_feature_observation
 

@@ -20,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from experiments_design import OUTPUT_SIDE_PLACEHOLDER
 from function import call_llm
-from llm_api.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
+from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from model_with_sae import ModelWithSAEModule
 
 SAE_RELEASE_BY_NAME: Dict[str, str] = {
