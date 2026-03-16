@@ -6,7 +6,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 from openai import OpenAI
 
@@ -52,6 +52,68 @@ class ExplanationScore:
     relative_quality: Optional[float]
 
 
+@dataclass
+class NonActivationExplanationScore:
+    reference_explanation: str
+    sample_count: int
+    adherence: float
+    neuronpedia_non_activation_accuracy: float
+    my_non_activation_accuracy: float
+    relative_quality: Optional[float]
+
+
+@dataclass
+class BoundaryCaseResult:
+    context: str
+    activation_max: float
+    is_non_activated: bool
+
+
+@dataclass
+class BoundaryScore:
+    explanation: str
+    sample_count: int
+    activation_threshold: float
+    non_activation_rate: float
+    details: List[BoundaryCaseResult]
+
+
+def _sanitize_path_component(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*]+', "_", value.strip())
+    cleaned = cleaned.replace(" ", "_")
+    return cleaned or "unknown"
+
+
+def _extract_output_layout_from_source(source: str) -> Tuple[str, str]:
+    parts = [p for p in source.split("-") if p]
+    if len(parts) >= 3 and parts[0].isdigit():
+        layer_id = parts[0]
+        sae_name = "-".join(parts[1:-1]) or parts[1]
+        return layer_id, sae_name
+    if parts and parts[0].isdigit():
+        return parts[0], source
+    return "unknown", source
+
+
+def _prepare_run_output_paths(source: str, feature_id: str) -> Dict[str, Path]:
+    layer_id, sae_name = _extract_output_layout_from_source(source)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = (
+        Path("outputs")
+        / _sanitize_path_component(sae_name)
+        / f"layer-{_sanitize_path_component(layer_id)}"
+        / f"feature-{_sanitize_path_component(str(feature_id))}"
+        / timestamp
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "run_dir": run_dir,
+        "llm_io_log": run_dir / "llm_inout.md",
+        "evaluation_record": run_dir / "evaluation_record.json",
+        "result_json": run_dir / "result.json",
+    }
+
+
 def _read_api_key(api_key_file: str) -> str:
     key = Path(api_key_file).read_text(encoding="utf-8").strip()
     if not key:
@@ -75,56 +137,122 @@ def restore_sentence(tokens: Sequence[Any]) -> str:
     return " ".join(text.split())
 
 
-def _safe_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+def _safe_max_token(activation: Dict[str, Any]) -> str:
+    tokens = activation.get("tokens")
+    max_idx = activation.get("maxValueTokenIndex")
+    if not isinstance(tokens, list) or not isinstance(max_idx, int):
+        return ""
+    if max_idx < 0 or max_idx >= len(tokens):
+        return ""
+    token = tokens[max_idx]
+    return token if isinstance(token, str) else str(token)
+
+
+def _select_activations_method_1(
+    activations: List[Dict[str, Any]],
+    m: int,
+    n: int,
+) -> List[Dict[str, Any]]:
+    total = len(activations)
+    first_count = min(m, total)
+    selected_indices: List[int] = list(range(first_count))
+
+    for idx in range(first_count, total):
+        if len(selected_indices) >= first_count + n:
+            break
+        current_token = _safe_max_token(activations[idx])
+        last_token = _safe_max_token(activations[selected_indices[-1]]) if selected_indices else ""
+        if current_token != last_token:
+            selected_indices.append(idx)
+
+    target = first_count + n
+    if len(selected_indices) < target:
+        for idx in range(first_count, total):
+            if len(selected_indices) >= target:
+                break
+            if idx not in selected_indices:
+                selected_indices.append(idx)
+
+    return [activations[i] for i in selected_indices]
+
+
+def _select_activations_method_2(
+    activations: List[Dict[str, Any]],
+    n: int,
+) -> List[Dict[str, Any]]:
+    selected_indices: List[int] = []
+    for idx, item in enumerate(activations):
+        if not selected_indices:
+            selected_indices.append(idx)
+        else:
+            current_token = _safe_max_token(item)
+            last_token = _safe_max_token(activations[selected_indices[-1]])
+            if current_token != last_token:
+                selected_indices.append(idx)
+        if len(selected_indices) >= n:
+            break
+
+    return [activations[i] for i in selected_indices]
+
+
+def _select_activations_method_3(
+    activations: List[Dict[str, Any]],
+    m: int,
+) -> List[Dict[str, Any]]:
+    count = min(m, len(activations))
+    return [activations[i] for i in range(count)]
 
 
 def select_activation_contexts(
     feature_payload: Dict[str, Any],
-    activation_ratio: float = 0.5,
-    max_samples: int = 10,
+    selection_method: int = 1,
+    m: int = 5,
+    n: int = 5,
 ) -> List[str]:
-    if not (0 < activation_ratio <= 1):
-        raise ValueError("activation_ratio must be in (0, 1].")
-    if max_samples <= 0:
-        raise ValueError("max_samples must be a positive integer.")
+    if selection_method not in (1, 2, 3):
+        raise ValueError("selection_method must be 1, 2, or 3.")
+    if m < 0 or n < 0:
+        raise ValueError("m and n must be non-negative integers.")
 
-    hist = feature_payload.get("freq_hist_data_bar_values") or []
-    hist_max = _safe_float(hist[-1], default=0.0) if hist else 0.0
-
-    activations = feature_payload.get("activations") or []
-    if hist_max <= 0.0:
-        derived_max = 0.0
-        for item in activations:
-            mv = item.get("maxValue")
-            if mv is None:
-                values = item.get("values") or []
-                mv = max(values) if values else 0.0
-            derived_max = max(derived_max, _safe_float(mv, default=0.0))
-        hist_max = derived_max
-
-    threshold = hist_max * activation_ratio
+    activations_raw = feature_payload.get("activations") or []
+    activations: List[Dict[str, Any]] = [item for item in activations_raw if isinstance(item, dict)]
+    if selection_method == 1:
+        selected_activations = _select_activations_method_1(activations, m=m, n=n)
+    elif selection_method == 2:
+        selected_activations = _select_activations_method_2(activations, n=n)
+    else:
+        selected_activations = _select_activations_method_3(activations, m=m)
 
     contexts: List[str] = []
-    for item in activations:
-        mv = item.get("maxValue")
-        if mv is None:
-            values = item.get("values") or []
-            mv = max(values) if values else 0.0
-        max_value = _safe_float(mv, default=0.0)
-        if max_value < threshold:
-            continue
-
+    for item in selected_activations:
         tokens = item.get("tokens") or []
         context = restore_sentence(tokens)
         if context:
             contexts.append(context)
-        if len(contexts) >= max_samples:
-            break
     return contexts
+
+
+def select_non_activation_contexts(
+    feature_payload: Dict[str, Any],
+    non_activation_context_count: int = 5,
+) -> List[str]:
+    if non_activation_context_count <= 0:
+        raise ValueError("non_activation_context_count must be a positive integer.")
+
+    activations = feature_payload.get("activations") or []
+    tail = activations[-non_activation_context_count:]
+
+    contexts: List[str] = []
+    for item in tail:
+        tokens = item.get("tokens") or []
+        context = restore_sentence(tokens)
+        if context:
+            contexts.append(context)
+    return contexts
+
+
+def _build_source(layer_id: str, width: str) -> str:
+    return f"{layer_id}-gemmascope-res-{width}"
 
 
 def _normalize_decision(raw: str) -> Optional[Decision]:
@@ -163,11 +291,52 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _extract_json_any(text: str) -> Optional[Any]:
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Fallback: try to recover a dict/object payload.
+    for pattern in (r"\{.*\}", r"\[.*\]"):
+        match = re.search(pattern, text, flags=re.DOTALL)
+        if not match:
+            continue
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            continue
+    return None
+
+
+def _extract_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        normalized = " ".join(value.split())
+        return [normalized] if normalized else []
+    if isinstance(value, list):
+        out: List[str] = []
+        for item in value:
+            out.extend(_extract_string_list(item))
+        return out
+    if isinstance(value, dict):
+        out: List[str] = []
+        for item in value.values():
+            out.extend(_extract_string_list(item))
+        return out
+    return []
+
+
 def judge_should_activate(
     client: OpenAI,
     model: str,
     explanation: str,
     context: str,
+    max_tokens: int = 5000,
 ) -> Decision:
     system_prompt = (
         "You are a strict evaluator of SAE feature explanations."
@@ -193,6 +362,7 @@ def judge_should_activate(
         ],
         stream=False,
         temperature=0,
+        max_tokens=max_tokens,
     )
     content = (response.choices[0].message.content or "").strip().strip("`")
     _append_llm_io_log(system_prompt=system_prompt, user_prompt=user_prompt, raw_output=content)
@@ -217,10 +387,257 @@ def judge_should_activate(
     raise ValueError(f"Unexpected judge output: {content}")
 
 
+def generate_boundary_contexts(
+    client: OpenAI,
+    model: str,
+    explanation: str,
+    boundary_case_count: int = 5,
+    max_tokens: int = 5000,
+) -> List[str]:
+    if boundary_case_count <= 0:
+        raise ValueError("boundary_case_count must be a positive integer.")
+
+    system_prompt = (
+        "You are an expert at designing adversarial boundary test cases for SAE feature explanations."
+        " Return JSON only."
+    )
+    user_prompt = (
+        "Task: generate boundary contexts for the hypothesis below.\n\n"
+        "Definition of boundary case (critical):\n"
+        "- A boundary case is near the edge of the explained set by the feature explanation:\
+              it looks lexically/semantically similar,\n"
+        "  but should still fall OUTSIDE the true activation set, which means .\n"
+        "- The case should be tempting and confusable, but as long as it sticks closely to the explanation,\n"
+        "  the feature should NOT activate strongly on that case.\n"
+        "- Use multiple near-miss types when possible (context shift, minimal lexical edits,\n"
+        "  homophone/orthographic variants, same surface form in a different domain, etc.).\n\n"
+        f"Hypothesis / explanation:\n{explanation}\n\n"
+        f"Generate exactly {boundary_case_count} boundary contexts.\n"
+        "Each context should be a single natural sentence or short snippet.\n"
+        "Return JSON only in this format:\n"
+        "{\n"
+        '  "boundary_cases": ["case 1", "case 2", "case 3", "case 4", "case 5"]\n'
+        "}"
+    )
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        stream=False,
+        temperature=0.2,
+        max_tokens=max_tokens,
+    )
+    content = (response.choices[0].message.content or "").strip().strip("`")
+    _append_llm_io_log(system_prompt=system_prompt, user_prompt=user_prompt, raw_output=content)
+
+    parsed = _extract_json_any(content)
+    candidates: List[str] = []
+    if isinstance(parsed, dict):
+        for key in ("boundary_cases", "cases", "examples", "contexts", "items"):
+            if key in parsed:
+                candidates.extend(_extract_string_list(parsed[key]))
+        if not candidates:
+            candidates.extend(_extract_string_list(parsed))
+    elif parsed is not None:
+        candidates.extend(_extract_string_list(parsed))
+
+    if not candidates:
+        # Last-resort fallback for numbered plain-text lists.
+        for line in content.splitlines():
+            cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+            if cleaned:
+                candidates.append(" ".join(cleaned.split()))
+
+    deduped: List[str] = []
+    seen = set()
+    for item in candidates:
+        if item and item not in seen:
+            seen.add(item)
+            deduped.append(item)
+
+    if len(deduped) < boundary_case_count:
+        raise ValueError(
+            f"Boundary case generator returned {len(deduped)} cases, "
+            f"but {boundary_case_count} are required. Raw output: {content}"
+        )
+    return deduped[:boundary_case_count]
+
+
+def _parse_layer_width_from_source(source: str) -> Tuple[int, str]:
+    match = re.match(r"^(?P<layer>\d+)-gemmascope-res-(?P<width>[A-Za-z0-9_]+)$", source)
+    if not match:
+        raise ValueError(
+            "Cannot infer SAE layer/width from source. "
+            "Provide --sae-path and --sae-layer explicitly."
+        )
+    return int(match.group("layer")), match.group("width")
+
+
+def _normalize_hf_model_name(model_id: str, hf_model_name: Optional[str]) -> str:
+    if hf_model_name:
+        return hf_model_name
+    mapping = {
+        "gemma-2-2b": "google/gemma-2-2b",
+        "gemma-2-9b": "google/gemma-2-9b",
+        "gemma-2-27b": "google/gemma-2-27b",
+    }
+    return mapping.get(model_id, model_id)
+
+
+def _infer_gemma_scope_release(model_id: str) -> Optional[str]:
+    normalized = model_id.lower()
+    if "2b" in normalized and "gemma" in normalized:
+        return "gemma-scope-2b-pt-res"
+    if "9b" in normalized and "gemma" in normalized:
+        return "gemma-scope-9b-pt-res"
+    if "27b" in normalized and "gemma" in normalized:
+        return "gemma-scope-27b-pt-res"
+    return None
+
+
+def _resolve_sae_path(
+    model_id: str,
+    source: str,
+    sae_path: Optional[str],
+    sae_variant: str,
+) -> str:
+    if sae_path:
+        return sae_path
+    layer, width = _parse_layer_width_from_source(source)
+    release = _infer_gemma_scope_release(model_id)
+    if release is None:
+        raise ValueError(
+            f"Cannot infer SAE release from model_id='{model_id}'. "
+            "Please pass --sae-path explicitly."
+        )
+    return f"sae-lens://release={release};sae_id=layer_{layer}/width_{width}/{sae_variant}"
+
+
+def _resolve_sae_device(sae_device: str) -> str:
+    if sae_device != "auto":
+        return sae_device
+    try:
+        import torch  # type: ignore
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def build_boundary_sae_module(
+    model_id: str,
+    source: str,
+    feature_index: int,
+    *,
+    hf_model_name: Optional[str] = None,
+    sae_path: Optional[str] = None,
+    sae_layer: Optional[int] = None,
+    sae_variant: str = "average_l0_70",
+    sae_device: str = "auto",
+) -> Any:
+    try:
+        from model_with_sae import ModelWithSAEModule  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to import model_with_sae.py. "
+            "Please ensure model/SAE dependencies are installed."
+        ) from exc
+
+    resolved_sae_path = _resolve_sae_path(model_id, source, sae_path=sae_path, sae_variant=sae_variant)
+    resolved_sae_layer = sae_layer
+    if resolved_sae_layer is None:
+        try:
+            inferred_layer, _ = _parse_layer_width_from_source(source)
+            resolved_sae_layer = inferred_layer
+        except ValueError:
+            resolved_sae_layer = None
+    resolved_hf_model_name = _normalize_hf_model_name(model_id, hf_model_name)
+    resolved_device = _resolve_sae_device(sae_device)
+
+    module = ModelWithSAEModule(
+        llm_name=resolved_hf_model_name,
+        sae_path=resolved_sae_path,
+        sae_layer=resolved_sae_layer,
+        feature_index=feature_index,
+        device=resolved_device,
+        debug=False,
+    )
+    if not getattr(module, "sae", None):
+        raise RuntimeError(
+            "SAE failed to load for boundary evaluation. "
+            "Please check --sae-path / --sae-layer / model compatibility."
+        )
+    return module
+
+
+def evaluate_boundary_with_sae(
+    contexts: Sequence[str],
+    explanation: str,
+    model_id: str,
+    source: str,
+    feature_index: int,
+    *,
+    activation_threshold: float = 0.0,
+    hf_model_name: Optional[str] = None,
+    sae_path: Optional[str] = None,
+    sae_layer: Optional[int] = None,
+    sae_variant: str = "average_l0_70",
+    sae_device: str = "auto",
+    module: Optional[Any] = None,
+) -> BoundaryScore:
+    if not contexts:
+        raise ValueError("No boundary contexts available for evaluation.")
+
+    sae_module = module or build_boundary_sae_module(
+        model_id=model_id,
+        source=source,
+        feature_index=feature_index,
+        hf_model_name=hf_model_name,
+        sae_path=sae_path,
+        sae_layer=sae_layer,
+        sae_variant=sae_variant,
+        sae_device=sae_device,
+    )
+
+    details: List[BoundaryCaseResult] = []
+    non_activation_hits = 0
+    for ctx in contexts:
+        trace = sae_module.get_activation_trace(ctx)
+        activation = float(trace.get("summary_activation", 0.0))
+        is_non_activated = activation <= activation_threshold
+        if is_non_activated:
+            non_activation_hits += 1
+        details.append(
+            BoundaryCaseResult(
+                context=ctx,
+                activation_max=activation,
+                is_non_activated=is_non_activated,
+            )
+        )
+
+    non_activation_rate = non_activation_hits / len(contexts)
+    return BoundaryScore(
+        explanation=explanation,
+        sample_count=len(contexts),
+        activation_threshold=activation_threshold,
+        non_activation_rate=non_activation_rate,
+        details=details,
+    )
+
+
 def _activation_accuracy(decisions: Sequence[Decision]) -> float:
     if not decisions:
         return 0.0
     return sum(1 for d in decisions if d == "ACTIVATE") / len(decisions)
+
+
+def _non_activation_accuracy(decisions: Sequence[Decision]) -> float:
+    if not decisions:
+        return 0.0
+    return sum(1 for d in decisions if d == "DO_NOT_ACTIVATE") / len(decisions)
 
 
 def evaluate_against_reference(
@@ -264,6 +681,47 @@ def evaluate_against_reference(
     )
 
 
+def evaluate_non_activation_against_reference(
+    client: OpenAI,
+    model: str,
+    contexts: Sequence[str],
+    reference_explanation: str,
+    my_explanation: str,
+    my_decisions: Optional[Sequence[Decision]] = None,
+) -> NonActivationExplanationScore:
+    if not contexts:
+        raise ValueError("No contexts available for evaluation.")
+
+    ref_decisions: List[Decision] = [
+        judge_should_activate(client, model, reference_explanation, ctx) for ctx in contexts
+    ]
+    own_decisions: Sequence[Decision] = (
+        my_decisions
+        if my_decisions is not None
+        else [judge_should_activate(client, model, my_explanation, ctx) for ctx in contexts]
+    )
+
+    if len(own_decisions) != len(ref_decisions):
+        raise ValueError("Decision count mismatch.")
+
+    sample_count = len(contexts)
+    adherence = (
+        sum(1 for left, right in zip(ref_decisions, own_decisions) if left == right) / sample_count
+    )
+    np_acc = _non_activation_accuracy(ref_decisions)
+    my_acc = _non_activation_accuracy(list(own_decisions))
+    relative_quality = (my_acc / np_acc) if np_acc > 0 else None
+
+    return NonActivationExplanationScore(
+        reference_explanation=reference_explanation,
+        sample_count=sample_count,
+        adherence=adherence,
+        neuronpedia_non_activation_accuracy=np_acc,
+        my_non_activation_accuracy=my_acc,
+        relative_quality=relative_quality,
+    )
+
+
 def compare_with_neuronpedia_explanations(
     model_id: str,
     source: str,
@@ -271,15 +729,33 @@ def compare_with_neuronpedia_explanations(
     my_explanation: str,
     *,
     max_explanations: int = 3,
-    activation_ratio: float = 0.5,
-    max_samples: int = 10,
+    selection_method: int = 1,
+    m: int = 5,
+    n: int = 5,
+    non_activation_context_count: int = 5,
     neuronpedia_api_key: Optional[str] = None,
     neuronpedia_timeout: int = 30,
     llm_model: str = DEFAULT_MODEL,
     ppio_base_url: str = DEFAULT_PPIO_BASE_URL,
     ppio_api_key_file: str = DEFAULT_API_KEY_FILE,
+    enable_activation_score: bool = True,
+    enable_non_activation_score: bool = True,
+    enable_boundary_score: bool = True,
+    boundary_case_count: int = 5,
+    boundary_max_tokens: int = 1200,
+    boundary_llm_model: Optional[str] = None,
+    boundary_activation_threshold: float = 0.0,
+    hf_model_name: Optional[str] = None,
+    sae_path: Optional[str] = None,
+    sae_layer: Optional[int] = None,
+    sae_variant: str = "average_l0_70",
+    sae_device: str = "auto",
 ) -> Dict[str, Any]:
-    print('in comparing:')
+    global DEBUG_LLM_IO_PATH
+    output_paths = _prepare_run_output_paths(source=source, feature_id=index)
+    DEBUG_LLM_IO_PATH = output_paths["llm_io_log"]
+
+    print("in comparing:")
     payload = fetch_feature_json(
         model_id=model_id,
         source=source,
@@ -287,56 +763,315 @@ def compare_with_neuronpedia_explanations(
         api_key=neuronpedia_api_key,
         timeout=neuronpedia_timeout,
     )
-    print('fetched')
+    print("fetched")
     reference_explanations = extract_explanations(payload, limit=max_explanations)
     if not reference_explanations:
         raise ValueError("No explanation found in Neuronpedia response.")
 
-    contexts = select_activation_contexts(
-        payload,
-        activation_ratio=activation_ratio,
-        max_samples=max_samples,
-    )
-    if not contexts:
-        raise ValueError("No contexts selected from activations.")
+    contexts: List[str] = []
+    non_activation_contexts: List[str] = []
+    if enable_activation_score:
+        contexts = select_activation_contexts(
+            payload,
+            selection_method=selection_method,
+            m=m,
+            n=n,
+        )
+        if not contexts:
+            raise ValueError("No contexts selected from activations.")
 
-    print('context selected')
-    client = build_client(ppio_api_key_file, ppio_base_url)
-    my_decisions: List[Decision] = [
-        judge_should_activate(client, llm_model, my_explanation, ctx) for ctx in contexts
-    ]
-    print('judged')
+    if enable_non_activation_score:
+        non_activation_contexts = select_non_activation_contexts(
+            payload,
+            non_activation_context_count=non_activation_context_count,
+        )
+        if not non_activation_contexts:
+            raise ValueError("No non-activation contexts selected from activations.")
+
+    print("context selected")
+    need_llm = enable_activation_score or enable_non_activation_score or enable_boundary_score
+    client: Optional[OpenAI] = build_client(ppio_api_key_file, ppio_base_url) if need_llm else None
+
+    my_decisions: List[Decision] = []
+    my_non_activation_decisions: List[Decision] = []
+    if enable_activation_score:
+        assert client is not None
+        my_decisions = [judge_should_activate(client, llm_model, my_explanation, ctx) for ctx in contexts]
+    if enable_non_activation_score:
+        assert client is not None
+        my_non_activation_decisions = [
+            judge_should_activate(client, llm_model, my_explanation, ctx)
+            for ctx in non_activation_contexts
+        ]
+    print("judged")
+
+    boundary_contexts: List[str] = []
+    boundary_score: Optional[BoundaryScore] = None
+    boundary_reference_scores: List[BoundaryScore] = []
+    if enable_boundary_score:
+        assert client is not None
+        try:
+            feature_index = int(index)
+        except ValueError as exc:
+            raise ValueError(f"feature index must be an integer for SAE evaluation, got: {index}") from exc
+
+        boundary_module = build_boundary_sae_module(
+            model_id=model_id,
+            source=source,
+            feature_index=feature_index,
+            hf_model_name=hf_model_name,
+            sae_path=sae_path,
+            sae_layer=sae_layer,
+            sae_variant=sae_variant,
+            sae_device=sae_device,
+        )
+
+        boundary_contexts = generate_boundary_contexts(
+            client=client,
+            model=boundary_llm_model or llm_model,
+            explanation=my_explanation,
+            boundary_case_count=boundary_case_count,
+            max_tokens=boundary_max_tokens,
+        )
+        boundary_score = evaluate_boundary_with_sae(
+            contexts=boundary_contexts,
+            explanation=my_explanation,
+            model_id=model_id,
+            source=source,
+            feature_index=feature_index,
+            activation_threshold=boundary_activation_threshold,
+            hf_model_name=hf_model_name,
+            sae_path=sae_path,
+            sae_layer=sae_layer,
+            sae_variant=sae_variant,
+            sae_device=sae_device,
+            module=boundary_module,
+        )
+
+        for exp in reference_explanations:
+            ref_boundary_contexts = generate_boundary_contexts(
+                client=client,
+                model=boundary_llm_model or llm_model,
+                explanation=exp,
+                boundary_case_count=boundary_case_count,
+                max_tokens=boundary_max_tokens,
+            )
+            ref_boundary_score = evaluate_boundary_with_sae(
+                contexts=ref_boundary_contexts,
+                explanation=exp,
+                model_id=model_id,
+                source=source,
+                feature_index=feature_index,
+                activation_threshold=boundary_activation_threshold,
+                hf_model_name=hf_model_name,
+                sae_path=sae_path,
+                sae_layer=sae_layer,
+                sae_variant=sae_variant,
+                sae_device=sae_device,
+                module=boundary_module,
+            )
+            boundary_reference_scores.append(ref_boundary_score)
 
     details: List[ExplanationScore] = []
-    for exp in reference_explanations:
-        score = evaluate_against_reference(
-            client=client,
-            model=llm_model,
-            contexts=contexts,
-            reference_explanation=exp,
-            my_explanation=my_explanation,
-            my_decisions=my_decisions,
+    non_activation_details: List[NonActivationExplanationScore] = []
+    if enable_activation_score:
+        assert client is not None
+        for exp in reference_explanations:
+            score = evaluate_against_reference(
+                client=client,
+                model=llm_model,
+                contexts=contexts,
+                reference_explanation=exp,
+                my_explanation=my_explanation,
+                my_decisions=my_decisions,
+            )
+            details.append(score)
+    if enable_non_activation_score:
+        assert client is not None
+        for exp in reference_explanations:
+            non_activation_score = evaluate_non_activation_against_reference(
+                client=client,
+                model=llm_model,
+                contexts=non_activation_contexts,
+                reference_explanation=exp,
+                my_explanation=my_explanation,
+                my_decisions=my_non_activation_decisions,
+            )
+            non_activation_details.append(non_activation_score)
+
+    print("evaluated")
+    relative_quality_score: Optional[float] = None
+    adherence: Optional[float] = None
+    if enable_activation_score:
+        relative_quality_values = [item.relative_quality for item in details if item.relative_quality is not None]
+        adherence_values = [item.adherence for item in details]
+        relative_quality_score = (
+            sum(relative_quality_values) / len(relative_quality_values)
+            if relative_quality_values
+            else None
         )
-        details.append(score)
+        adherence = sum(adherence_values) / len(adherence_values) if adherence_values else None
 
-    print('evaluated')
-    relative_quality_values = [item.relative_quality for item in details if item.relative_quality is not None]
-    adherence_values = [item.adherence for item in details]
-    relative_quality_score = (
-        sum(relative_quality_values) / len(relative_quality_values)
-        if relative_quality_values
-        else None
-    )
-    adherence = sum(adherence_values) / len(adherence_values) if adherence_values else None
+    non_activation_relative_quality_score: Optional[float] = None
+    non_activation_adherence: Optional[float] = None
+    if enable_non_activation_score:
+        non_activation_relative_quality_values = [
+            item.relative_quality for item in non_activation_details if item.relative_quality is not None
+        ]
+        non_activation_adherence_values = [item.adherence for item in non_activation_details]
+        non_activation_relative_quality_score = (
+            sum(non_activation_relative_quality_values) / len(non_activation_relative_quality_values)
+            if non_activation_relative_quality_values
+            else None
+        )
+        non_activation_adherence = (
+            sum(non_activation_adherence_values) / len(non_activation_adherence_values)
+            if non_activation_adherence_values
+            else None
+        )
 
-    return {
+    boundary_reference_mean_non_activation_rate: Optional[float] = None
+    boundary_relative_quality_score: Optional[float] = None
+    if enable_boundary_score and boundary_reference_scores:
+        boundary_reference_mean_non_activation_rate = (
+            sum(item.non_activation_rate for item in boundary_reference_scores)
+            / len(boundary_reference_scores)
+        )
+        if boundary_score is not None:
+            boundary_relative_values = [
+                boundary_score.non_activation_rate / item.non_activation_rate
+                for item in boundary_reference_scores
+                if item.non_activation_rate > 0
+            ]
+            boundary_relative_quality_score = (
+                sum(boundary_relative_values) / len(boundary_relative_values)
+                if boundary_relative_values
+                else None
+            )
+
+    result = {
         "feature": {"model_id": model_id, "source": source, "index": index},
+        "evaluations_enabled": {
+            "activation": enable_activation_score,
+            "non_activation": enable_non_activation_score,
+            "boundary": enable_boundary_score,
+        },
         "num_reference_explanations": len(reference_explanations),
-        "num_contexts": len(contexts),
+        "num_contexts": len(contexts) if enable_activation_score else None,
         "relative_quality_score": relative_quality_score,
         "adherence": adherence,
-        "details": [asdict(item) for item in details],
+        "details": [asdict(item) for item in details] if enable_activation_score else [],
+        "num_non_activation_contexts": len(non_activation_contexts) if enable_non_activation_score else None,
+        "non_activation_relative_quality_score": non_activation_relative_quality_score,
+        "non_activation_adherence": non_activation_adherence,
+        "non_activation_details": [asdict(item) for item in non_activation_details] if enable_non_activation_score else [],
+        "num_boundary_contexts": len(boundary_contexts) if enable_boundary_score else None,
+        "boundary_non_activation_rate": (
+            boundary_score.non_activation_rate if enable_boundary_score and boundary_score is not None else None
+        ),
+        "boundary_activation_threshold": (
+            boundary_score.activation_threshold if enable_boundary_score and boundary_score is not None else None
+        ),
+        "boundary_details": (
+            [asdict(item) for item in boundary_score.details]
+            if enable_boundary_score and boundary_score
+            else []
+        ),
+        "boundary_reference_mean_non_activation_rate": (
+            boundary_reference_mean_non_activation_rate if enable_boundary_score else None
+        ),
+        "boundary_relative_quality_score": (
+            boundary_relative_quality_score if enable_boundary_score else None
+        ),
+        "boundary_reference_details": (
+            [asdict(item) for item in boundary_reference_scores] if enable_boundary_score else []
+        ),
+        "output_paths": {
+            "run_dir": str(output_paths["run_dir"]),
+            "llm_io_log": str(output_paths["llm_io_log"]),
+            "evaluation_record": str(output_paths["evaluation_record"]),
+            "result_json": str(output_paths["result_json"]),
+        },
     }
+
+    activation_case_results = [
+        {
+            "context": ctx,
+            "expected": "ACTIVATE",
+            "my_decision": decision,
+            "is_correct": decision == "ACTIVATE",
+        }
+        for ctx, decision in zip(contexts, my_decisions)
+    ]
+    non_activation_case_results = [
+        {
+            "context": ctx,
+            "expected": "DO_NOT_ACTIVATE",
+            "my_decision": decision,
+            "is_correct": decision == "DO_NOT_ACTIVATE",
+        }
+        for ctx, decision in zip(non_activation_contexts, my_non_activation_decisions)
+    ]
+
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "feature": {"model_id": model_id, "source": source, "index": index},
+        "hypothesis": my_explanation,
+        "reference_explanations": reference_explanations,
+        "evaluations_enabled": result["evaluations_enabled"],
+        "test_cases": {
+            "activation_cases": activation_case_results,
+            "non_activation_cases": non_activation_case_results,
+            "boundary_cases_my": (
+                [asdict(item) for item in boundary_score.details]
+                if enable_boundary_score and boundary_score
+                else []
+            ),
+            "boundary_cases_reference": (
+                [asdict(item) for item in boundary_reference_scores]
+                if enable_boundary_score
+                else []
+            ),
+        },
+        "scores": {
+            "activation_relative_quality_score": relative_quality_score,
+            "activation_adherence": adherence,
+            "non_activation_relative_quality_score": non_activation_relative_quality_score,
+            "non_activation_adherence": non_activation_adherence,
+            "boundary_non_activation_rate": (
+                boundary_score.non_activation_rate if enable_boundary_score and boundary_score is not None else None
+            ),
+            "boundary_activation_threshold": (
+                boundary_score.activation_threshold if enable_boundary_score and boundary_score is not None else None
+            ),
+            "boundary_reference_mean_non_activation_rate": (
+                boundary_reference_mean_non_activation_rate if enable_boundary_score else None
+            ),
+            "boundary_relative_quality_score": (
+                boundary_relative_quality_score if enable_boundary_score else None
+            ),
+        },
+        "summary": {
+            "num_activation_cases": len(activation_case_results),
+            "num_non_activation_cases": len(non_activation_case_results),
+            "num_boundary_cases_my": len(boundary_contexts) if enable_boundary_score else 0,
+            "num_boundary_cases_reference": (
+                sum(item.sample_count for item in boundary_reference_scores)
+                if enable_boundary_score
+                else 0
+            ),
+        },
+    }
+
+    output_paths["evaluation_record"].write_text(
+        json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    output_paths["result_json"].write_text(
+        json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return result
 
 
 def _load_my_explanation(args: argparse.Namespace) -> str:
@@ -357,8 +1092,21 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--model-id", default="gemma-2-2b", help="Neuronpedia model id, e.g. gemma-2-2b")
-    parser.add_argument("--source", default="0-gemmascope-res-16k", help="Neuronpedia source id, e.g. 11-clt-hp")
-    parser.add_argument("--index", required=True, help="Feature index")
+    parser.add_argument("--layer-id", required=True, help="Layer id used in Neuronpedia source, e.g. 0")
+    parser.add_argument("--width", default="16k", help="Width in Neuronpedia source, e.g. 16k")
+    parser.add_argument(
+        "--source",
+        default=None,
+        help="Optional full Neuronpedia source override. If omitted, uses {layer_id}-gemmascope-res-{width}.",
+    )
+    parser.add_argument(
+        "--feature-id",
+        "--index",
+        dest="feature_id",
+        required=True,
+        help="Feature index",
+    )
+    parser.add_argument("--max-tokens", type=int, default=10000, help="Max tokens for LLM judge")
     parser.add_argument("--my-explanation", default=None, help="Your explanation string")
     parser.add_argument(
         "--my-explanation-file",
@@ -367,16 +1115,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-explanations", type=int, default=3, help="Top explanations to use")
     parser.add_argument(
-        "--activation-ratio",
-        type=float,
-        default=0.5,
-        help="Threshold ratio of feature max activation for context sampling",
-    )
-    parser.add_argument(
-        "--max-samples",
+        "--selection-method",
         type=int,
-        default=10,
-        help="Maximum number of activation contexts to evaluate",
+        default=1,
+        choices=[1, 2, 3],
+        help="Activation sampling method (1/2/3), aligned with neuronpedia_feature_api copy.py",
+    )
+    parser.add_argument("--m", type=int, default=5, help="Method parameter m for activation sampling")
+    parser.add_argument("--n", type=int, default=5, help="Method parameter n for activation sampling")
+    parser.add_argument(
+        "--non-activation-context-count",
+        "--non-activation-samples",
+        dest="non_activation_context_count",
+        type=int,
+        default=5,
+        help="Count of tail activation contexts used as should-not-activate samples",
     )
     parser.add_argument(
         "--neuronpedia-api-key",
@@ -391,26 +1144,105 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_API_KEY_FILE,
         help="Path to API key file used by llmapi.py",
     )
+    parser.add_argument(
+        "--disable-activation-score",
+        action="store_true",
+        help="Disable activation-score evaluation.",
+    )
+    parser.add_argument(
+        "--disable-non-activation-score",
+        action="store_true",
+        help="Disable non-activation-score evaluation.",
+    )
+    parser.add_argument(
+        "--disable-boundary-score",
+        action="store_true",
+        help="Disable boundary-case generation and SAE boundary scoring.",
+    )
+    parser.add_argument(
+        "--boundary-case-count",
+        type=int,
+        default=5,
+        help="Number of boundary contexts generated by LLM.",
+    )
+    parser.add_argument(
+        "--boundary-max-tokens",
+        type=int,
+        default=10000,
+        help="Max tokens for boundary-context generation call.",
+    )
+    parser.add_argument(
+        "--boundary-llm-model",
+        default=None,
+        help="Optional separate model for boundary-case generation (defaults to --llm-model).",
+    )
+    parser.add_argument(
+        "--boundary-activation-threshold",
+        type=float,
+        default=0.0,
+        help="Activation threshold: activation <= threshold counts as non-activated.",
+    )
+    parser.add_argument(
+        "--hf-model-name",
+        default=None,
+        help="Optional HuggingFace model name used by model_with_sae.py.",
+    )
+    parser.add_argument(
+        "--sae-path",
+        default=None,
+        help="Optional SAE path/URI for model_with_sae.py. If omitted, inferred from model/source.",
+    )
+    parser.add_argument(
+        "--sae-layer",
+        type=int,
+        default=None,
+        help="Optional SAE layer override for model_with_sae.py.",
+    )
+    parser.add_argument(
+        "--sae-variant",
+        default="average_l0_105",
+        help="SAE variant name when SAE path is inferred.",
+    )
+    parser.add_argument(
+        "--sae-device",
+        default="auto",
+        help="Device for SAE scoring (auto/cpu/cuda).",
+    )
     parser.add_argument("--output-json", default=None, help="Optional path to write JSON output")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    source = args.source or _build_source(layer_id=args.layer_id, width=args.width)
     my_explanation = _load_my_explanation(args)
     result = compare_with_neuronpedia_explanations(
         model_id=args.model_id,
-        source=args.source,
-        index=args.index,
+        source=source,
+        index=args.feature_id,
         my_explanation=my_explanation,
         max_explanations=args.max_explanations,
-        activation_ratio=args.activation_ratio,
-        max_samples=args.max_samples,
+        selection_method=args.selection_method,
+        m=args.m,
+        n=args.n,
+        non_activation_context_count=args.non_activation_context_count,
         neuronpedia_api_key=args.neuronpedia_api_key,
         neuronpedia_timeout=args.neuronpedia_timeout,
         llm_model=args.llm_model,
         ppio_base_url=args.ppio_base_url,
         ppio_api_key_file=args.ppio_api_key_file,
+        enable_activation_score=not args.disable_activation_score,
+        enable_non_activation_score=not args.disable_non_activation_score,
+        enable_boundary_score=not args.disable_boundary_score,
+        boundary_case_count=args.boundary_case_count,
+        boundary_max_tokens=args.boundary_max_tokens,
+        boundary_llm_model=args.boundary_llm_model,
+        boundary_activation_threshold=args.boundary_activation_threshold,
+        hf_model_name=args.hf_model_name,
+        sae_path=args.sae_path,
+        sae_layer=args.sae_layer,
+        sae_variant=args.sae_variant,
+        sae_device=args.sae_device,
     )
 
     text = json.dumps(result, ensure_ascii=False, indent=2)
