@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
+from tqdm import tqdm
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_ROOT = (
@@ -226,8 +228,16 @@ def main() -> None:
     
     selection = [(0, 414)]
     records: List[RunRecord] = []
-    for layer_id, feature_id in selection:
-        for history_scope in HISTORY_SCOPES:  # 完全定制化
+    tasks = [
+        (layer_id, feature_id, history_scope)
+        for layer_id, feature_id in selection
+        for history_scope in HISTORY_SCOPES
+    ]
+    for layer_id, feature_id, history_scope in tqdm(
+        tasks,
+        desc="Batch input history scope eval",
+        unit="task",
+    ):
             timestamp = f"{now_tag}_l{layer_id}_f{feature_id}_{history_scope}"
             workflow_cmd = [
                 str(args.python_exe),

@@ -271,12 +271,12 @@ def _pick_best_hypothesis(
     execution_payload: Optional[Dict[str, Any]],
     side: str,
 ) -> Dict[str, Any]:
-    if refined_payload is not None:
-        result = _pick_best_hypothesis_from_refined(refined_payload, side=side)
-        if result is not None:
-            return result
     if execution_payload is not None:
         result = _pick_best_hypothesis_from_execution(execution_payload, side=side)
+        if result is not None:
+            return result
+    if refined_payload is not None:
+        result = _pick_best_hypothesis_from_refined(refined_payload, side=side)
         if result is not None:
             return result
     result = _pick_best_hypothesis_from_final_result(final_result_payload, side=side)

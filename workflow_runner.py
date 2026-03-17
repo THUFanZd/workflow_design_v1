@@ -19,6 +19,7 @@ from function import (
     build_round_dir,
     normalize_round_id,
 )
+from hypothesis_merge import merge_refined_hypotheses
 from hypothesis_memory import build_hypothesis_memory, write_hypothesis_memory_markdown
 from hypothesis_refinement import refine_hypotheses
 from initial_hypothesis_generation import generate_initial_hypotheses
@@ -67,6 +68,7 @@ def _artifact_json_path(
         "experiments_execution": f"{stem}-experiments-execution.json",
         "memory": f"{stem}-memory.json",
         "refined_hypotheses": f"{stem}-refined-hypotheses.json",
+        "merged_hypotheses": f"{stem}-merged-hypotheses.json",
     }
     if kind not in filename_map:
         raise ValueError(f"Unsupported artifact kind: {kind}")
@@ -475,8 +477,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "When --start-round=0, valid steps are 1..5 "
             "(observation, initial, design, execution, memory). "
-            "When --start-round>=1, valid steps are 1..4 "
-            "(refinement, design, execution, memory)."
+            "When --start-round>=1 and merge is disabled, valid steps are 1..4 "
+            "(refinement, design, execution, memory). "
+            "When --start-round>=1 and merge is enabled, valid steps are 1..5 "
+            "(refinement, merge, design, execution, memory)."
         ),
     )
     parser.add_argument(
@@ -505,6 +509,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Input-side designed activation and boundary sentences per hypothesis.",
     )
     parser.add_argument("--top-m", type=int, default=None, help="Refine top-m hypotheses per side (default=all).")
+    parser.add_argument(
+        "--enable-hypothesis-merge",
+        action="store_true",
+        help=(
+            "After each refinement, add an LLM semantic merge step. "
+            "Default off to keep original workflow behavior."
+        ),
+    )
     parser.add_argument(
         "--history-rounds",
         type=int,
@@ -571,6 +583,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
     workflow_start_time = time.perf_counter()
+    merge_enabled = bool(args.enable_hypothesis_merge)
 
     if args.max_rounds < 0:
         raise ValueError("--max-rounds must be >= 0.")
@@ -578,8 +591,12 @@ if __name__ == "__main__":
         raise ValueError("--start-round must be >= 0.")
     if args.start_round == 0 and args.start_step not in (1, 2, 3, 4, 5):
         raise ValueError("When --start-round=0, --start-step must be one of 1/2/3/4/5.")
-    if args.start_round >= 1 and args.start_step not in (1, 2, 3, 4):
-        raise ValueError("When --start-round>=1, --start-step must be one of 1/2/3/4.")
+    if args.start_round >= 1:
+        valid_steps = (1, 2, 3, 4, 5) if merge_enabled else (1, 2, 3, 4)
+        if args.start_step not in valid_steps:
+            if merge_enabled:
+                raise ValueError("When --start-round>=1 with merge enabled, --start-step must be one of 1/2/3/4/5.")
+            raise ValueError("When --start-round>=1 with merge disabled, --start-step must be one of 1/2/3/4.")
     if args.start_round > args.max_rounds and args.start_round > 0:
         raise ValueError("--start-round cannot be greater than --max-rounds.")
     if args.history_rounds is not None and args.history_rounds < 0:
@@ -669,6 +686,7 @@ if __name__ == "__main__":
     previous_experiments_result: Optional[Dict[str, Any]] = None
     round_memories: Dict[int, Dict[str, Any]] = {}
     round_refinements: Dict[int, Dict[str, Any]] = {}
+    round_merges: Dict[int, Dict[str, Any]] = {}
     round_executions: Dict[int, Dict[str, Any]] = {}
     module: Optional[ModelWithSAEModule] = None
     converged = False
@@ -825,6 +843,9 @@ if __name__ == "__main__":
 
     for round_index in range(1, args.max_rounds + 1):
         round_id = _round_id_from_index(round_index)
+        round_design_step_index = 3 if merge_enabled else 2
+        round_execution_step_index = 4 if merge_enabled else 3
+        round_memory_step_index = 5 if merge_enabled else 4
         _log_stage(f"round {round_index}...", workflow_start_time)
 
         if previous_execution_result is None:
@@ -911,10 +932,44 @@ if __name__ == "__main__":
             track_usage(refinement_result, executed=False)
         round_refinements[round_index] = refinement_result
 
+        merged_result: Optional[Dict[str, Any]] = None
+        if merge_enabled:
+            merge_path = _artifact_json_path(
+                layer_id=layer_id,
+                feature_id=feature_id,
+                timestamp=ts,
+                round_index=round_index,
+                kind="merged_hypotheses",
+            )
+            _log_stage("merge refined hypotheses...", workflow_start_time)
+            if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=2):
+                merged_result = merge_refined_hypotheses(
+                    refined_hypotheses_result=refinement_result,
+                    model_id=str(refinement_result.get("model_id", args.model_id)),
+                    layer_id=layer_id,
+                    feature_id=feature_id,
+                    run_side=args.side,
+                    timestamp=ts,
+                    round_id=round_id,
+                    llm_base_url=args.llm_base_url,
+                    llm_model=args.llm_model,
+                    llm_api_key_file=args.llm_api_key_file,
+                    temperature=args.temperature,
+                    max_tokens=args.max_tokens,
+                )
+                executed_steps.append(f"{round_id}_step_2_merge")
+                track_usage(merged_result, executed=True)
+            else:
+                merged_result = _load_json_or_raise(merge_path)
+                loaded_steps.append(f"{round_id}_step_2_merge")
+                track_usage(merged_result, executed=False)
+            round_merges[round_index] = merged_result
+
+        hypotheses_after_refine = merged_result if merged_result is not None else refinement_result
         hypotheses_before_refine = current_hypotheses
-        converged_this_round = _same_hypotheses(current_hypotheses, refinement_result)
+        converged_this_round = _same_hypotheses(current_hypotheses, hypotheses_after_refine)
         current_hypotheses = _to_next_round_hypotheses(
-            refinement_result=refinement_result,
+            refinement_result=hypotheses_after_refine,
             round_index=round_index,
         )
         last_executed_hypotheses = current_hypotheses
@@ -946,7 +1001,12 @@ if __name__ == "__main__":
             kind="experiments",
         )
         _log_stage("design experiments...", workflow_start_time)
-        if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=2):
+        if _should_run(
+            start_round=args.start_round,
+            start_step=args.start_step,
+            round_index=round_index,
+            step_index=round_design_step_index,
+        ):
             active_experiments_result = design_hypothesis_experiments(
                 hypotheses_result=hypotheses_for_design,
                 num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
@@ -976,11 +1036,11 @@ if __name__ == "__main__":
                 )
             else:
                 experiments_result = active_experiments_result
-            executed_steps.append(f"{round_id}_step_2_experiments_design")
+            executed_steps.append(f"{round_id}_step_{round_design_step_index}_experiments_design")
             track_usage(active_experiments_result, executed=True)
         else:
             experiments_result = _load_json_or_raise(experiments_path)
-            loaded_steps.append(f"{round_id}_step_2_experiments_design")
+            loaded_steps.append(f"{round_id}_step_{round_design_step_index}_experiments_design")
             track_usage(experiments_result, executed=False)
 
         execution_path = _artifact_json_path(
@@ -991,7 +1051,12 @@ if __name__ == "__main__":
             kind="experiments_execution",
         )
         _log_stage("execute experiments...", workflow_start_time)
-        if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=3):
+        if _should_run(
+            start_round=args.start_round,
+            start_step=args.start_step,
+            round_index=round_index,
+            step_index=round_execution_step_index,
+        ):
             if module is None:
                 sae_path = args.sae_path or build_default_sae_path(
                     layer_id=layer_id,
@@ -1059,11 +1124,11 @@ if __name__ == "__main__":
                 )
             else:
                 execution_result = active_execution_result
-            executed_steps.append(f"{round_id}_step_3_experiments_execution")
+            executed_steps.append(f"{round_id}_step_{round_execution_step_index}_experiments_execution")
             track_usage(active_execution_result, executed=True)
         else:
             execution_result = _load_json_or_raise(execution_path)
-            loaded_steps.append(f"{round_id}_step_3_experiments_execution")
+            loaded_steps.append(f"{round_id}_step_{round_execution_step_index}_experiments_execution")
             track_usage(execution_result, executed=False)
         (
             last_output_intervention_method,
@@ -1086,7 +1151,12 @@ if __name__ == "__main__":
         )
         memory_md_path = memory_path.with_suffix(".md")
         _log_stage("build memory...", workflow_start_time)
-        if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=4):
+        if _should_run(
+            start_round=args.start_round,
+            start_step=args.start_step,
+            round_index=round_index,
+            step_index=round_memory_step_index,
+        ):
             memory_result = build_hypothesis_memory(
                 initial_hypotheses_result=current_hypotheses,
                 experiments_result=experiments_result,
@@ -1097,10 +1167,10 @@ if __name__ == "__main__":
             )
             _save_json(memory_path, memory_result)
             write_hypothesis_memory_markdown(memory_md_path, memory=memory_result)
-            executed_steps.append(f"{round_id}_step_4_memory")
+            executed_steps.append(f"{round_id}_step_{round_memory_step_index}_memory")
         else:
             memory_result = _load_json_or_raise(memory_path)
-            loaded_steps.append(f"{round_id}_step_4_memory")
+            loaded_steps.append(f"{round_id}_step_{round_memory_step_index}_memory")
         round_memories[round_index] = memory_result
         previous_experiments_result = experiments_result
         previous_execution_result = execution_result
@@ -1190,6 +1260,9 @@ if __name__ == "__main__":
         "output_side_final_reasons": final_output_reasons,
         "run_side": args.side,
         "history_rounds": args.history_rounds,
+        "enable_hypothesis_merge": merge_enabled,
+        "hypothesis_merge_mode": "llm_semantic" if merge_enabled else "off",
+        "merged_rounds": sorted(round_merges.keys()),
         "output_intervention_method": last_output_intervention_method,
         "output_score_name": last_output_score_name,
         "output_logit_top_k": last_output_logit_top_k,
@@ -1218,6 +1291,9 @@ if __name__ == "__main__":
     lines.append(f"- executed_rounds: {last_round_executed}")
     lines.append(f"- converged: {converged}")
     lines.append(f"- converged_round: {converged_round}")
+    lines.append(f"- enable_hypothesis_merge: {final_result.get('enable_hypothesis_merge')}")
+    lines.append(f"- hypothesis_merge_mode: {final_result.get('hypothesis_merge_mode')}")
+    lines.append(f"- merged_rounds: {final_result.get('merged_rounds')}")
     lines.append(f"- output_intervention_method: {final_result.get('output_intervention_method')}")
     lines.append(f"- output_score_name: {final_result.get('output_score_name')}")
     lines.append(f"- output_logit_top_k: {final_result.get('output_logit_top_k')}")
@@ -1269,6 +1345,9 @@ if __name__ == "__main__":
                 "workflow_memory_md_path": str(workflow_memory_md),
                 "converged": converged,
                 "converged_round": converged_round,
+                "enable_hypothesis_merge": final_result.get("enable_hypothesis_merge"),
+                "hypothesis_merge_mode": final_result.get("hypothesis_merge_mode"),
+                "merged_rounds": final_result.get("merged_rounds"),
                 "output_intervention_method": final_result.get("output_intervention_method"),
                 "output_score_name": final_result.get("output_score_name"),
                 "input_side_hypothesis_cache_path": final_result.get("input_side_hypothesis_cache_path"),
