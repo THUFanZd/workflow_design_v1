@@ -388,7 +388,9 @@ def _write_summary_markdown(path: Path, *, payload: Dict[str, Any]) -> None:
     lines.append(f"- status: {input_eval.get('status')}")
     lines.append(f"- used_workflow_cached_scores: {input_eval.get('used_workflow_cached_scores')}")
     lines.append(f"- relative_quality_score: {input_eval.get('relative_quality_score')}")
+    lines.append(f"- adherence: {input_eval.get('adherence')}")
     lines.append(f"- non_activation_relative_quality_score: {input_eval.get('non_activation_relative_quality_score')}")
+    lines.append(f"- non_activation_adherence: {input_eval.get('non_activation_adherence')}")
     lines.append(f"- boundary_relative_quality_score: {input_eval.get('boundary_relative_quality_score')}")
     lines.append(f"- score_non_zero_rate: {input_eval.get('score_non_zero_rate')}")
     lines.append(f"- score_boundary_non_activation_rate: {input_eval.get('score_boundary_non_activation_rate')}")
@@ -452,7 +454,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-run-input-eval",
         action="store_true",
-        help="Force rerun input-side evaluation script even when workflow cached input scores exist.",
+        help="Deprecated no-op. Input-side Neuronpedia comparison now always runs when run-mode includes input.",
     )
     parser.add_argument("--sae-release", default=None)
     parser.add_argument("--sae-average-l0", default=None)
@@ -598,102 +600,75 @@ def main() -> None:
     input_eval_status = "skipped"
     used_cached_input_scores = False
     if run_input:
-        has_cached_score_values = (
-            selected_input.get("combined_score") is not None
-            or selected_input.get("score_non_zero_rate") is not None
-            or selected_input.get("score_boundary_non_activation_rate") is not None
-        )
-        if (
-            selected_input_cache_raw is not None
-            and has_cached_score_values
-            and not args.force_run_input_eval
-        ):
-            used_cached_input_scores = True
-            input_eval_status = "completed_from_workflow_cache"
+        if selected_input_cache_raw is not None:
             _log_progress(
-                "Using cached input-side activation/boundary scores from workflow logs; "
-                "skip compare_explanations_with_llm.py."
+                "Workflow cached input-side scores detected, but Neuronpedia comparison will still run."
             )
-            cached_non_zero = selected_input.get("score_non_zero_rate")
-            cached_boundary = selected_input.get("score_boundary_non_activation_rate")
-            cached_combined = selected_input.get("combined_score", selected_input.get("score_value"))
-            input_result = {
-                "relative_quality_score": cached_combined,
-                "non_activation_relative_quality_score": cached_non_zero,
-                "boundary_relative_quality_score": cached_boundary,
-                "score_non_zero_rate": cached_non_zero,
-                "score_boundary_non_activation_rate": cached_boundary,
-                "combined_input_score": cached_combined,
-                "from_workflow_cache": True,
-                "score_formula": "score_non_zero_rate + score_boundary_non_activation_rate",
-            }
-            input_result_path = input_cache_path or final_result_path
-        else:
-            input_cmd: List[str] = [
-                sys.executable,
-                str(input_script),
-                "--model-id",
-                model_id,
-                "--layer-id",
-                layer_id,
-                "--width",
-                str(args.width),
-                "--source",
-                source,
-                "--feature-id",
-                str(feature_id),
-                "--my-explanation",
-                str(selected_input["hypothesis"]),
-                "--max-explanations",
-                str(args.input_max_explanations),
-                "--selection-method",
-                str(args.input_selection_method),
-                "--m",
-                str(args.input_m),
-                "--n",
-                str(args.input_n),
-                "--non-activation-context-count",
-                str(args.input_non_activation_context_count),
-                "--llm-model",
-                str(args.input_llm_model),
-                "--ppio-base-url",
-                str(args.input_ppio_base_url),
-                "--sae-name",
-                str(args.sae_name),
-                "--sae-device",
-                str(args.sae_device),
-                "--output-root",
-                str(args.input_output_root),
-                "--timestamp",
-                evaluation_timestamp,
-            ]
-            if args.input_ppio_api_key_file:
-                input_cmd.extend(["--ppio-api-key-file", str(args.input_ppio_api_key_file)])
-            if args.sae_release:
-                input_cmd.extend(["--sae-release", str(args.sae_release)])
-            if args.sae_average_l0:
-                input_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
-            if args.sae_canonical_map:
-                input_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
-            if args.input_disable_boundary_score:
-                input_cmd.append("--disable-boundary-score")
+        input_cmd: List[str] = [
+            sys.executable,
+            str(input_script),
+            "--model-id",
+            model_id,
+            "--layer-id",
+            layer_id,
+            "--width",
+            str(args.width),
+            "--source",
+            source,
+            "--feature-id",
+            str(feature_id),
+            "--my-explanation",
+            str(selected_input["hypothesis"]),
+            "--max-explanations",
+            str(args.input_max_explanations),
+            "--selection-method",
+            str(args.input_selection_method),
+            "--m",
+            str(args.input_m),
+            "--n",
+            str(args.input_n),
+            "--non-activation-context-count",
+            str(args.input_non_activation_context_count),
+            "--llm-model",
+            str(args.input_llm_model),
+            "--ppio-base-url",
+            str(args.input_ppio_base_url),
+            "--sae-name",
+            str(args.sae_name),
+            "--sae-device",
+            str(args.sae_device),
+            "--output-root",
+            str(args.input_output_root),
+            "--timestamp",
+            evaluation_timestamp,
+        ]
+        if args.input_ppio_api_key_file:
+            input_cmd.extend(["--ppio-api-key-file", str(args.input_ppio_api_key_file)])
+        if args.sae_release:
+            input_cmd.extend(["--sae-release", str(args.sae_release)])
+        if args.sae_average_l0:
+            input_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
+        if args.sae_canonical_map:
+            input_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
+        if args.input_disable_boundary_score:
+            input_cmd.append("--disable-boundary-score")
 
-            _run_command_with_progress(
-                input_cmd,
-                cwd=PROJECT_ROOT,
-                step_name="input-side evaluation",
-                heartbeat_seconds=int(args.heartbeat_seconds),
-            )
-            input_result_path = (
-                Path(args.input_output_root)
-                / str(args.sae_name)
-                / f"layer-{layer_id}"
-                / f"feature-{feature_id}"
-                / evaluation_timestamp
-                / "result.json"
-            )
-            input_result = _load_json(input_result_path)
-            input_eval_status = "completed"
+        _run_command_with_progress(
+            input_cmd,
+            cwd=PROJECT_ROOT,
+            step_name="input-side evaluation",
+            heartbeat_seconds=int(args.heartbeat_seconds),
+        )
+        input_result_path = (
+            Path(args.input_output_root)
+            / str(args.sae_name)
+            / f"layer-{layer_id}"
+            / f"feature-{feature_id}"
+            / evaluation_timestamp
+            / "result.json"
+        )
+        input_result = _load_json(input_result_path)
+        input_eval_status = "completed"
     else:
         _log_progress("Skip input-side evaluation.")
 
@@ -847,8 +822,12 @@ def main() -> None:
             "status": input_eval_status,
             "used_workflow_cached_scores": used_cached_input_scores,
             "relative_quality_score": input_result.get("relative_quality_score") if run_input else None,
+            "adherence": input_result.get("adherence") if run_input else None,
             "non_activation_relative_quality_score": (
                 input_result.get("non_activation_relative_quality_score") if run_input else None
+            ),
+            "non_activation_adherence": (
+                input_result.get("non_activation_adherence") if run_input else None
             ),
             "boundary_relative_quality_score": input_result.get("boundary_relative_quality_score") if run_input else None,
             "score_non_zero_rate": input_result.get("score_non_zero_rate") if run_input else None,

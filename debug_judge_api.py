@@ -53,11 +53,12 @@ def _run_once(
         "stream": False,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "extra_body": {"enable_thinking": False},
     }
     if response_format_text:
         kwargs["response_format"] = {"type": "text"}
     if extra_body_empty:
-        kwargs["extra_body"] = {}
+        kwargs["extra_body"] = {"enable_thinking": False}
 
     response = client.chat.completions.create(**kwargs)
     fields = _extract_message_fields(response)
@@ -166,4 +167,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -266,6 +266,7 @@ def call_llm(
             temperature=temperature,
             max_tokens=max_tokens,
             stream_options={"include_usage": True},
+            extra_body={"enable_thinking": False},
         )
 
         output_parts = []
@@ -292,11 +293,11 @@ def call_llm(
         "stream": False,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "extra_body": {"enable_thinking": False},
     }
     if response_format_text:
         request_mode = "with_response_format_text"
         request_kwargs["response_format"] = {"type": "text"}
-        request_kwargs["extra_body"] = {}
 
     try:
         response = client.chat.completions.create(**request_kwargs)
@@ -311,6 +312,7 @@ def call_llm(
             "stream": False,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "extra_body": {"enable_thinking": False},
         }
         response = client.chat.completions.create(**fallback_kwargs)
 

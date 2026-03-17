@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import json
 import sys
@@ -169,6 +170,47 @@ def _is_cache_compatible(cache_data: Dict[str, Any], expected_signature: Dict[st
     return cache_data.get("signature") == expected_signature
 
 
+def _cache_signature_hash(signature: Dict[str, Any]) -> str:
+    canonical = json.dumps(signature, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _iter_reference_cache_candidates(base_path: Path) -> List[Path]:
+    ordered_candidates: List[Path] = []
+    if base_path.exists():
+        ordered_candidates.append(base_path)
+    pattern = f"{base_path.stem}-*{base_path.suffix}"
+    ordered_candidates.extend(
+        sorted(
+            base_path.parent.glob(pattern),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    )
+
+    candidates: List[Path] = []
+    seen: set[str] = set()
+    for path in ordered_candidates:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(path)
+    return candidates
+
+
+def _find_compatible_reference_cache(
+    *,
+    base_path: Path,
+    expected_signature: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Path]]:
+    for candidate in _iter_reference_cache_candidates(base_path):
+        payload = _load_reference_cache(candidate)
+        if payload and _is_cache_compatible(payload, expected_signature):
+            return payload, candidate
+    return None, None
+
+
 def _to_boundary_score(payload: Dict[str, Any]) -> BoundaryScore:
     details_raw = payload.get("details")
     details: List[BoundaryCaseResult] = []
@@ -285,6 +327,7 @@ def generate_boundary_contexts(
         stream=False,
         temperature=temperature,
         max_tokens=max_tokens,
+        extra_body={"enable_thinking": False},
     )
 
     content = (response.choices[0].message.content or "").strip().strip("`")
@@ -521,6 +564,7 @@ def judge_should_activate(
         stream=False,
         temperature=0,
         max_tokens=max_tokens,
+        extra_body={"enable_thinking": False},
     )
     content = (response.choices[0].message.content or "").strip().strip("`")
     _append_llm_io_log(system_prompt=system_prompt, user_prompt=user_prompt, raw_output=content)
@@ -937,7 +981,7 @@ def compare_with_neuronpedia_explanations(
     )
     DEBUG_LLM_IO_PATH = output_paths["llm_io_log"]
 
-    reference_cache_path = _prepare_reference_cache_path(
+    reference_cache_base_path = _prepare_reference_cache_path(
         source=source,
         feature_id=index,
         cache_root=DEFAULT_REFERENCE_CACHE_ROOT,
@@ -960,9 +1004,18 @@ def compare_with_neuronpedia_explanations(
         "boundary_activation_threshold": float(boundary_activation_threshold),
         "llm_model": llm_model,
     }
-    cached_reference = _load_reference_cache(reference_cache_path)
-    use_reference_cache = bool(
-        cached_reference and _is_cache_compatible(cached_reference, cache_signature)
+    cached_reference, matched_cache_path = _find_compatible_reference_cache(
+        base_path=reference_cache_base_path,
+        expected_signature=cache_signature,
+    )
+    use_reference_cache = cached_reference is not None
+    cache_hash = _cache_signature_hash(cache_signature)
+    reference_cache_path = (
+        matched_cache_path
+        if matched_cache_path is not None
+        else reference_cache_base_path.with_name(
+            f"{reference_cache_base_path.stem}-{cache_hash}{reference_cache_base_path.suffix}"
+        )
     )
 
     if use_reference_cache:
@@ -1247,6 +1300,7 @@ def compare_with_neuronpedia_explanations(
         "neuronpedia_reference_cache": {
             "path": str(reference_cache_path),
             "hit": use_reference_cache,
+            "signature_hash": cache_hash,
         },
     }
 
@@ -1320,12 +1374,14 @@ def compare_with_neuronpedia_explanations(
         "neuronpedia_reference_cache": {
             "path": str(reference_cache_path),
             "hit": use_reference_cache,
+            "signature_hash": cache_hash,
         },
     }
 
     if not use_reference_cache:
         cache_payload = {
             "signature": cache_signature,
+            "signature_hash": cache_hash,
             "cached_at": datetime.now().isoformat(timespec="seconds"),
             "feature": {"model_id": model_id, "source": source, "index": index},
             "reference_explanations": reference_explanations,

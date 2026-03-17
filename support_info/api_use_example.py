@@ -25,7 +25,7 @@ chat_completion_res = client.chat.completions.create(
     stream=stream,
     max_tokens=max_tokens,
     stream_options={"include_usage": True} if stream else None,
-    extra_body={}
+    extra_body={"enable_thinking": False}
 )
 
 if stream:
@@ -65,5 +65,3 @@ else:
         print(f"total_tokens: {chat_completion_res.usage.total_tokens}")
     else:
         print("该接口未返回 usage，无法直接统计 token 用量。")
-  
-  

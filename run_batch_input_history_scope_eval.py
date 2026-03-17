@@ -104,7 +104,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sample-per-layer", type=int, default=2)
-    parser.add_argument("--max-rounds", type=int, default=1)
+    parser.add_argument("--max-rounds", "--max_round", dest="max_rounds", type=int, default=1)
+    parser.add_argument(
+        "--selection-method",
+        type=int,
+        default=1,
+        choices=[1, 2, 3],
+        help="Passed to workflow_runner.py --selection-method.",
+    )
+    parser.add_argument(
+        "--input-selection-method",
+        type=int,
+        default=1,
+        choices=[1, 2, 3],
+        help="Passed to final_explanation_evaluation_runner.py --input-selection-method.",
+    )
     parser.add_argument(
         "--final-run-mode",
         choices=["both", "input", "output", "none"],
@@ -115,6 +129,11 @@ def parse_args() -> argparse.Namespace:
         "--continue-on-error",
         action="store_true",
         help="Continue with next task if one workflow/evaluation run fails.",
+    )
+    parser.add_argument(
+        "--force-run-input-eval",
+        action="store_true",
+        help="Passed to final_explanation_evaluation_runner.py to force compare_explanations_with_llm.py.",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -157,6 +176,8 @@ def main() -> None:
                 history_scope,
                 "--max-rounds",
                 str(args.max_rounds),
+                "--selection-method",
+                str(args.selection_method),
                 "--timestamp",
                 timestamp,
             ]
@@ -176,7 +197,11 @@ def main() -> None:
                     timestamp,
                     "--run-mode",
                     str(args.final_run_mode),
+                    "--input-selection-method",
+                    str(args.input_selection_method),
                 ]
+                if bool(args.force_run_input_eval):
+                    evaluation_cmd.append("--force-run-input-eval")
                 evaluation_code, evaluation_seconds = _run_command(
                     evaluation_cmd,
                     dry_run=bool(args.dry_run),
@@ -204,7 +229,10 @@ def main() -> None:
         "seed": int(args.seed),
         "sample_per_layer": int(args.sample_per_layer),
         "max_rounds": int(args.max_rounds),
+        "selection_method": int(args.selection_method),
+        "input_selection_method": int(args.input_selection_method),
         "final_run_mode": str(args.final_run_mode),
+        "force_run_input_eval": bool(args.force_run_input_eval),
         "selection": [{"layer_id": l, "feature_id": f} for l, f in selection],
         "records": [r.__dict__ for r in records],
     }
