@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
@@ -12,6 +13,7 @@ from openai import OpenAI
 from function import (
     TokenUsageAccumulator,
     build_round_dir,
+    call_llm,
     call_llm_stream,
     extract_usage_counts,
     extract_json_object,
@@ -114,6 +116,8 @@ def generate_boundary_contexts(
     llm_calls: Optional[List[Dict[str, Any]]] = None,
     call_metadata: Optional[Dict[str, Any]] = None,
     llm_io_logger: Optional[Callable[[str, str, str], None]] = None,
+    max_retries: int = 2,
+    retry_backoff_seconds: float = 1.5,
 ) -> List[str]:
     if boundary_case_count <= 0:
         raise ValueError("boundary_case_count must be a positive integer.")
@@ -145,61 +149,94 @@ def generate_boundary_contexts(
         {"role": "user", "content": user_prompt},
     ]
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        stream=False,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    content = (response.choices[0].message.content or "").strip().strip("`")
-    if llm_io_logger is not None:
-        llm_io_logger(system_prompt, user_prompt, content)
-
-    usage_counts = extract_usage_counts(getattr(response, "usage", None))
-    if token_counter is not None:
-        token_counter.add(getattr(response, "usage", None))
-    if llm_calls is not None:
-        record = {
-            "messages": messages,
-            "raw_output": content,
-            "usage": usage_counts,
-            "call_type": "input_boundary_context_generation",
-        }
-        if isinstance(call_metadata, dict):
-            record.update(call_metadata)
-        llm_calls.append(record)
-
-    parsed = _extract_json_any(content)
-    candidates: List[str] = []
-    if isinstance(parsed, dict):
-        for key in ("boundary_cases", "cases", "examples", "contexts", "items"):
-            if key in parsed:
-                candidates.extend(_extract_string_list(parsed[key]))
-        if not candidates:
+    def _collect_candidates(raw_text: str) -> List[str]:
+        parsed = _extract_json_any(raw_text)
+        candidates: List[str] = []
+        if isinstance(parsed, dict):
+            for key in ("boundary_cases", "cases", "examples", "contexts", "items"):
+                if key in parsed:
+                    candidates.extend(_extract_string_list(parsed[key]))
+            if not candidates:
+                candidates.extend(_extract_string_list(parsed))
+        elif parsed is not None:
             candidates.extend(_extract_string_list(parsed))
-    elif parsed is not None:
-        candidates.extend(_extract_string_list(parsed))
 
-    if not candidates:
-        for line in content.splitlines():
-            cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
-            if cleaned:
-                candidates.append(" ".join(cleaned.split()))
+        if not candidates:
+            for line in raw_text.splitlines():
+                cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+                if cleaned:
+                    candidates.append(" ".join(cleaned.split()))
 
-    deduped: List[str] = []
-    seen = set()
-    for item in candidates:
-        if item and item not in seen:
-            seen.add(item)
-            deduped.append(item)
+        deduped: List[str] = []
+        seen = set()
+        for item in candidates:
+            if item and item not in seen:
+                seen.add(item)
+                deduped.append(item)
+        return deduped
 
-    if len(deduped) < boundary_case_count:
-        raise ValueError(
-            f"Boundary case generator returned {len(deduped)} cases, "
-            f"but {boundary_case_count} are required. Raw output: {content}"
+    max_attempts = max(1, int(max_retries) + 1)
+    last_content = ""
+    last_debug: Dict[str, Any] = {}
+    last_count = 0
+
+    for attempt in range(1, max_attempts + 1):
+        content, usage_obj, debug_info = call_llm(
+            client=client,
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=False,
+            return_debug=True,
         )
-    return deduped[:boundary_case_count]
+        content = content.strip().strip("`")
+        if llm_io_logger is not None:
+            llm_io_logger(system_prompt, user_prompt, content)
+
+        usage_counts = extract_usage_counts(usage_obj)
+        if token_counter is not None:
+            token_counter.add(usage_obj)
+        if llm_calls is not None:
+            record = {
+                "messages": messages,
+                "raw_output": content,
+                "usage": usage_counts,
+                "call_type": "input_boundary_context_generation",
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+            }
+            if isinstance(debug_info, dict):
+                record["debug"] = {
+                    "request_mode": debug_info.get("request_mode"),
+                    "request_error": debug_info.get("request_error"),
+                    "content_type": debug_info.get("content_type"),
+                    "finish_reason": debug_info.get("finish_reason"),
+                }
+            if isinstance(call_metadata, dict):
+                record.update(call_metadata)
+            llm_calls.append(record)
+
+        deduped = _collect_candidates(content)
+        if len(deduped) >= boundary_case_count:
+            return deduped[:boundary_case_count]
+
+        last_content = content
+        last_count = len(deduped)
+        if isinstance(debug_info, dict):
+            last_debug = debug_info
+
+        if attempt < max_attempts:
+            time.sleep(max(0.0, retry_backoff_seconds) * attempt)
+
+    finish_reason = last_debug.get("finish_reason")
+    content_type = last_debug.get("content_type")
+    raise ValueError(
+        f"Boundary case generator returned {last_count} cases, "
+        f"but {boundary_case_count} are required after {max_attempts} attempts. "
+        f"finish_reason={finish_reason}, content_type={content_type}. "
+        f"Raw output: {last_content}"
+    )
 
 
 def _design_experiments_for_side(
@@ -343,6 +380,12 @@ def _write_markdown_log(
         lines.append(f"- prompt_tokens: {usage.get('prompt_tokens', 0)}")
         lines.append(f"- completion_tokens: {usage.get('completion_tokens', 0)}")
         lines.append(f"- total_tokens: {usage.get('total_tokens', 0)}")
+        if "attempt" in call:
+            lines.append(f"- attempt: {call.get('attempt')}/{call.get('max_attempts', 1)}")
+        debug_info = call.get("debug", {})
+        if isinstance(debug_info, dict):
+            lines.append(f"- finish_reason: {debug_info.get('finish_reason')}")
+            lines.append(f"- content_type: {debug_info.get('content_type')}")
         lines.append("")
         lines.append("#### Messages")
         lines.append("```json")
