@@ -92,6 +92,11 @@ def _save_manifest(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _build_plan_output_path(base_path: Path, *, end_time: datetime) -> Path:
+    end_tag = end_time.strftime("%Y%m%d_%H%M%S")
+    return base_path.parent / end_tag / base_path.name
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -105,6 +110,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sample-per-layer", type=int, default=2)
     parser.add_argument("--max-rounds", "--max_round", dest="max_rounds", type=int, default=1)
+    parser.add_argument("--num-hypothesis", type=int, default=3)
+    parser.add_argument(
+        "--generation-mode",
+        choices=["single_call", "iterative"],
+        default="single_call",
+        help="Passed to workflow_runner.py --generation-mode.",
+    )
+    parser.add_argument("--num-input-sentences-per-hypothesis", type=int, default=5)
+    parser.add_argument(
+        "--top-m",
+        type=int,
+        default=None,
+        help="Passed to workflow_runner.py --top-m. If omitted, workflow default applies.",
+    )
+    parser.add_argument(
+        "--history-rounds",
+        type=int,
+        default=1,
+        help="Passed to workflow_runner.py --history-rounds.",
+    )
+    parser.add_argument("--width", default="16k", help="Passed to workflow/final-eval width args.")
     parser.add_argument(
         "--selection-method",
         type=int,
@@ -113,11 +139,47 @@ def parse_args() -> argparse.Namespace:
         help="Passed to workflow_runner.py --selection-method.",
     )
     parser.add_argument(
+        "--observation-m",
+        type=int,
+        default=2,
+        help="Passed to workflow_runner.py --observation-m (used by selection-method=1).",
+    )
+    parser.add_argument(
+        "--observation-n",
+        type=int,
+        default=2,
+        help="Passed to workflow_runner.py --observation-n (used by selection-method=1).",
+    )
+    parser.add_argument(
         "--input-selection-method",
         type=int,
         default=1,
         choices=[1, 2, 3],
         help="Passed to final_explanation_evaluation_runner.py --input-selection-method.",
+    )
+    parser.add_argument(
+        "--input-max-explanations",
+        type=int,
+        default=3,
+        help="Passed to final_explanation_evaluation_runner.py --input-max-explanations.",
+    )
+    parser.add_argument(
+        "--input-m",
+        type=int,
+        default=5,
+        help="Passed to final_explanation_evaluation_runner.py --input-m.",
+    )
+    parser.add_argument(
+        "--input-n",
+        type=int,
+        default=5,
+        help="Passed to final_explanation_evaluation_runner.py --input-n.",
+    )
+    parser.add_argument(
+        "--input-non-activation-context-count",
+        type=int,
+        default=5,
+        help="Passed to final_explanation_evaluation_runner.py --input-non-activation-context-count.",
     )
     parser.add_argument(
         "--final-run-mode",
@@ -139,7 +201,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plan-output",
         default=str(PROJECT_ROOT / "logs" / "batch_input_history_scope_plan.json"),
-        help="Where to save selected features and run records.",
+        help=(
+            "Base manifest path. Actual output inserts one more directory level using run-end timestamp, "
+            "e.g. logs/<end_ts>/batch_input_history_scope_plan.json."
+        ),
     )
     return parser.parse_args()
 
@@ -159,9 +224,10 @@ def main() -> None:
     for layer_id, feature_id in selection:
         print(f"- layer={layer_id}, feature={feature_id}")
     
+    selection = [(0, 414)]
     records: List[RunRecord] = []
     for layer_id, feature_id in selection:
-        for history_scope in HISTORY_SCOPES:
+        for history_scope in HISTORY_SCOPES:  # 完全定制化
             timestamp = f"{now_tag}_l{layer_id}_f{feature_id}_{history_scope}"
             workflow_cmd = [
                 str(args.python_exe),
@@ -176,11 +242,27 @@ def main() -> None:
                 history_scope,
                 "--max-rounds",
                 str(args.max_rounds),
+                "--num-hypothesis",
+                str(args.num_hypothesis),
+                "--generation-mode",
+                str(args.generation_mode),
+                "--num-input-sentences-per-hypothesis",
+                str(args.num_input_sentences_per_hypothesis),
+                "--history-rounds",
+                str(args.history_rounds),
+                "--width",
+                str(args.width),
                 "--selection-method",
                 str(args.selection_method),
+                "--observation-m",
+                str(args.observation_m),
+                "--observation-n",
+                str(args.observation_n),
                 "--timestamp",
                 timestamp,
             ]
+            if args.top_m is not None:
+                workflow_cmd.extend(["--top-m", str(args.top_m)])
             workflow_code, workflow_seconds = _run_command(workflow_cmd, dry_run=bool(args.dry_run))
 
             evaluation_code: int | None = None
@@ -195,10 +277,22 @@ def main() -> None:
                     str(feature_id),
                     "--timestamp",
                     timestamp,
+                    "--sae-name",
+                    str(args.sae_name),
+                    "--width",
+                    str(args.width),
                     "--run-mode",
                     str(args.final_run_mode),
+                    "--input-max-explanations",
+                    str(args.input_max_explanations),
                     "--input-selection-method",
                     str(args.input_selection_method),
+                    "--input-m",
+                    str(args.input_m),
+                    "--input-n",
+                    str(args.input_n),
+                    "--input-non-activation-context-count",
+                    str(args.input_non_activation_context_count),
                 ]
                 if bool(args.force_run_input_eval):
                     evaluation_cmd.append("--force-run-input-eval")
@@ -229,15 +323,31 @@ def main() -> None:
         "seed": int(args.seed),
         "sample_per_layer": int(args.sample_per_layer),
         "max_rounds": int(args.max_rounds),
+        "num_hypothesis": int(args.num_hypothesis),
+        "generation_mode": str(args.generation_mode),
+        "num_input_sentences_per_hypothesis": int(args.num_input_sentences_per_hypothesis),
+        "top_m": None if args.top_m is None else int(args.top_m),
+        "history_rounds": int(args.history_rounds),
+        "width": str(args.width),
         "selection_method": int(args.selection_method),
+        "observation_m": int(args.observation_m),
+        "observation_n": int(args.observation_n),
+        "input_max_explanations": int(args.input_max_explanations),
         "input_selection_method": int(args.input_selection_method),
+        "input_m": int(args.input_m),
+        "input_n": int(args.input_n),
+        "input_non_activation_context_count": int(args.input_non_activation_context_count),
         "final_run_mode": str(args.final_run_mode),
         "force_run_input_eval": bool(args.force_run_input_eval),
         "selection": [{"layer_id": l, "feature_id": f} for l, f in selection],
         "records": [r.__dict__ for r in records],
     }
-    _save_manifest(Path(str(args.plan_output)), summary)
-    print(f"Saved manifest: {args.plan_output}")
+    plan_output_path = _build_plan_output_path(
+        Path(str(args.plan_output)),
+        end_time=datetime.now(),
+    )
+    _save_manifest(plan_output_path, summary)
+    print(f"Saved manifest: {plan_output_path}")
 
 
 if __name__ == "__main__":

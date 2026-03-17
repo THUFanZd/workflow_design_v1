@@ -5,9 +5,11 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Set
 
+from experiments_design import _write_markdown_log as write_experiments_markdown
 from experiments_design import design_hypothesis_experiments
+from experiments_execution import _write_markdown_log as write_execution_markdown
 from experiments_execution import execute_hypothesis_experiments
 from experiments_execution_output import KL_DIV_VALUES_DEFAULT
 from function import (
@@ -109,6 +111,184 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _is_input_hypothesis_full_score(item: Dict[str, Any]) -> bool:
+    score_non_zero = item.get("score_non_zero_rate")
+    score_boundary = item.get("score_boundary_non_activation_rate")
+    if score_non_zero is None or score_boundary is None:
+        return False
+    return _safe_float(score_non_zero, 0.0) >= 1.0 and _safe_float(score_boundary, 0.0) >= 1.0
+
+
+def _frozen_input_indices_from_execution(execution_result: Dict[str, Any]) -> Set[int]:
+    input_exec = execution_result.get("input_side_execution", {})
+    if not isinstance(input_exec, dict):
+        return set()
+    hypothesis_results_raw = input_exec.get("hypothesis_results", [])
+    hypothesis_results = (
+        [item for item in hypothesis_results_raw if isinstance(item, dict)]
+        if isinstance(hypothesis_results_raw, list)
+        else []
+    )
+    frozen: Set[int] = set()
+    for item in hypothesis_results:
+        index = _safe_int(item.get("hypothesis_index"), 0)
+        if index <= 0:
+            continue
+        if _is_input_hypothesis_full_score(item):
+            frozen.add(index)
+    return frozen
+
+
+def _normalize_hypothesis_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value]
+
+
+def _copy_dict(value: Any) -> Dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _build_filtered_hypotheses_for_active_input(
+    *,
+    hypotheses_result: Dict[str, Any],
+    active_input_indices: Sequence[int],
+) -> Dict[str, Any]:
+    payload = dict(hypotheses_result)
+    input_hypotheses = _normalize_hypothesis_list(hypotheses_result.get("input_side_hypotheses", []))
+    input_reasons_raw = hypotheses_result.get("input_side_hypothesis_reasons", [])
+    input_reasons = (
+        [str(item) if item is not None else "" for item in input_reasons_raw]
+        if isinstance(input_reasons_raw, list)
+        else []
+    )
+
+    filtered_hypotheses: List[str] = []
+    filtered_reasons: List[str] = []
+    for index in active_input_indices:
+        if 1 <= index <= len(input_hypotheses):
+            filtered_hypotheses.append(input_hypotheses[index - 1])
+            filtered_reasons.append(input_reasons[index - 1] if index - 1 < len(input_reasons) else "")
+
+    payload["input_side_hypotheses"] = filtered_hypotheses
+    payload["input_side_hypothesis_reasons"] = filtered_reasons
+    return payload
+
+
+def _merge_input_experiments_from_active_and_frozen(
+    *,
+    current_hypotheses: Dict[str, Any],
+    active_indices: Sequence[int],
+    frozen_indices: Set[int],
+    active_experiments_result: Dict[str, Any],
+    previous_experiments_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    merged = dict(active_experiments_result)
+    input_hypotheses = _normalize_hypothesis_list(current_hypotheses.get("input_side_hypotheses", []))
+    total_input = len(input_hypotheses)
+    active_items_raw = active_experiments_result.get("input_side_experiments", [])
+    active_items = [item for item in active_items_raw if isinstance(item, dict)] if isinstance(active_items_raw, list) else []
+    previous_items_raw = previous_experiments_result.get("input_side_experiments", [])
+    previous_items = (
+        [item for item in previous_items_raw if isinstance(item, dict)] if isinstance(previous_items_raw, list) else []
+    )
+
+    merged_items: List[Optional[Dict[str, Any]]] = [None] * total_input
+    for index in frozen_indices:
+        if 1 <= index <= len(previous_items):
+            carried = _copy_dict(previous_items[index - 1])
+            if 1 <= index <= total_input:
+                carried["hypothesis"] = input_hypotheses[index - 1]
+            merged_items[index - 1] = carried
+
+    for position, index in enumerate(active_indices):
+        if not (1 <= index <= total_input):
+            continue
+        if position >= len(active_items):
+            raise ValueError(
+                "Active input experiments count does not match expected active hypotheses count."
+            )
+        generated = _copy_dict(active_items[position])
+        generated["hypothesis"] = input_hypotheses[index - 1]
+        merged_items[index - 1] = generated
+
+    if any(item is None for item in merged_items):
+        raise ValueError("Failed to assemble merged input experiments for all hypotheses.")
+
+    merged["input_side_experiments"] = [item for item in merged_items if isinstance(item, dict)]
+    output_hypotheses = _normalize_hypothesis_list(current_hypotheses.get("output_side_hypotheses", []))
+    merged["num_hypothesis"] = max(len(input_hypotheses), len(output_hypotheses))
+    return merged
+
+
+def _merge_input_execution_from_active_and_frozen(
+    *,
+    current_hypotheses: Dict[str, Any],
+    active_indices: Sequence[int],
+    frozen_indices: Set[int],
+    active_execution_result: Dict[str, Any],
+    previous_execution_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    merged = dict(active_execution_result)
+    input_hypotheses = _normalize_hypothesis_list(current_hypotheses.get("input_side_hypotheses", []))
+    total_input = len(input_hypotheses)
+
+    active_input_exec = active_execution_result.get("input_side_execution", {})
+    active_items_raw = active_input_exec.get("hypothesis_results", []) if isinstance(active_input_exec, dict) else []
+    active_items = [item for item in active_items_raw if isinstance(item, dict)] if isinstance(active_items_raw, list) else []
+
+    previous_input_exec = previous_execution_result.get("input_side_execution", {})
+    previous_items_raw = previous_input_exec.get("hypothesis_results", []) if isinstance(previous_input_exec, dict) else []
+    previous_items = (
+        [item for item in previous_items_raw if isinstance(item, dict)] if isinstance(previous_items_raw, list) else []
+    )
+
+    merged_items: List[Optional[Dict[str, Any]]] = [None] * total_input
+    for index in frozen_indices:
+        if 1 <= index <= len(previous_items):
+            carried = _copy_dict(previous_items[index - 1])
+            carried["hypothesis_index"] = index
+            if 1 <= index <= total_input:
+                carried["hypothesis"] = input_hypotheses[index - 1]
+            merged_items[index - 1] = carried
+
+    for position, index in enumerate(active_indices):
+        if not (1 <= index <= total_input):
+            continue
+        if position >= len(active_items):
+            raise ValueError(
+                "Active input execution count does not match expected active hypotheses count."
+            )
+        generated = _copy_dict(active_items[position])
+        generated["hypothesis_index"] = index
+        generated["hypothesis"] = input_hypotheses[index - 1]
+        merged_items[index - 1] = generated
+
+    if any(item is None for item in merged_items):
+        raise ValueError("Failed to assemble merged input execution for all hypotheses.")
+
+    boundary_values = [
+        _safe_float(item.get("score_boundary_non_activation_rate"), 0.0)
+        for item in merged_items
+        if isinstance(item, dict) and item.get("score_boundary_non_activation_rate") is not None
+    ]
+    non_zero_values = [
+        _safe_float(item.get("score_non_zero_rate"), 0.0)
+        for item in merged_items
+        if isinstance(item, dict)
+    ]
+    merged_input_execution = dict(active_input_exec) if isinstance(active_input_exec, dict) else {}
+    merged_input_execution["hypothesis_results"] = [item for item in merged_items if isinstance(item, dict)]
+    merged_input_execution["overall_score_non_zero_rate"] = (
+        (sum(non_zero_values) / len(non_zero_values)) if non_zero_values else 0.0
+    )
+    merged_input_execution["overall_score_boundary_non_activation_rate"] = (
+        (sum(boundary_values) / len(boundary_values)) if boundary_values else None
+    )
+    merged["input_side_execution"] = merged_input_execution
+    return merged
 
 
 def _format_elapsed(total_seconds: float) -> str:
@@ -486,6 +666,7 @@ if __name__ == "__main__":
     last_executed_hypotheses = initial_result
     previous_execution_result: Optional[Dict[str, Any]] = None
     previous_memory_result: Optional[Dict[str, Any]] = None
+    previous_experiments_result: Optional[Dict[str, Any]] = None
     round_memories: Dict[int, Dict[str, Any]] = {}
     round_refinements: Dict[int, Dict[str, Any]] = {}
     round_executions: Dict[int, Dict[str, Any]] = {}
@@ -613,6 +794,7 @@ if __name__ == "__main__":
     round_executions[0] = baseline_execution_result
     last_executed_hypotheses = current_hypotheses
     previous_execution_result = baseline_execution_result
+    previous_experiments_result = baseline_experiments_result
 
     baseline_memory_path = _artifact_json_path(
         layer_id=layer_id,
@@ -664,6 +846,15 @@ if __name__ == "__main__":
             )
             previous_memory_result = _load_json_or_raise(prev_memory_path)
             round_memories[round_index - 1] = previous_memory_result
+        if previous_experiments_result is None:
+            prev_experiments_path = _artifact_json_path(
+                layer_id=layer_id,
+                feature_id=feature_id,
+                timestamp=ts,
+                round_index=round_index - 1,
+                kind="experiments",
+            )
+            previous_experiments_result = _load_json_or_raise(prev_experiments_path)
 
         refine_path = _artifact_json_path(
             layer_id=layer_id,
@@ -720,12 +911,32 @@ if __name__ == "__main__":
             track_usage(refinement_result, executed=False)
         round_refinements[round_index] = refinement_result
 
+        hypotheses_before_refine = current_hypotheses
         converged_this_round = _same_hypotheses(current_hypotheses, refinement_result)
         current_hypotheses = _to_next_round_hypotheses(
             refinement_result=refinement_result,
             round_index=round_index,
         )
         last_executed_hypotheses = current_hypotheses
+
+        frozen_input_indices: Set[int] = set()
+        if args.side in ("input", "both") and isinstance(previous_execution_result, dict):
+            frozen_candidates = _frozen_input_indices_from_execution(previous_execution_result)
+            before_input = _normalize_hypothesis_list(hypotheses_before_refine.get("input_side_hypotheses", []))
+            after_input = _normalize_hypothesis_list(current_hypotheses.get("input_side_hypotheses", []))
+            for idx in frozen_candidates:
+                if 1 <= idx <= len(before_input) and 1 <= idx <= len(after_input):
+                    if before_input[idx - 1] == after_input[idx - 1]:
+                        frozen_input_indices.add(idx)
+
+        total_input_hypotheses = len(_normalize_hypothesis_list(current_hypotheses.get("input_side_hypotheses", [])))
+        active_input_indices = [
+            idx for idx in range(1, total_input_hypotheses + 1) if idx not in frozen_input_indices
+        ]
+        hypotheses_for_design = _build_filtered_hypotheses_for_active_input(
+            hypotheses_result=current_hypotheses,
+            active_input_indices=active_input_indices,
+        )
 
         experiments_path = _artifact_json_path(
             layer_id=layer_id,
@@ -736,8 +947,8 @@ if __name__ == "__main__":
         )
         _log_stage("design experiments...", workflow_start_time)
         if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=2):
-            experiments_result = design_hypothesis_experiments(
-                hypotheses_result=current_hypotheses,
+            active_experiments_result = design_hypothesis_experiments(
+                hypotheses_result=hypotheses_for_design,
                 num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
                 run_side=args.side,
                 round_id=round_id,
@@ -747,8 +958,26 @@ if __name__ == "__main__":
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
             )
+            if frozen_input_indices:
+                if previous_experiments_result is None:
+                    raise ValueError("Missing previous experiments result for frozen input hypotheses.")
+                experiments_result = _merge_input_experiments_from_active_and_frozen(
+                    current_hypotheses=current_hypotheses,
+                    active_indices=active_input_indices,
+                    frozen_indices=frozen_input_indices,
+                    active_experiments_result=active_experiments_result,
+                    previous_experiments_result=previous_experiments_result,
+                )
+                _save_json(experiments_path, experiments_result)
+                write_experiments_markdown(
+                    experiments_path.with_suffix(".md"),
+                    result=experiments_result,
+                    llm_calls=active_experiments_result.get("llm_calls", []),
+                )
+            else:
+                experiments_result = active_experiments_result
             executed_steps.append(f"{round_id}_step_2_experiments_design")
-            track_usage(experiments_result, executed=True)
+            track_usage(active_experiments_result, executed=True)
         else:
             experiments_result = _load_json_or_raise(experiments_path)
             loaded_steps.append(f"{round_id}_step_2_experiments_design")
@@ -778,8 +1007,18 @@ if __name__ == "__main__":
                     feature_index=int(feature_id),
                     device=args.device,
                 )
-            execution_result = execute_hypothesis_experiments(
-                experiments_result=experiments_result,
+            experiments_for_execution = dict(experiments_result)
+            if frozen_input_indices:
+                active_input_experiments = []
+                all_input_experiments = experiments_result.get("input_side_experiments", [])
+                if isinstance(all_input_experiments, list):
+                    for idx in active_input_indices:
+                        if 1 <= idx <= len(all_input_experiments) and isinstance(all_input_experiments[idx - 1], dict):
+                            active_input_experiments.append(dict(all_input_experiments[idx - 1]))
+                experiments_for_execution["input_side_experiments"] = active_input_experiments
+
+            active_execution_result = execute_hypothesis_experiments(
+                experiments_result=experiments_for_execution,
                 module=module,
                 run_side=args.side,
                 round_id=round_id,
@@ -802,8 +1041,26 @@ if __name__ == "__main__":
                 output_logit_force_refresh_kl_cache=args.output_logit_force_refresh_kl_cache,
                 output_logit_include_special_tokens=args.output_logit_include_special_tokens,
             )
+            if frozen_input_indices:
+                if previous_execution_result is None:
+                    raise ValueError("Missing previous execution result for frozen input hypotheses.")
+                execution_result = _merge_input_execution_from_active_and_frozen(
+                    current_hypotheses=current_hypotheses,
+                    active_indices=active_input_indices,
+                    frozen_indices=frozen_input_indices,
+                    active_execution_result=active_execution_result,
+                    previous_execution_result=previous_execution_result,
+                )
+                _save_json(execution_path, execution_result)
+                write_execution_markdown(
+                    execution_path.with_suffix(".md"),
+                    result=execution_result,
+                    llm_calls=execution_result.get("llm_calls", []),
+                )
+            else:
+                execution_result = active_execution_result
             executed_steps.append(f"{round_id}_step_3_experiments_execution")
-            track_usage(execution_result, executed=True)
+            track_usage(active_execution_result, executed=True)
         else:
             execution_result = _load_json_or_raise(execution_path)
             loaded_steps.append(f"{round_id}_step_3_experiments_execution")
@@ -845,6 +1102,7 @@ if __name__ == "__main__":
             memory_result = _load_json_or_raise(memory_path)
             loaded_steps.append(f"{round_id}_step_4_memory")
         round_memories[round_index] = memory_result
+        previous_experiments_result = experiments_result
         previous_execution_result = execution_result
         previous_memory_result = memory_result
         last_round_executed = round_index
