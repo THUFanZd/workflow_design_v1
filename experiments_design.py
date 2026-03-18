@@ -25,7 +25,7 @@ from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
 from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
 from neuronpedia_feature_api import fetch_and_parse_feature_observation
-from prompts.experiments_generation_prompt import build_system_prompt, build_user_prompt
+from prompts.experiments_design_prompt import build_system_prompt, build_user_prompt
 
 SideType = Literal["input", "output"]
 RunSideType = Literal["input", "output", "both"]

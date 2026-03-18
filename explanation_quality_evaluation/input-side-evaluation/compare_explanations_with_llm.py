@@ -682,7 +682,7 @@ def build_boundary_sae_module(
     hf_model_name: Optional[str] = None,
     sae_path: Optional[str] = None,
     sae_layer: Optional[int] = None,
-    sae_variant: str = "average_l0_70",
+    sae_variant: Optional[str] = None,
     sae_name: Optional[str] = None,
     sae_release: Optional[str] = None,
     sae_average_l0: Optional[str] = None,
@@ -744,7 +744,7 @@ def evaluate_boundary_with_sae(
     hf_model_name: Optional[str] = None,
     sae_path: Optional[str] = None,
     sae_layer: Optional[int] = None,
-    sae_variant: str = "average_l0_70",
+    sae_variant: Optional[str] = None,
     sae_device: str = "auto",
     module: Optional[Any] = None,
 ) -> BoundaryScore:
@@ -964,7 +964,7 @@ def compare_with_neuronpedia_explanations(
     hf_model_name: Optional[str] = None,
     sae_path: Optional[str] = None,
     sae_layer: Optional[int] = None,
-    sae_variant: str = "average_l0_70",
+    sae_variant: Optional[str] = None,
     sae_name: Optional[str] = None,
     sae_release: Optional[str] = None,
     sae_average_l0: Optional[str] = None,
@@ -1092,6 +1092,7 @@ def compare_with_neuronpedia_explanations(
     boundary_contexts: List[str] = []
     boundary_score: Optional[BoundaryScore] = None
     boundary_reference_scores: List[BoundaryScore] = []
+    boundary_warning: Optional[str] = None
     if enable_boundary_score:
         assert client is not None
         try:
@@ -1099,75 +1100,83 @@ def compare_with_neuronpedia_explanations(
         except ValueError as exc:
             raise ValueError(f"feature index must be an integer for SAE evaluation, got: {index}") from exc
 
-        boundary_module = build_boundary_sae_module(
-            model_id=model_id,
-            source=source,
-            feature_index=feature_index,
-            hf_model_name=hf_model_name,
-            sae_path=sae_path,
-            sae_layer=sae_layer,
-            sae_variant=sae_variant,
-            sae_name=sae_name,
-            sae_release=sae_release,
-            sae_average_l0=sae_average_l0,
-            sae_canonical_map=sae_canonical_map,
-            sae_device=sae_device,
-        )
+        try:
+            boundary_module = build_boundary_sae_module(
+                model_id=model_id,
+                source=source,
+                feature_index=feature_index,
+                hf_model_name=hf_model_name,
+                sae_path=sae_path,
+                sae_layer=sae_layer,
+                sae_variant=sae_variant,
+                sae_name=sae_name,
+                sae_release=sae_release,
+                sae_average_l0=sae_average_l0,
+                sae_canonical_map=sae_canonical_map,
+                sae_device=sae_device,
+            )
 
-        boundary_contexts = generate_boundary_contexts(
-            client=client,
-            model=boundary_llm_model or llm_model,
-            explanation=my_explanation,
-            boundary_case_count=boundary_case_count,
-            max_tokens=boundary_max_tokens,
-            llm_io_logger=_append_llm_io_log,
-        )
-        boundary_score = evaluate_boundary_with_sae(
-            contexts=boundary_contexts,
-            explanation=my_explanation,
-            model_id=model_id,
-            source=source,
-            feature_index=feature_index,
-            activation_threshold=boundary_activation_threshold,
-            hf_model_name=hf_model_name,
-            sae_path=sae_path,
-            sae_layer=sae_layer,
-            sae_variant=sae_variant,
-            sae_device=sae_device,
-            module=boundary_module,
-        )
+            boundary_contexts = generate_boundary_contexts(
+                client=client,
+                model=boundary_llm_model or llm_model,
+                explanation=my_explanation,
+                boundary_case_count=boundary_case_count,
+                max_tokens=boundary_max_tokens,
+                llm_io_logger=_append_llm_io_log,
+            )
+            boundary_score = evaluate_boundary_with_sae(
+                contexts=boundary_contexts,
+                explanation=my_explanation,
+                model_id=model_id,
+                source=source,
+                feature_index=feature_index,
+                activation_threshold=boundary_activation_threshold,
+                hf_model_name=hf_model_name,
+                sae_path=sae_path,
+                sae_layer=sae_layer,
+                sae_variant=sae_variant,
+                sae_device=sae_device,
+                module=boundary_module,
+            )
 
-        if use_reference_cache:
-            boundary_reference_scores = [
-                _to_boundary_score(item)
-                for item in boundary_reference_scores_raw
-                if isinstance(item, dict)
-            ]
-        else:
-            for exp in reference_explanations:
-                ref_boundary_contexts = generate_boundary_contexts(
-                    client=client,
-                    model=boundary_llm_model or llm_model,
-                    explanation=exp,
-                    boundary_case_count=boundary_case_count,
-                    max_tokens=boundary_max_tokens,
-                    llm_io_logger=_append_llm_io_log,
-                )
-                ref_boundary_score = evaluate_boundary_with_sae(
-                    contexts=ref_boundary_contexts,
-                    explanation=exp,
-                    model_id=model_id,
-                    source=source,
-                    feature_index=feature_index,
-                    activation_threshold=boundary_activation_threshold,
-                    hf_model_name=hf_model_name,
-                    sae_path=sae_path,
-                    sae_layer=sae_layer,
-                    sae_variant=sae_variant,
-                    sae_device=sae_device,
-                    module=boundary_module,
-                )
-                boundary_reference_scores.append(ref_boundary_score)
+            if use_reference_cache:
+                boundary_reference_scores = [
+                    _to_boundary_score(item)
+                    for item in boundary_reference_scores_raw
+                    if isinstance(item, dict)
+                ]
+            else:
+                for exp in reference_explanations:
+                    ref_boundary_contexts = generate_boundary_contexts(
+                        client=client,
+                        model=boundary_llm_model or llm_model,
+                        explanation=exp,
+                        boundary_case_count=boundary_case_count,
+                        max_tokens=boundary_max_tokens,
+                        llm_io_logger=_append_llm_io_log,
+                    )
+                    ref_boundary_score = evaluate_boundary_with_sae(
+                        contexts=ref_boundary_contexts,
+                        explanation=exp,
+                        model_id=model_id,
+                        source=source,
+                        feature_index=feature_index,
+                        activation_threshold=boundary_activation_threshold,
+                        hf_model_name=hf_model_name,
+                        sae_path=sae_path,
+                        sae_layer=sae_layer,
+                        sae_variant=sae_variant,
+                        sae_device=sae_device,
+                        module=boundary_module,
+                    )
+                    boundary_reference_scores.append(ref_boundary_score)
+        except Exception as exc:
+            boundary_warning = (
+                "Boundary scoring disabled because SAE failed to initialize: "
+                f"{exc}"
+            )
+            print(f"[WARN] {boundary_warning}")
+            enable_boundary_score = False
 
     details: List[ExplanationScore] = []
     non_activation_details: List[NonActivationExplanationScore] = []
@@ -1303,6 +1312,7 @@ def compare_with_neuronpedia_explanations(
             "hit": use_reference_cache,
             "signature_hash": cache_hash,
         },
+        "boundary_warning": boundary_warning,
     }
 
     activation_case_results = [
@@ -1377,6 +1387,7 @@ def compare_with_neuronpedia_explanations(
             "hit": use_reference_cache,
             "signature_hash": cache_hash,
         },
+        "boundary_warning": boundary_warning,
     }
 
     if not use_reference_cache:
@@ -1596,8 +1607,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--sae-variant",
-        default="average_l0_105",
-        help="Backward-compatible SAE variant name when SAE path is inferred.",
+        default=None,
+        help="Optional SAE variant name (e.g. average_l0_105) when SAE path is inferred.",
     )
     parser.add_argument(
         "--sae-name",

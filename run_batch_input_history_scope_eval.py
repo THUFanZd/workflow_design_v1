@@ -29,6 +29,7 @@ class RunRecord:
     layer_id: int
     feature_id: int
     history_scope: str
+    merge_enabled: bool
     timestamp: str
     workflow_returncode: int
     evaluation_returncode: int | None
@@ -225,20 +226,22 @@ def main() -> None:
     print("Selected features:")
     for layer_id, feature_id in selection:
         print(f"- layer={layer_id}, feature={feature_id}")
-    
-    selection = [(0, 414)]
+
     records: List[RunRecord] = []
-    tasks = [
-        (layer_id, feature_id, history_scope)
-        for layer_id, feature_id in selection
-        for history_scope in HISTORY_SCOPES
-    ]
-    for layer_id, feature_id, history_scope in tqdm(
+    tasks: List[Tuple[int, int, str, bool]] = []
+    for layer_id, feature_id in selection:
+        tasks.extend(
+            (layer_id, feature_id, history_scope, False)
+            for history_scope in HISTORY_SCOPES
+        )
+        tasks.append((layer_id, feature_id, "all_hypotheses", True))
+    for layer_id, feature_id, history_scope, merge_enabled in tqdm(
         tasks,
         desc="Batch input history scope eval",
         unit="task",
     ):
-            timestamp = f"{now_tag}_l{layer_id}_f{feature_id}_{history_scope}"
+            merge_tag = "_merge" if merge_enabled else ""
+            timestamp = f"{now_tag}_l{layer_id}_f{feature_id}_{history_scope}{merge_tag}"
             workflow_cmd = [
                 str(args.python_exe),
                 str(PROJECT_ROOT / "workflow_runner.py"),
@@ -271,6 +274,8 @@ def main() -> None:
                 "--timestamp",
                 timestamp,
             ]
+            if merge_enabled:
+                workflow_cmd.append("--enable-hypothesis-merge")
             if args.top_m is not None:
                 workflow_cmd.extend(["--top-m", str(args.top_m)])
             workflow_code, workflow_seconds = _run_command(workflow_cmd, dry_run=bool(args.dry_run))
@@ -314,6 +319,7 @@ def main() -> None:
                 layer_id=layer_id,
                 feature_id=feature_id,
                 history_scope=history_scope,
+                merge_enabled=merge_enabled,
                 timestamp=timestamp,
                 workflow_returncode=workflow_code,
                 evaluation_returncode=evaluation_code,
