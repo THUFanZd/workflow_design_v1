@@ -90,6 +90,14 @@ def _run_command(cmd: Sequence[str], *, dry_run: bool) -> Tuple[int, float]:
     return completed.returncode, time.perf_counter() - started
 
 
+def _load_single_summary(summary_path: Path) -> dict:
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        raise ValueError(f"Invalid summary format in {summary_path}")
+    return summary
+
+
 def _save_manifest(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -242,13 +250,24 @@ def main() -> None:
     ):
             merge_tag = "_merge" if merge_enabled else ""
             timestamp = f"{now_tag}_l{layer_id}_f{feature_id}_{history_scope}{merge_tag}"
-            workflow_cmd = [
+            single_summary_path = (
+                PROJECT_ROOT
+                / "logs"
+                / "batch_input_history_scope_eval_single_summaries"
+                / now_tag
+                / f"l{layer_id}_f{feature_id}_{history_scope}{merge_tag}.json"
+            )
+            single_cmd = [
                 str(args.python_exe),
-                str(PROJECT_ROOT / "workflow_runner.py"),
+                str(PROJECT_ROOT / "run_single_input_history_scope_eval.py"),
                 "--layer-id",
                 str(layer_id),
                 "--feature-id",
                 str(feature_id),
+                "--summary-output",
+                str(single_summary_path),
+                "--timestamp",
+                timestamp,
                 "--side",
                 "input",
                 "--history-scope",
@@ -271,50 +290,43 @@ def main() -> None:
                 str(args.observation_m),
                 "--observation-n",
                 str(args.observation_n),
-                "--timestamp",
-                timestamp,
+                "--sae-name",
+                str(args.sae_name),
+                "--final-run-mode",
+                str(args.final_run_mode),
+                "--input-max-explanations",
+                str(args.input_max_explanations),
+                "--input-selection-method",
+                str(args.input_selection_method),
+                "--input-m",
+                str(args.input_m),
+                "--input-n",
+                str(args.input_n),
+                "--input-non-activation-context-count",
+                str(args.input_non_activation_context_count),
             ]
             if merge_enabled:
-                workflow_cmd.append("--enable-hypothesis-merge")
+                single_cmd.append("--enable-hypothesis-merge")
             if args.top_m is not None:
-                workflow_cmd.extend(["--top-m", str(args.top_m)])
-            workflow_code, workflow_seconds = _run_command(workflow_cmd, dry_run=bool(args.dry_run))
+                single_cmd.extend(["--top-m", str(args.top_m)])
+            if bool(args.force_run_input_eval):
+                single_cmd.append("--force-run-input-eval")
+            single_returncode, _ = _run_command(single_cmd, dry_run=bool(args.dry_run))
 
-            evaluation_code: int | None = None
+            workflow_code = 0 if bool(args.dry_run) else single_returncode
+            evaluation_code: int | None = 0 if bool(args.dry_run) else (0 if single_returncode == 0 else None)
+            workflow_seconds = 0.0
             evaluation_seconds = 0.0
-            if workflow_code == 0:
-                evaluation_cmd = [
-                    str(args.python_exe),
-                    str(PROJECT_ROOT / "final_explanation_evaluation_runner.py"),
-                    "--layer-id",
-                    str(layer_id),
-                    "--feature-id",
-                    str(feature_id),
-                    "--timestamp",
-                    timestamp,
-                    "--sae-name",
-                    str(args.sae_name),
-                    "--width",
-                    str(args.width),
-                    "--run-mode",
-                    str(args.final_run_mode),
-                    "--input-max-explanations",
-                    str(args.input_max_explanations),
-                    "--input-selection-method",
-                    str(args.input_selection_method),
-                    "--input-m",
-                    str(args.input_m),
-                    "--input-n",
-                    str(args.input_n),
-                    "--input-non-activation-context-count",
-                    str(args.input_non_activation_context_count),
-                ]
-                if bool(args.force_run_input_eval):
-                    evaluation_cmd.append("--force-run-input-eval")
-                evaluation_code, evaluation_seconds = _run_command(
-                    evaluation_cmd,
-                    dry_run=bool(args.dry_run),
-                )
+            if single_summary_path.exists():
+                try:
+                    single_summary = _load_single_summary(single_summary_path)
+                    workflow_code = int(single_summary.get("workflow_returncode", workflow_code))
+                    raw_eval_code = single_summary.get("evaluation_returncode")
+                    evaluation_code = None if raw_eval_code is None else int(raw_eval_code)
+                    workflow_seconds = float(single_summary.get("workflow_seconds", workflow_seconds))
+                    evaluation_seconds = float(single_summary.get("evaluation_seconds", evaluation_seconds))
+                except Exception as exc:  # noqa: BLE001
+                    print(f"WARNING: failed to parse single summary {single_summary_path}: {exc}")
             record = RunRecord(
                 layer_id=layer_id,
                 feature_id=feature_id,
