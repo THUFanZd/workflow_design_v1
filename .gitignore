@@ -14,3 +14,5 @@ explanation_quality_evaluation/output-side-evaluation/gemmascope-res
 explanation_quality_evaluation/output-side-evaluation/outputs
 explanation_quality_evaluation/input-side-evaluation/outputs
 explanation_quality_evaluation/input-side-evaluation/gemmascope-res
+chat_with_local_gemma.py
+steer_playground/output
