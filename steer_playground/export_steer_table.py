@@ -118,6 +118,18 @@ def _fmt_number(v: Any, digits: int = 6) -> str:
     return str(v)
 
 
+def _clean_max_activation_token(token: Any) -> str:
+    s = str(token)
+    # Recover common mojibake where SentencePiece marker "▁" was decoded with GBK/CP936.
+    try:
+        repaired = s.encode("gbk").decode("utf-8")
+    except UnicodeError:
+        repaired = s
+    if "▁" in repaired:
+        s = repaired
+    return s.replace("▁", "")
+
+
 def _load_json(path: Path) -> Dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -133,7 +145,7 @@ def _rows_from_result(path: Path, payload: Dict[str, Any], preview_chars: int) -
     feature_id = metadata.get("feature_id", "")
     np_source = str(neuronpedia.get("source", ""))
     feature_explanation = str(neuronpedia.get("feature_explanation", ""))
-    np_max_token = str(neuronpedia.get("max_activation_token", ""))
+    np_max_token = _clean_max_activation_token(neuronpedia.get("max_activation_token", ""))
     np_max_value = _fmt_number(neuronpedia.get("max_activation_value"))
 
     prompt_results = payload.get("prompt_results", [])

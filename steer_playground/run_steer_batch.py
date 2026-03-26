@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
 import json
 import os
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
     from model_with_sae import ModelWithSAEModule
 
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "steer_playground" / "output"
+CLEAN_OUTPUT_CACHE_JSON = DEFAULT_OUTPUT_ROOT / "clean_output_cache.json"
+CLEAN_OUTPUT_CACHE_CSV = DEFAULT_OUTPUT_ROOT / "clean_output_cache.csv"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -52,6 +55,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument(
+        "--intervention-scope",
+        type=str,
+        choices=("all_tokens", "last_token_only"),
+        default="all_tokens",
+        help="Scope for feature intervention during steered decoding.",
+    )
     parser.add_argument("--sae-release", type=str, default=None)
     parser.add_argument("--width", type=str, default=None)
     parser.add_argument(
@@ -139,11 +149,29 @@ def _resolve_jobs_files(args: argparse.Namespace) -> List[Path]:
 
     paths: List[Path] = []
     for layer_id, feature_id in pairs:
-        path = Path(args.output_root) / str(layer_id) / str(feature_id) / "batch_jobs.json"
-        if not path.exists():
-            raise FileNotFoundError(f"jobs file not found: {path}")
-        paths.append(path)
+        feature_dir = Path(args.output_root) / str(layer_id) / str(feature_id)
+        candidate_paths = [
+            feature_dir / str(args.intervention_scope) / "batch_jobs.json",
+            feature_dir / "batch_jobs.json",
+            feature_dir / "all_tokens" / "batch_jobs.json",
+        ]
+        resolved = next((p for p in candidate_paths if p.exists()), None)
+        if resolved is None:
+            raise FileNotFoundError(
+                "jobs file not found. tried: "
+                + ", ".join(str(p) for p in candidate_paths)
+            )
+        paths.append(resolved)
     return paths
+
+
+def _resolve_run_output_dir(jobs_path: Path, intervention_scope: str) -> Path:
+    parent = jobs_path.parent
+    if parent.name in ("all_tokens", "last_token_only"):
+        feature_dir = parent.parent
+    else:
+        feature_dir = parent
+    return feature_dir / str(intervention_scope)
 
 
 def _load_jobs(path: Path) -> Dict[str, Any]:
@@ -158,6 +186,160 @@ def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(str(tmp), str(path))
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8", newline="")
+    os.replace(str(tmp), str(path))
+
+
+def _build_clean_cache_key(
+    *,
+    llm_name: str,
+    prompt_kind: str,
+    prompt_text: str,
+    temperature: float,
+    max_new_tokens: int,
+) -> str:
+    payload = {
+        "llm_name": str(llm_name),
+        "prompt_kind": str(prompt_kind),
+        "prompt_text": str(prompt_text),
+        "temperature": float(temperature),
+        "max_new_tokens": int(max_new_tokens),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _load_clean_output_cache(path: Path) -> Dict[str, Dict[str, Any]]:
+    if not path.exists():
+        return {}
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return {}
+
+    entries = payload.get("entries", [])
+    if not isinstance(entries, list):
+        return {}
+
+    cache: Dict[str, Dict[str, Any]] = {}
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("cache_key")
+        clean_output = item.get("clean_output")
+        if not isinstance(key, str) or not isinstance(clean_output, dict):
+            continue
+        cache[key] = item
+    return cache
+
+
+def _serialize_clean_output_cache(cache: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    entries = [cache[key] for key in sorted(cache.keys())]
+    return {
+        "metadata": {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "entry_count": len(entries),
+        },
+        "entries": entries,
+    }
+
+
+def _write_clean_output_cache_json(path: Path, cache: Dict[str, Dict[str, Any]]) -> None:
+    _write_json_atomic(path, _serialize_clean_output_cache(cache))
+
+
+def _write_clean_output_cache_csv(path: Path, cache: Dict[str, Dict[str, Any]]) -> None:
+    fieldnames = [
+        "cache_key",
+        "llm_name",
+        "prompt_kind",
+        "prompt_text",
+        "temperature",
+        "max_new_tokens",
+        "completion_text",
+        "full_text",
+        "generated_token_count",
+    ]
+    rows = [cache[key] for key in sorted(cache.keys())]
+    from io import StringIO
+
+    buffer = StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        clean_output = row.get("clean_output", {})
+        writer.writerow(
+            {
+                "cache_key": row.get("cache_key", ""),
+                "llm_name": row.get("llm_name", ""),
+                "prompt_kind": row.get("prompt_kind", ""),
+                "prompt_text": row.get("prompt_text", ""),
+                "temperature": row.get("temperature", ""),
+                "max_new_tokens": row.get("max_new_tokens", ""),
+                "completion_text": clean_output.get("completion_text", ""),
+                "full_text": clean_output.get("full_text", ""),
+                "generated_token_count": clean_output.get("generated_token_count", ""),
+            }
+        )
+    _write_text_atomic(path, buffer.getvalue())
+
+
+def _persist_clean_output_cache(
+    json_path: Path,
+    csv_path: Path,
+    cache: Dict[str, Dict[str, Any]],
+) -> None:
+    _write_clean_output_cache_json(json_path, cache)
+    _write_clean_output_cache_csv(csv_path, cache)
+
+
+def _get_or_create_clean_output(
+    *,
+    cache: Dict[str, Dict[str, Any]],
+    cache_json_path: Path,
+    cache_csv_path: Path,
+    module: ModelWithSAEModule,
+    llm_name: str,
+    prompt_kind: str,
+    prompt_text: str,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float,
+) -> Tuple[Dict[str, Any], bool]:
+    cache_key = _build_clean_cache_key(
+        llm_name=llm_name,
+        prompt_kind=prompt_kind,
+        prompt_text=prompt_text,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return dict(cached["clean_output"]), True
+
+    clean_output = _generate_text_from_input(
+        module,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+    )
+    cache[cache_key] = {
+        "cache_key": cache_key,
+        "llm_name": str(llm_name),
+        "prompt_kind": str(prompt_kind),
+        "prompt_text": str(prompt_text),
+        "temperature": float(temperature),
+        "max_new_tokens": int(max_new_tokens),
+        "clean_output": clean_output,
+    }
+    _persist_clean_output_cache(cache_json_path, cache_csv_path, cache)
+    return dict(clean_output), False
 
 
 def _sample_next_token(last_logits: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -216,18 +398,8 @@ def _compute_kl_for_value(
     attention_mask: torch.Tensor,
     feature_id: int,
     steer_value: float,
+    intervention_scope: str,
 ) -> float:
-    if module.use_hooked_transformer and "__sae_lens_obj__" in module.sae:
-        sae_obj = module.sae["__sae_lens_obj__"]
-        return float(
-            module._compute_kl_for_value(
-                tokens=input_ids,
-                value=float(steer_value),
-                feature_index=int(feature_id),
-                sae_obj=sae_obj,
-            )
-        )
-
     clean_logits = module.run_logits(input_ids=input_ids, attention_mask=attention_mask)
     steered_logits = module.run_logits_with_feature_intervention(
         input_ids=input_ids,
@@ -235,6 +407,7 @@ def _compute_kl_for_value(
         value=float(steer_value),
         mode="add",
         attention_mask=attention_mask,
+        intervention_scope=str(intervention_scope),
     )
     return _mean_logits_kl(clean_logits, steered_logits, attention_mask)
 
@@ -286,30 +459,65 @@ def _find_steer_value_for_target_kl(
     module: ModelWithSAEModule,
     *,
     input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
     feature_id: int,
     target_kl: float,
     tolerance: float,
     max_steps: int,
+    intervention_scope: str,
 ) -> Tuple[float, float]:
-    if not (module.use_hooked_transformer and "__sae_lens_obj__" in module.sae):
-        raise RuntimeError(
-            "KL target search requires HookedSAETransformer + SAE-Lens object "
-            "(same KL definition as intervention_blind_score.py)."
-        )
-    sae_obj = module.sae["__sae_lens_obj__"]
-    clamp_values, kl_values = module._find_clamp_values_for_kl(
-        input_ids,
-        int(feature_id),
-        sae_obj,
-        target_kl=float(target_kl),
-        tolerance=float(tolerance),
-        max_steps=int(max_steps),
+    direction = 1.0 if float(target_kl) > 0 else -1.0
+    target = abs(float(target_kl))
+
+    low_mag = 0.0
+    high_mag = 1.0
+    high_kl = _compute_kl_for_value(
+        module,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        feature_id=feature_id,
+        steer_value=direction * high_mag,
+        intervention_scope=intervention_scope,
     )
-    if not clamp_values:
-        raise RuntimeError(f"Failed to find steer value for target KL={target_kl}.")
-    steer_value = float(clamp_values[0])
-    achieved_kl = float(kl_values[0]) if kl_values else float("nan")
-    return steer_value, achieved_kl
+
+    max_abs_value = 1_000.0
+    while high_kl < target and high_mag < max_abs_value:
+        low_mag = high_mag
+        high_mag = min(high_mag * 2.0, max_abs_value)
+        high_kl = _compute_kl_for_value(
+            module,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            feature_id=feature_id,
+            steer_value=direction * high_mag,
+            intervention_scope=intervention_scope,
+        )
+        if high_mag >= max_abs_value:
+            break
+
+    best_mag = high_mag
+    best_kl = high_kl
+
+    for _ in range(max(0, int(max_steps))):
+        mid_mag = 0.5 * (low_mag + high_mag)
+        mid_kl = _compute_kl_for_value(
+            module,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            feature_id=feature_id,
+            steer_value=direction * mid_mag,
+            intervention_scope=intervention_scope,
+        )
+        best_mag = mid_mag
+        best_kl = mid_kl
+        if abs(mid_kl - target) <= float(tolerance):
+            break
+        if mid_kl < target:
+            low_mag = mid_mag
+        else:
+            high_mag = mid_mag
+
+    return direction * float(best_mag), float(best_kl)
 
 
 @torch.no_grad()
@@ -322,6 +530,7 @@ def _generate_text_from_input(
     temperature: float,
     feature_id: Optional[int] = None,
     steer_value: Optional[float] = None,
+    intervention_scope: str = "all_tokens",
 ) -> Dict[str, Any]:
     tokens = input_ids.clone()
     mask = attention_mask.clone()
@@ -338,6 +547,7 @@ def _generate_text_from_input(
                 value=float(steer_value),
                 mode="add",
                 attention_mask=mask,
+                intervention_scope=str(intervention_scope),
             )
         next_logits = logits[:, -1, :]
         next_token = _sample_next_token(next_logits, temperature=float(temperature))
@@ -364,6 +574,10 @@ def main() -> None:
     from model_with_sae import ModelWithSAEModule
 
     jobs_paths = _resolve_jobs_files(args)
+    cache_root = Path(args.output_root)
+    clean_cache_json_path = cache_root / CLEAN_OUTPUT_CACHE_JSON.name
+    clean_cache_csv_path = cache_root / CLEAN_OUTPUT_CACHE_CSV.name
+    clean_output_cache = _load_clean_output_cache(clean_cache_json_path)
     run_summaries: List[Dict[str, Any]] = []
     shared_model: Any = None
     shared_tokenizer: Any = None
@@ -451,15 +665,19 @@ def main() -> None:
                 "clean_mode": "base_model",
                 "temperature": temperature,
                 "max_new_tokens": max_new_tokens,
+                "intervention_scope": str(args.intervention_scope),
                 "kl_tolerance": float(args.kl_tolerance),
                 "kl_max_steps": int(args.kl_max_steps),
                 "enable_target_kl": bool(args.enable_target_kl),
+                "clean_output_cache_json": str(clean_cache_json_path),
+                "clean_output_cache_csv": str(clean_cache_csv_path),
             },
             "neuronpedia": jobs.get("neuronpedia", {}),
             "prompt_results": [],
         }
-        progress_path = jobs_path.parent / str(args.progress_filename)
-        partial_path = jobs_path.parent / str(args.partial_filename)
+        run_output_dir = _resolve_run_output_dir(jobs_path, str(args.intervention_scope))
+        progress_path = run_output_dir / str(args.progress_filename)
+        partial_path = run_output_dir / str(args.partial_filename)
         steps_per_prompt = 1 + len(target_kl_values) + len(scaled_values)
         total_steps = max(1, len(prompt_specs) * steps_per_prompt)
         completed_steps = 0
@@ -497,10 +715,16 @@ def main() -> None:
                 prompt_text=prompt_text,
             )
 
-            clean_output = _generate_text_from_input(
-                module,
+            clean_output, clean_output_cache_hit = _get_or_create_clean_output(
+                cache=clean_output_cache,
+                cache_json_path=clean_cache_json_path,
+                cache_csv_path=clean_cache_csv_path,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                module=module,
+                llm_name=llm_name,
+                prompt_kind=prompt_kind,
+                prompt_text=prompt_text,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
             )
@@ -521,10 +745,12 @@ def main() -> None:
                 steer_value, achieved_kl = _find_steer_value_for_target_kl(
                     module,
                     input_ids=input_ids,
+                    attention_mask=attention_mask,
                     feature_id=feature_id,
                     target_kl=target_kl_float,
                     tolerance=float(args.kl_tolerance),
                     max_steps=int(args.kl_max_steps),
+                    intervention_scope=str(args.intervention_scope),
                 )
                 steered_output = _generate_text_from_input(
                     module,
@@ -534,10 +760,12 @@ def main() -> None:
                     temperature=temperature,
                     feature_id=feature_id,
                     steer_value=steer_value,
+                    intervention_scope=str(args.intervention_scope),
                 )
                 run_results.append(
                     {
                         "intervention_method": "target_kl",
+                        "intervention_scope": str(args.intervention_scope),
                         "target_kl": target_kl_float,
                         "steer_value": steer_value,
                         "achieved_kl": achieved_kl,
@@ -565,6 +793,7 @@ def main() -> None:
                     attention_mask=attention_mask,
                     feature_id=feature_id,
                     steer_value=steer_value,
+                    intervention_scope=str(args.intervention_scope),
                 )
                 steered_output = _generate_text_from_input(
                     module,
@@ -574,10 +803,12 @@ def main() -> None:
                     temperature=temperature,
                     feature_id=feature_id,
                     steer_value=steer_value,
+                    intervention_scope=str(args.intervention_scope),
                 )
                 run_results.append(
                     {
                         "intervention_method": "scaled_max_activation",
+                        "intervention_scope": str(args.intervention_scope),
                         "scale": scale,
                         "steer_value": steer_value,
                         "achieved_kl": achieved_kl,
@@ -600,13 +831,14 @@ def main() -> None:
                     "prompt_kind": prompt_kind,
                     "prompt_source": prompt_source,
                     "prompt_text": prompt_text,
+                    "clean_output_cache_hit": bool(clean_output_cache_hit),
                     "clean_output": clean_output,
                     "interventions": run_results,
                 }
             )
             _write_json_atomic(partial_path, result_payload)
 
-        result_path = jobs_path.parent / str(args.result_filename)
+        result_path = run_output_dir / str(args.result_filename)
         _write_json_atomic(result_path, result_payload)
         progress_payload["metadata"]["updated_at"] = datetime.now().isoformat(timespec="seconds")
         progress_payload["progress"] = {

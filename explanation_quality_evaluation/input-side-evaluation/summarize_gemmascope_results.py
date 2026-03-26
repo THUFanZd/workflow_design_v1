@@ -5,21 +5,19 @@ import argparse
 import csv
 import json
 import math
+import re
 import statistics
 from pathlib import Path
-import re
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ROOT = Path(__file__).resolve().parent / "outputs" / "gemmascope-res"
 DEFAULT_PLOTS_DIR = DEFAULT_ROOT / "summary_plots"
+DEFAULT_ROUND_PLOTS_DIR = DEFAULT_PLOTS_DIR / "round_trends"
 
-DEFAULT_SCORE_FIELDS = [
-    "activation_relative_quality_score",
-    "activation_adherence",
-    "non_activation_relative_quality_score",
-    "non_activation_adherence",
-    "boundary_relative_quality_score",
+DEFAULT_METRIC_FIELDS = [
+    "relative_quality_score_non_zero_rate",
+    "relative_quality_score_boundary_non_activation_rate",
 ]
 
 DEFAULT_TOKEN_FIELDS = [
@@ -37,15 +35,15 @@ FEATURE_PATTERN = re.compile(r"^feature-(\d+)$")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Summarize gemmascope input-side evaluation results, compare modes, "
-            "and visualize score/token usage."
+            "Summarize gemmascope input-side final-evaluation results, compare modes, "
+            "and visualize score/token usage and per-round score trends."
         )
     )
     parser.add_argument(
         "--root",
         type=Path,
         default=DEFAULT_ROOT,
-        help="Root folder that contains layer-*/feature-*/.../evaluation_record.json.",
+        help="Root folder that contains layer-*/feature-*/.../result.json.",
     )
     parser.add_argument(
         "--details-out",
@@ -78,10 +76,16 @@ def parse_args() -> argparse.Namespace:
         help="Output folder for generated figures.",
     )
     parser.add_argument(
+        "--round-plots-dir",
+        type=Path,
+        default=DEFAULT_ROUND_PLOTS_DIR,
+        help="Output folder for per-run round trend figures.",
+    )
+    parser.add_argument(
         "--fields",
         nargs="+",
-        default=DEFAULT_SCORE_FIELDS,
-        help="Score fields to aggregate and visualize.",
+        default=DEFAULT_METRIC_FIELDS,
+        help="Relative-quality score fields to aggregate and visualize.",
     )
     return parser.parse_args()
 
@@ -209,64 +213,156 @@ def extract_workflow_fields(workflow_payload: dict[str, Any] | None) -> dict[str
     }
 
 
-def build_records(eval_record_paths: list[Path]) -> tuple[list[dict[str, Any]], list[tuple[Path, str]]]:
+def _extract_relative_metrics(payload: dict[str, Any]) -> dict[str, float | None]:
+    # New schema (workflow_style_sae_only result.json).
+    non_zero = coerce_float(payload.get("relative_quality_score_non_zero_rate"))
+    boundary = coerce_float(payload.get("relative_quality_score_boundary_non_activation_rate"))
+
+    # Backward compatibility: old compare_explanations_with_llm output.
+    if non_zero is None:
+        non_zero = coerce_float(payload.get("activation_relative_quality_score"))
+    if boundary is None:
+        boundary = coerce_float(payload.get("boundary_relative_quality_score"))
+
+    return {
+        "relative_quality_score_non_zero_rate": non_zero,
+        "relative_quality_score_boundary_non_activation_rate": boundary,
+    }
+
+
+def _extract_round_scores_from_execution(execution_payload: dict[str, Any]) -> tuple[float | None, float | None]:
+    input_side = execution_payload.get("input_side_execution", {})
+    if not isinstance(input_side, dict):
+        return None, None
+
+    hypothesis_results_raw = input_side.get("hypothesis_results", [])
+    hypothesis_results = [item for item in hypothesis_results_raw if isinstance(item, dict)]
+    if not hypothesis_results:
+        return (
+            coerce_float(input_side.get("overall_score_non_zero_rate")),
+            coerce_float(input_side.get("overall_score_boundary_non_activation_rate")),
+        )
+
+    def rank_key(item: dict[str, Any]) -> tuple[float, int]:
+        score_non_zero = coerce_float(item.get("score_non_zero_rate")) or 0.0
+        score_boundary = coerce_float(item.get("score_boundary_non_activation_rate")) or 0.0
+        combined = score_non_zero + score_boundary
+        hypothesis_index = int(item.get("hypothesis_index", 10**9))
+        return combined, -hypothesis_index
+
+    best = max(hypothesis_results, key=rank_key)
+    return (
+        coerce_float(best.get("score_non_zero_rate")),
+        coerce_float(best.get("score_boundary_non_activation_rate")),
+    )
+
+
+def load_round_series(
+    *,
+    layer: int | None,
+    feature: int | None,
+    run_dir: str,
+    workflow_payload: dict[str, Any] | None,
+    cache: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    if layer is None or feature is None:
+        return []
+    workflow_path = expected_workflow_result_path(layer, feature, run_dir)
+    if workflow_path is None:
+        return []
+    cache_key = str(workflow_path)
+    if cache_key in cache:
+        return cache[cache_key]
+    if not workflow_path.exists():
+        cache[cache_key] = []
+        return []
+
+    workflow_dir = workflow_path.parents[1]
+    executed_rounds = 0
+    if isinstance(workflow_payload, dict):
+        maybe_executed = workflow_payload.get("executed_rounds")
+        if isinstance(maybe_executed, int):
+            executed_rounds = max(0, maybe_executed)
+
+    series: list[dict[str, Any]] = []
+    for round_index in range(0, executed_rounds + 1):
+        execution_path = (
+            workflow_dir
+            / f"round_{round_index}"
+            / f"layer{layer}-feature{feature}-experiments-execution.json"
+        )
+        if not execution_path.exists():
+            continue
+        try:
+            execution_payload = load_json(execution_path)
+        except Exception:  # noqa: BLE001
+            continue
+
+        score_non_zero, score_boundary = _extract_round_scores_from_execution(execution_payload)
+        series.append(
+            {
+                "round_index": round_index,
+                "score_non_zero_rate": score_non_zero,
+                "score_boundary_non_activation_rate": score_boundary,
+            }
+        )
+
+    cache[cache_key] = series
+    return series
+
+
+def build_records(result_paths: list[Path]) -> tuple[list[dict[str, Any]], list[tuple[Path, str]]]:
     rows: list[dict[str, Any]] = []
     errors: list[tuple[Path, str]] = []
     workflow_cache: dict[str, dict[str, Any] | None] = {}
+    round_series_cache: dict[str, list[dict[str, Any]]] = {}
 
-    for eval_path in eval_record_paths:
+    for result_path in result_paths:
         try:
-            payload = load_json(eval_path)
+            payload = load_json(result_path)
         except Exception as exc:  # noqa: BLE001
-            errors.append((eval_path, str(exc)))
+            errors.append((result_path, str(exc)))
             continue
 
-        scores = payload.get("scores")
-        if not isinstance(scores, dict):
-            scores = {}
+        # Skip files that are clearly not the per-run input evaluation result.
+        if (
+            "relative_quality_score_non_zero_rate" not in payload
+            and "activation_relative_quality_score" not in payload
+            and "boundary_relative_quality_score" not in payload
+            and "scores" not in payload
+        ):
+            continue
 
-        layer, feature = extract_layer_feature(eval_path)
-        feature_payload = payload.get("feature")
-        if isinstance(feature_payload, dict):
-            source_text = str(feature_payload.get("source", ""))
-            source_head = source_text.split("-")[0]
-            index_text = str(feature_payload.get("index", ""))
-            if layer is None and source_head.isdigit():
-                layer = int(source_head)
-            if feature is None and index_text.isdigit():
-                feature = int(index_text)
-
-        run_dir = eval_path.parent.name
+        layer, feature = extract_layer_feature(result_path)
+        run_dir = result_path.parent.name
         mode = detect_hypothesis_mode(run_dir)
 
         workflow_payload, workflow_path = load_workflow_result(layer, feature, run_dir, workflow_cache)
         workflow_fields = extract_workflow_fields(workflow_payload)
-
-        hypothesis = payload.get("hypothesis", "")
-        reference_hypotheses = payload.get("reference_explanations", [])
-        if reference_hypotheses is None:
-            reference_hypotheses = []
-        if not isinstance(reference_hypotheses, list):
-            reference_hypotheses = [reference_hypotheses]
+        relative_metrics = _extract_relative_metrics(payload)
+        round_series = load_round_series(
+            layer=layer,
+            feature=feature,
+            run_dir=run_dir,
+            workflow_payload=workflow_payload,
+            cache=round_series_cache,
+        )
 
         row: dict[str, Any] = {
             "layer": layer,
             "feature": feature,
             "run_dir": run_dir,
             "hypothesis_mode": mode,
-            "my_hypothesis": str(hypothesis) if hypothesis is not None else "",
-            "neuronpedia_hypotheses": safe_json_text(reference_hypotheses),
-            "scores": safe_json_text(scores),
-            "evaluation_record_path": str(eval_path),
+            "evaluation_result_path": str(result_path),
             "workflow_final_result_path": workflow_path or "",
-            "__scores_obj__": scores,
+            "relative_quality_score_non_zero_rate": relative_metrics["relative_quality_score_non_zero_rate"],
+            "relative_quality_score_boundary_non_activation_rate": relative_metrics[
+                "relative_quality_score_boundary_non_activation_rate"
+            ],
+            "round_score_series": safe_json_text(round_series),
+            "__round_series_obj__": round_series,
         }
-
         row.update(workflow_fields)
-
-        for score_key, score_value in scores.items():
-            row[score_key] = score_value
-
         rows.append(row)
 
     return rows, errors
@@ -279,8 +375,7 @@ def build_stats(rows: list[dict[str, Any]], fields: list[str], *, field_type: st
     for field in fields:
         numeric_values: list[float] = []
         for row in rows:
-            value = row.get(field)
-            numeric = coerce_float(value)
+            numeric = coerce_float(row.get(field))
             if numeric is not None:
                 numeric_values.append(numeric)
 
@@ -426,6 +521,12 @@ def _mode_label(mode: str) -> str:
     return mapping.get(mode, mode)
 
 
+def _safe_filename(text: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*]+', "_", text)
+    cleaned = cleaned.strip().replace(" ", "_")
+    return cleaned or "unknown"
+
+
 def plot_score_boxplots(rows: list[dict[str, Any]], score_fields: list[str], output_path: Path) -> bool:
     try:
         import matplotlib.pyplot as plt
@@ -464,13 +565,13 @@ def plot_score_boxplots(rows: list[dict[str, Any]], score_fields: list[str], out
         ax.boxplot(series, labels=labels, showmeans=True)
         ax.set_title(field)
         ax.set_xlabel("Hypothesis mode")
-        ax.set_ylabel("Score")
+        ax.set_ylabel("Relative quality")
         ax.grid(axis="y", linestyle="--", alpha=0.3)
 
     for idx in range(n, len(axes_flat)):
         axes_flat[idx].axis("off")
 
-    fig.suptitle("Score Comparison Across Hypothesis Modes", fontsize=14)
+    fig.suptitle("Relative-Quality Score Comparison Across Hypothesis Modes", fontsize=14)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
@@ -532,6 +633,54 @@ def plot_token_usage_bars(rows: list[dict[str, Any]], token_fields: list[str], o
     return True
 
 
+def plot_round_trends_per_run(rows: list[dict[str, Any]], output_dir: Path) -> int:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:  # noqa: BLE001
+        return 0
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    created = 0
+    for row in rows:
+        series_raw = row.get("__round_series_obj__")
+        series = [item for item in series_raw if isinstance(item, dict)] if isinstance(series_raw, list) else []
+        if not series:
+            continue
+
+        rounds: list[int] = []
+        non_zero_vals: list[float | None] = []
+        boundary_vals: list[float | None] = []
+        for item in sorted(series, key=lambda x: int(x.get("round_index", 0))):
+            rounds.append(int(item.get("round_index", 0)))
+            non_zero_vals.append(coerce_float(item.get("score_non_zero_rate")))
+            boundary_vals.append(coerce_float(item.get("score_boundary_non_activation_rate")))
+
+        if not rounds:
+            continue
+
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.plot(rounds, non_zero_vals, marker="o", label="score_non_zero_rate")
+        ax.plot(rounds, boundary_vals, marker="o", label="score_boundary_non_activation_rate")
+        ax.set_xlabel("Round index")
+        ax.set_ylabel("Score")
+        ax.set_title(
+            f"Round Score Trend | layer={row.get('layer')} feature={row.get('feature')} "
+            f"mode={_mode_label(str(row.get('hypothesis_mode', 'unknown')))}"
+        )
+        ax.grid(axis="y", linestyle="--", alpha=0.3)
+        ax.legend()
+        ax.set_xticks(rounds)
+        fig.tight_layout()
+
+        filename = _safe_filename(
+            f"l{row.get('layer')}_f{row.get('feature')}_{row.get('run_dir')}_round_trend.png"
+        )
+        fig.savefig(output_dir / filename, dpi=160)
+        plt.close(fig)
+        created += 1
+    return created
+
+
 def main() -> int:
     args = parse_args()
     root = args.root.resolve()
@@ -540,42 +689,34 @@ def main() -> int:
     mode_score_out = args.mode_score_out or (root / "summary_mode_score_stats.csv")
     mode_token_out = args.mode_token_out or (root / "summary_mode_token_stats.csv")
     plots_dir = args.plots_dir.resolve()
+    round_plots_dir = args.round_plots_dir.resolve()
 
     if not root.exists():
         raise SystemExit(f"Root folder not found: {root}")
 
-    eval_record_paths = sorted(root.rglob("evaluation_record.json"))
-    if not eval_record_paths:
-        raise SystemExit(f"No evaluation_record.json found under: {root}")
+    result_paths = sorted(root.rglob("result.json"))
+    if not result_paths:
+        raise SystemExit(f"No result.json found under: {root}")
 
-    rows, errors = build_records(eval_record_paths)
+    rows, errors = build_records(result_paths)
     if not rows:
-        raise SystemExit("No valid evaluation records were parsed.")
-
-    score_keys = sorted(
-        {
-            key
-            for row in rows
-            for key in row["__scores_obj__"].keys()
-        }
-    )
+        raise SystemExit("No valid result records were parsed.")
 
     detail_headers = [
         "layer",
         "feature",
         "run_dir",
         "hypothesis_mode",
-        "my_hypothesis",
-        "neuronpedia_hypotheses",
+        "relative_quality_score_non_zero_rate",
+        "relative_quality_score_boundary_non_activation_rate",
         "workflow_best_hypothesis",
         "workflow_executed_rounds",
         "workflow_prompt_tokens",
         "workflow_completion_tokens",
         "workflow_total_tokens",
+        "round_score_series",
         "workflow_final_result_path",
-        "scores",
-        *score_keys,
-        "evaluation_record_path",
+        "evaluation_result_path",
     ]
     write_csv(details_out, rows, detail_headers)
 
@@ -642,12 +783,13 @@ def main() -> int:
         ],
     )
 
-    score_plot_path = plots_dir / "score_mode_boxplots.png"
+    score_plot_path = plots_dir / "relative_quality_mode_boxplots.png"
     token_plot_path = plots_dir / "token_usage_mode_bars.png"
     score_plot_ok = plot_score_boxplots(rows, args.fields, score_plot_path)
     token_plot_ok = plot_token_usage_bars(rows, DEFAULT_TOKEN_FIELDS, token_plot_path)
+    round_plot_count = plot_round_trends_per_run(rows, round_plots_dir)
 
-    print(f"Scanned records: {len(eval_record_paths)}")
+    print(f"Scanned result files: {len(result_paths)}")
     print(f"Valid records: {len(rows)}")
     print(f"Detail CSV: {details_out}")
     print(f"Overall stats CSV: {stats_out}")
@@ -661,6 +803,7 @@ def main() -> int:
         print(f"Token usage plot: {token_plot_path}")
     else:
         print("Token usage plot: skipped (matplotlib unavailable or no valid mode data)")
+    print(f"Per-run round trend plots: {round_plot_count} (dir: {round_plots_dir})")
 
     if errors:
         print(f"Parse errors: {len(errors)}")

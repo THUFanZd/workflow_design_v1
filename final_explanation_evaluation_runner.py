@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from function import build_default_sae_path
+from model_with_sae import ModelWithSAEModule
+from neuronpedia_feature_api import extract_explanations, fetch_feature_json
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -333,6 +338,421 @@ def _build_source(layer_id: str, sae_name: str, width: str) -> str:
     return f"{layer_id}-{sae_name}-{width}"
 
 
+def _restore_sentence(tokens: Sequence[Any]) -> str:
+    text = "".join(str(token) for token in tokens)
+    replacements = {
+        "\u2581": " ",
+        "\u0120": " ",
+        "\u010a": "\n",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    return " ".join(text.split())
+
+
+def _safe_max_token_from_activation(activation: Dict[str, Any]) -> str:
+    tokens = activation.get("tokens")
+    max_idx = activation.get("maxValueTokenIndex")
+    if not isinstance(tokens, list) or not isinstance(max_idx, int):
+        return ""
+    if max_idx < 0 or max_idx >= len(tokens):
+        return ""
+    token = tokens[max_idx]
+    return token if isinstance(token, str) else str(token)
+
+
+def _select_activation_contexts(
+    *,
+    feature_payload: Dict[str, Any],
+    selection_method: int,
+    m: int,
+    n: int,
+) -> List[str]:
+    if selection_method not in (1, 2, 3):
+        raise ValueError("selection_method must be 1, 2, or 3.")
+    if m < 0 or n < 0:
+        raise ValueError("m and n must be non-negative integers.")
+
+    activations_raw = feature_payload.get("activations") or []
+    activations: List[Dict[str, Any]] = [item for item in activations_raw if isinstance(item, dict)]
+
+    selected_indices: List[int] = []
+    if selection_method == 1:
+        total = len(activations)
+        first_count = min(m, total)
+        selected_indices = list(range(first_count))
+        for idx in range(first_count, total):
+            if len(selected_indices) >= first_count + n:
+                break
+            current_token = _safe_max_token_from_activation(activations[idx])
+            last_token = (
+                _safe_max_token_from_activation(activations[selected_indices[-1]])
+                if selected_indices
+                else ""
+            )
+            if current_token != last_token:
+                selected_indices.append(idx)
+        target = first_count + n
+        if len(selected_indices) < target:
+            for idx in range(first_count, total):
+                if len(selected_indices) >= target:
+                    break
+                if idx not in selected_indices:
+                    selected_indices.append(idx)
+    elif selection_method == 2:
+        for idx, item in enumerate(activations):
+            if not selected_indices:
+                selected_indices.append(idx)
+            else:
+                current_token = _safe_max_token_from_activation(item)
+                last_token = _safe_max_token_from_activation(activations[selected_indices[-1]])
+                if current_token != last_token:
+                    selected_indices.append(idx)
+            if len(selected_indices) >= n:
+                break
+    else:
+        count = min(m, len(activations))
+        selected_indices = list(range(count))
+
+    contexts: List[str] = []
+    for idx in selected_indices:
+        tokens = activations[idx].get("tokens") or []
+        context = _restore_sentence(tokens)
+        if context:
+            contexts.append(context)
+    return contexts
+
+
+def _select_non_activation_contexts(
+    *,
+    feature_payload: Dict[str, Any],
+    count: int,
+) -> List[str]:
+    if count <= 0:
+        raise ValueError("count must be positive.")
+    activations = feature_payload.get("activations") or []
+    tail = activations[-count:]
+    contexts: List[str] = []
+    for item in tail:
+        if not isinstance(item, dict):
+            continue
+        tokens = item.get("tokens") or []
+        context = _restore_sentence(tokens)
+        if context:
+            contexts.append(context)
+    return contexts
+
+
+_KEYWORD_STOPWORDS = {
+    "the", "and", "that", "this", "with", "from", "into", "about", "over", "under", "between",
+    "while", "where", "when", "what", "which", "their", "there", "have", "has", "were", "been",
+    "being", "them", "they", "these", "those", "will", "would", "could", "should", "your", "you",
+    "for", "are", "not", "but", "can", "all", "its", "our", "out", "any", "may", "than", "then",
+}
+
+
+def _extract_keywords(text: str, *, max_keywords: int = 12) -> List[str]:
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_'-]{2,}", text.lower())
+    seen: set[str] = set()
+    out: List[str] = []
+    for word in words:
+        if word in _KEYWORD_STOPWORDS:
+            continue
+        if word in seen:
+            continue
+        seen.add(word)
+        out.append(word)
+        if len(out) >= max_keywords:
+            break
+    return out
+
+
+def _rank_contexts_by_overlap(contexts: Sequence[str], keywords: Sequence[str]) -> List[str]:
+    if not contexts:
+        return []
+    if not keywords:
+        return list(contexts)
+    scored: List[Tuple[int, int, str]] = []
+    for idx, context in enumerate(contexts):
+        low = context.lower()
+        overlap = sum(1 for key in keywords if key in low)
+        scored.append((overlap, idx, context))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [item[2] for item in scored]
+
+
+def _generate_sentence_sets_for_reference(
+    *,
+    reference_explanation: str,
+    activation_candidates: Sequence[str],
+    boundary_candidates: Sequence[str],
+    activation_count: int,
+    boundary_count: int,
+) -> Tuple[List[str], List[str]]:
+    keywords = _extract_keywords(reference_explanation)
+    ranked_activation = _rank_contexts_by_overlap(activation_candidates, keywords)
+    ranked_boundary = _rank_contexts_by_overlap(boundary_candidates, keywords)
+    designed = [ctx for ctx in ranked_activation[: max(activation_count, 0)] if ctx]
+    boundary = [ctx for ctx in ranked_boundary[: max(boundary_count, 0)] if ctx]
+    return designed, boundary
+
+
+def _extract_max_token(trace: Dict[str, Any]) -> str:
+    tokens = trace.get("tokens")
+    max_token_index = trace.get("max_token_index")
+    if not isinstance(tokens, list) or not isinstance(max_token_index, int):
+        return ""
+    if max_token_index < 0 or max_token_index >= len(tokens):
+        return ""
+    token = tokens[max_token_index]
+    return token if isinstance(token, str) else str(token)
+
+
+def _run_sentence_batch_with_sae(
+    *,
+    module: ModelWithSAEModule,
+    sentences: Sequence[str],
+    non_zero_threshold: float,
+) -> Dict[str, Any]:
+    sentence_results: List[Dict[str, Any]] = []
+    non_zero_count = 0
+    activation_sum = 0.0
+    activation_max = 0.0
+
+    for sentence_index, sentence in enumerate(sentences, start=1):
+        trace = module.get_activation_trace(sentence)
+        activation_value = float(trace.get("summary_activation", 0.0) or 0.0)
+        activation_sum += activation_value
+        activation_max = max(activation_max, activation_value)
+        is_non_zero = activation_value > non_zero_threshold
+        if is_non_zero:
+            non_zero_count += 1
+        sentence_results.append(
+            {
+                "sentence_index": sentence_index,
+                "sentence": sentence,
+                "summary_activation": activation_value,
+                "summary_activation_mean": float(trace.get("summary_activation_mean", 0.0) or 0.0),
+                "summary_activation_sum": float(trace.get("summary_activation_sum", 0.0) or 0.0),
+                "max_token_index": int(trace.get("max_token_index", 0) or 0),
+                "max_token": _extract_max_token(trace),
+                "is_non_zero": is_non_zero,
+            }
+        )
+
+    total_sentences = len(sentences)
+    non_zero_rate = (non_zero_count / total_sentences) if total_sentences > 0 else 0.0
+    mean_activation = (activation_sum / total_sentences) if total_sentences > 0 else 0.0
+    return {
+        "sentence_results": sentence_results,
+        "non_zero_count": non_zero_count,
+        "total_sentences": total_sentences,
+        "score_non_zero_rate": non_zero_rate,
+        "mean_summary_activation": mean_activation,
+        "max_summary_activation": activation_max,
+    }
+
+
+def _extract_workflow_input_scores(
+    *,
+    selected_input: Dict[str, Any],
+    selected_input_cache_raw: Optional[Dict[str, Any]],
+    execution_payload: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if isinstance(selected_input_cache_raw, dict):
+        non_zero = selected_input_cache_raw.get("score_non_zero_rate")
+        boundary = selected_input_cache_raw.get("score_boundary_non_activation_rate")
+        if non_zero is not None and boundary is not None:
+            return {
+                "source": "workflow_input_side_cache.best_hypothesis",
+                "score_non_zero_rate": _safe_float(non_zero, 0.0),
+                "score_boundary_non_activation_rate": _safe_float(boundary, 0.0),
+                "combined_input_score": _safe_float(non_zero, 0.0) + _safe_float(boundary, 0.0),
+                "designed_sentences": list(selected_input_cache_raw.get("designed_sentences", []))
+                if isinstance(selected_input_cache_raw.get("designed_sentences"), list)
+                else [],
+                "boundary_sentences": list(selected_input_cache_raw.get("boundary_sentences", []))
+                if isinstance(selected_input_cache_raw.get("boundary_sentences"), list)
+                else [],
+            }
+
+    non_zero_sel = selected_input.get("score_non_zero_rate")
+    boundary_sel = selected_input.get("score_boundary_non_activation_rate")
+    if non_zero_sel is not None and boundary_sel is not None:
+        return {
+            "source": str(selected_input.get("source", "selected_input")),
+            "score_non_zero_rate": _safe_float(non_zero_sel, 0.0),
+            "score_boundary_non_activation_rate": _safe_float(boundary_sel, 0.0),
+            "combined_input_score": _safe_float(non_zero_sel, 0.0) + _safe_float(boundary_sel, 0.0),
+            "designed_sentences": [],
+            "boundary_sentences": [],
+        }
+
+    if isinstance(execution_payload, dict):
+        input_side = execution_payload.get("input_side_execution", {})
+        if isinstance(input_side, dict):
+            items_raw = input_side.get("hypothesis_results", [])
+            items = [item for item in items_raw if isinstance(item, dict)]
+            target_index = _safe_int(selected_input.get("hypothesis_index"), 0)
+            target_text = str(selected_input.get("hypothesis", "")).strip()
+            for item in items:
+                hypothesis_index = _safe_int(item.get("hypothesis_index"), 0)
+                hypothesis_text = str(item.get("hypothesis", "")).strip()
+                if target_index and hypothesis_index != target_index:
+                    continue
+                if target_text and hypothesis_text and hypothesis_text != target_text:
+                    continue
+                non_zero = item.get("score_non_zero_rate")
+                boundary = item.get("score_boundary_non_activation_rate")
+                if non_zero is None or boundary is None:
+                    continue
+                return {
+                    "source": "round_execution_input_side",
+                    "score_non_zero_rate": _safe_float(non_zero, 0.0),
+                    "score_boundary_non_activation_rate": _safe_float(boundary, 0.0),
+                    "combined_input_score": _safe_float(non_zero, 0.0) + _safe_float(boundary, 0.0),
+                    "designed_sentences": list(item.get("designed_sentences", []))
+                    if isinstance(item.get("designed_sentences"), list)
+                    else [],
+                    "boundary_sentences": list(item.get("boundary_sentences", []))
+                    if isinstance(item.get("boundary_sentences"), list)
+                    else [],
+                }
+
+    raise ValueError(
+        "Failed to recover workflow cached input-side SAE scores "
+        "(score_non_zero_rate / score_boundary_non_activation_rate)."
+    )
+
+
+def _evaluate_neuronpedia_input_with_sae(
+    *,
+    model_id: str,
+    source: str,
+    feature_id: int,
+    module: ModelWithSAEModule,
+    non_zero_threshold: float,
+    max_explanations: int,
+    selection_method: int,
+    m: int,
+    n: int,
+    non_activation_context_count: int,
+    activation_count_per_reference: int,
+    boundary_count_per_reference: int,
+    neuronpedia_api_key: Optional[str],
+    neuronpedia_timeout: int,
+) -> Dict[str, Any]:
+    payload = fetch_feature_json(
+        model_id=model_id,
+        source=source,
+        feature_id=str(feature_id),
+        api_key=neuronpedia_api_key,
+        timeout=neuronpedia_timeout,
+    )
+    reference_explanations = extract_explanations(payload, limit=max(1, int(max_explanations)))
+    if not reference_explanations:
+        raise ValueError("No explanation found in Neuronpedia response.")
+
+    activation_candidates = _select_activation_contexts(
+        feature_payload=payload,
+        selection_method=selection_method,
+        m=m,
+        n=n,
+    )
+    if not activation_candidates:
+        raise ValueError("No activation contexts available for Neuronpedia evaluation.")
+
+    boundary_candidates = _select_non_activation_contexts(
+        feature_payload=payload,
+        count=max(non_activation_context_count, boundary_count_per_reference, 1),
+    )
+    if not boundary_candidates:
+        raise ValueError("No non-activation contexts available for Neuronpedia boundary evaluation.")
+
+    details: List[Dict[str, Any]] = []
+    for explanation in reference_explanations:
+        designed_sentences, boundary_sentences = _generate_sentence_sets_for_reference(
+            reference_explanation=explanation,
+            activation_candidates=activation_candidates,
+            boundary_candidates=boundary_candidates,
+            activation_count=activation_count_per_reference,
+            boundary_count=boundary_count_per_reference,
+        )
+        activation_metrics = _run_sentence_batch_with_sae(
+            module=module,
+            sentences=designed_sentences,
+            non_zero_threshold=non_zero_threshold,
+        )
+        boundary_metrics = _run_sentence_batch_with_sae(
+            module=module,
+            sentences=boundary_sentences,
+            non_zero_threshold=non_zero_threshold,
+        )
+        boundary_non_activation_count = (
+            boundary_metrics["total_sentences"] - boundary_metrics["non_zero_count"]
+        )
+        boundary_non_activation_rate = (
+            boundary_non_activation_count / boundary_metrics["total_sentences"]
+            if boundary_metrics["total_sentences"] > 0
+            else None
+        )
+        score_non_zero_rate = _safe_float(activation_metrics.get("score_non_zero_rate"), 0.0)
+        score_boundary_non_activation_rate = (
+            _safe_float(boundary_non_activation_rate, 0.0)
+            if boundary_non_activation_rate is not None
+            else None
+        )
+        combined_input_score = (
+            score_non_zero_rate + score_boundary_non_activation_rate
+            if score_boundary_non_activation_rate is not None
+            else None
+        )
+        details.append(
+            {
+                "reference_explanation": explanation,
+                "designed_sentences": designed_sentences,
+                "boundary_sentences": boundary_sentences,
+                "score_non_zero_rate": score_non_zero_rate,
+                "score_boundary_non_activation_rate": score_boundary_non_activation_rate,
+                "combined_input_score": combined_input_score,
+                "activation_metrics": activation_metrics,
+                "boundary_metrics": boundary_metrics,
+            }
+        )
+
+    non_zero_values = [
+        _safe_float(item.get("score_non_zero_rate"), 0.0)
+        for item in details
+        if item.get("score_non_zero_rate") is not None
+    ]
+    boundary_values = [
+        _safe_float(item.get("score_boundary_non_activation_rate"), 0.0)
+        for item in details
+        if item.get("score_boundary_non_activation_rate") is not None
+    ]
+    combined_values = [
+        _safe_float(item.get("combined_input_score"), 0.0)
+        for item in details
+        if item.get("combined_input_score") is not None
+    ]
+    return {
+        "reference_explanations": reference_explanations,
+        "reference_count": len(reference_explanations),
+        "reference_details": details,
+        "neuronpedia_mean_score_non_zero_rate": (
+            (sum(non_zero_values) / len(non_zero_values)) if non_zero_values else None
+        ),
+        "neuronpedia_mean_score_boundary_non_activation_rate": (
+            (sum(boundary_values) / len(boundary_values)) if boundary_values else None
+        ),
+        "neuronpedia_mean_combined_input_score": (
+            (sum(combined_values) / len(combined_values)) if combined_values else None
+        ),
+        "activation_candidate_pool": activation_candidates,
+        "boundary_candidate_pool": boundary_candidates,
+    }
+
+
 def _extract_logit_summary(logit_payload: Dict[str, Any]) -> Dict[str, Any]:
     runs = [item for item in logit_payload.get("runs", []) if isinstance(item, dict)]
     positive = [
@@ -386,15 +806,30 @@ def _write_summary_markdown(path: Path, *, payload: Dict[str, Any]) -> None:
     lines.append("")
     lines.append("## Input-side Metrics")
     lines.append(f"- status: {input_eval.get('status')}")
+    lines.append(f"- method: {input_eval.get('method')}")
     lines.append(f"- used_workflow_cached_scores: {input_eval.get('used_workflow_cached_scores')}")
-    lines.append(f"- relative_quality_score: {input_eval.get('relative_quality_score')}")
-    lines.append(f"- adherence: {input_eval.get('adherence')}")
-    lines.append(f"- non_activation_relative_quality_score: {input_eval.get('non_activation_relative_quality_score')}")
-    lines.append(f"- non_activation_adherence: {input_eval.get('non_activation_adherence')}")
-    lines.append(f"- boundary_relative_quality_score: {input_eval.get('boundary_relative_quality_score')}")
-    lines.append(f"- score_non_zero_rate: {input_eval.get('score_non_zero_rate')}")
-    lines.append(f"- score_boundary_non_activation_rate: {input_eval.get('score_boundary_non_activation_rate')}")
-    lines.append(f"- combined_input_score: {input_eval.get('combined_input_score')}")
+    lines.append(f"- workflow_score_non_zero_rate: {input_eval.get('workflow_score_non_zero_rate')}")
+    lines.append(
+        f"- workflow_score_boundary_non_activation_rate: {input_eval.get('workflow_score_boundary_non_activation_rate')}"
+    )
+    lines.append(
+        f"- neuronpedia_mean_score_non_zero_rate: {input_eval.get('neuronpedia_mean_score_non_zero_rate')}"
+    )
+    lines.append(
+        "- neuronpedia_mean_score_boundary_non_activation_rate: "
+        f"{input_eval.get('neuronpedia_mean_score_boundary_non_activation_rate')}"
+    )
+    lines.append(
+        f"- relative_quality_score_non_zero_rate: {input_eval.get('relative_quality_score_non_zero_rate')}"
+    )
+    lines.append(
+        "- relative_quality_score_boundary_non_activation_rate: "
+        f"{input_eval.get('relative_quality_score_boundary_non_activation_rate')}"
+    )
+    lines.append(f"- workflow_combined_input_score: {input_eval.get('workflow_combined_input_score')}")
+    lines.append(f"- neuronpedia_mean_combined_input_score: {input_eval.get('neuronpedia_mean_combined_input_score')}")
+    lines.append(f"- relative_quality_combined_input_score: {input_eval.get('relative_quality_combined_input_score')}")
+    lines.append(f"- reference_count: {input_eval.get('reference_count')}")
     lines.append("")
     lines.append("## Output-side Metrics")
     lines.append(f"- mode: {output_eval.get('mode')}")
@@ -412,7 +847,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Read workflow_runner outputs from logs, select top-scoring final input/output hypotheses, "
-            "run final evaluation scripts, and save summary metrics."
+            "run final evaluation, and save summary metrics."
         )
     )
     parser.add_argument(
@@ -447,15 +882,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-m", type=int, default=5)
     parser.add_argument("--input-n", type=int, default=5)
     parser.add_argument("--input-non-activation-context-count", type=int, default=5)
-    parser.add_argument("--input-llm-model", default="zai-org/glm-4.7")
-    parser.add_argument("--input-ppio-base-url", default="https://api.ppio.com/openai")
-    parser.add_argument("--input-ppio-api-key-file", default=None)
-    parser.add_argument("--input-disable-boundary-score", action="store_true")
+    parser.add_argument("--input-llm-model", default="zai-org/glm-4.7", help="Deprecated no-op.")
+    parser.add_argument("--input-ppio-base-url", default="https://api.ppio.com/openai", help="Deprecated no-op.")
+    parser.add_argument("--input-ppio-api-key-file", default=None, help="Deprecated no-op.")
+    parser.add_argument("--input-disable-boundary-score", action="store_true", help="Deprecated no-op.")
     parser.add_argument(
         "--force-run-input-eval",
         action="store_true",
-        help="Deprecated no-op. Input-side Neuronpedia comparison now always runs when run-mode includes input.",
+        help="Deprecated no-op. Input-side evaluation now always runs when run-mode includes input.",
     )
+    parser.add_argument("--input-non-zero-threshold", type=float, default=0.0)
+    parser.add_argument("--neuronpedia-api-key", default=None)
+    parser.add_argument("--neuronpedia-timeout", type=int, default=30)
+    parser.add_argument("--sae-path", default=None, help="Optional SAE path override for input-side SAE scoring.")
     parser.add_argument("--sae-release", default=None)
     parser.add_argument("--sae-average-l0", default=None)
     parser.add_argument("--sae-canonical-map", default=str(PROJECT_ROOT / "support_info" / "canonical_map.txt"))
@@ -571,12 +1010,6 @@ def main() -> None:
     )
 
     source = _build_source(layer_id=layer_id, sae_name=str(args.sae_name), width=str(args.width))
-    input_script = (
-        PROJECT_ROOT
-        / "explanation_quality_evaluation"
-        / "input-side-evaluation"
-        / "compare_explanations_with_llm.py"
-    )
     output_blind_script = (
         PROJECT_ROOT
         / "explanation_quality_evaluation"
@@ -600,65 +1033,97 @@ def main() -> None:
     input_eval_status = "skipped"
     used_cached_input_scores = False
     if run_input:
-        if selected_input_cache_raw is not None:
-            _log_progress(
-                "Workflow cached input-side scores detected, but Neuronpedia comparison will still run."
-            )
-        input_cmd: List[str] = [
-            sys.executable,
-            str(input_script),
-            "--model-id",
-            model_id,
-            "--layer-id",
-            layer_id,
-            "--width",
-            str(args.width),
-            "--source",
-            source,
-            "--feature-id",
-            str(feature_id),
-            "--my-explanation",
-            str(selected_input["hypothesis"]),
-            "--max-explanations",
-            str(args.input_max_explanations),
-            "--selection-method",
-            str(args.input_selection_method),
-            "--m",
-            str(args.input_m),
-            "--n",
-            str(args.input_n),
-            "--non-activation-context-count",
-            str(args.input_non_activation_context_count),
-            "--llm-model",
-            str(args.input_llm_model),
-            "--ppio-base-url",
-            str(args.input_ppio_base_url),
-            "--sae-name",
-            str(args.sae_name),
-            "--sae-device",
-            str(args.sae_device),
-            "--output-root",
-            str(args.input_output_root),
-            "--timestamp",
-            evaluation_timestamp,
-        ]
-        if args.input_ppio_api_key_file:
-            input_cmd.extend(["--ppio-api-key-file", str(args.input_ppio_api_key_file)])
-        if args.sae_release:
-            input_cmd.extend(["--sae-release", str(args.sae_release)])
-        if args.sae_average_l0:
-            input_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
-        if args.sae_canonical_map:
-            input_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
-        if args.input_disable_boundary_score:
-            input_cmd.append("--disable-boundary-score")
-
-        _run_command_with_progress(
-            input_cmd,
-            cwd=PROJECT_ROOT,
-            step_name="input-side evaluation",
-            heartbeat_seconds=int(args.heartbeat_seconds),
+        workflow_input_scores = _extract_workflow_input_scores(
+            selected_input=selected_input,
+            selected_input_cache_raw=selected_input_cache_raw,
+            execution_payload=execution_payload,
         )
+        used_cached_input_scores = True
+
+        workflow_designed = list(workflow_input_scores.get("designed_sentences", []))
+        workflow_boundary = list(workflow_input_scores.get("boundary_sentences", []))
+        activation_count = (
+            len(workflow_designed)
+            if workflow_designed
+            else max(1, int(args.input_m) + int(args.input_n))
+        )
+        boundary_count = (
+            len(workflow_boundary)
+            if workflow_boundary
+            else max(1, int(args.input_non_activation_context_count))
+        )
+
+        _log_progress("Initializing SAE module for Neuronpedia input-side scoring")
+        sae_release = str(args.sae_release).strip() if args.sae_release else "gemma-scope-2b-pt-res"
+        sae_path = str(args.sae_path).strip() if args.sae_path else build_default_sae_path(
+            layer_id=layer_id,
+            width=str(args.width),
+            release=sae_release,
+            average_l0=args.sae_average_l0,
+            canonical_map_path=args.sae_canonical_map,
+        )[0]
+        module = ModelWithSAEModule(
+            llm_name=str(args.model_checkpoint_path),
+            sae_path=sae_path,
+            sae_layer=int(layer_id),
+            feature_index=int(feature_id),
+            device=str(args.device),
+        )
+
+        _log_progress("Scoring Neuronpedia reference explanations with SAE-only input-side method")
+        neuronpedia_eval = _evaluate_neuronpedia_input_with_sae(
+            model_id=model_id,
+            source=source,
+            feature_id=feature_id,
+            module=module,
+            non_zero_threshold=float(args.input_non_zero_threshold),
+            max_explanations=int(args.input_max_explanations),
+            selection_method=int(args.input_selection_method),
+            m=int(args.input_m),
+            n=int(args.input_n),
+            non_activation_context_count=int(args.input_non_activation_context_count),
+            activation_count_per_reference=activation_count,
+            boundary_count_per_reference=boundary_count,
+            neuronpedia_api_key=args.neuronpedia_api_key,
+            neuronpedia_timeout=int(args.neuronpedia_timeout),
+        )
+
+        workflow_non_zero = _safe_float(workflow_input_scores.get("score_non_zero_rate"), 0.0)
+        workflow_boundary_rate = _safe_float(workflow_input_scores.get("score_boundary_non_activation_rate"), 0.0)
+        workflow_combined = _safe_float(workflow_input_scores.get("combined_input_score"), 0.0)
+        np_non_zero = neuronpedia_eval.get("neuronpedia_mean_score_non_zero_rate")
+        np_boundary_rate = neuronpedia_eval.get("neuronpedia_mean_score_boundary_non_activation_rate")
+        np_combined = neuronpedia_eval.get("neuronpedia_mean_combined_input_score")
+
+        input_result = {
+            "method": "workflow_style_sae_only",
+            "workflow_score_non_zero_rate": workflow_non_zero,
+            "workflow_score_boundary_non_activation_rate": workflow_boundary_rate,
+            "workflow_combined_input_score": workflow_combined,
+            "neuronpedia_mean_score_non_zero_rate": np_non_zero,
+            "neuronpedia_mean_score_boundary_non_activation_rate": np_boundary_rate,
+            "neuronpedia_mean_combined_input_score": np_combined,
+            "relative_quality_score_non_zero_rate": (
+                (workflow_non_zero / _safe_float(np_non_zero, 0.0))
+                if np_non_zero is not None and _safe_float(np_non_zero, 0.0) > 0
+                else None
+            ),
+            "relative_quality_score_boundary_non_activation_rate": (
+                (workflow_boundary_rate / _safe_float(np_boundary_rate, 0.0))
+                if np_boundary_rate is not None and _safe_float(np_boundary_rate, 0.0) > 0
+                else None
+            ),
+            "relative_quality_combined_input_score": (
+                (workflow_combined / _safe_float(np_combined, 0.0))
+                if np_combined is not None and _safe_float(np_combined, 0.0) > 0
+                else None
+            ),
+            "reference_count": neuronpedia_eval.get("reference_count"),
+            "reference_details": neuronpedia_eval.get("reference_details"),
+            "workflow_input_score_source": workflow_input_scores.get("source"),
+            "workflow_input_score_details": workflow_input_scores,
+            "neuronpedia_evaluation": neuronpedia_eval,
+        }
         input_result_path = (
             Path(args.input_output_root)
             / str(args.sae_name)
@@ -667,7 +1132,8 @@ def main() -> None:
             / evaluation_timestamp
             / "result.json"
         )
-        input_result = _load_json(input_result_path)
+        input_result_path.parent.mkdir(parents=True, exist_ok=True)
+        input_result_path.write_text(json.dumps(input_result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         input_eval_status = "completed"
     else:
         _log_progress("Skip input-side evaluation.")
@@ -820,21 +1286,36 @@ def main() -> None:
         },
         "input_evaluation": {
             "status": input_eval_status,
+            "method": input_result.get("method") if run_input else None,
             "used_workflow_cached_scores": used_cached_input_scores,
-            "relative_quality_score": input_result.get("relative_quality_score") if run_input else None,
-            "adherence": input_result.get("adherence") if run_input else None,
-            "non_activation_relative_quality_score": (
-                input_result.get("non_activation_relative_quality_score") if run_input else None
+            "workflow_score_non_zero_rate": (
+                input_result.get("workflow_score_non_zero_rate") if run_input else None
             ),
-            "non_activation_adherence": (
-                input_result.get("non_activation_adherence") if run_input else None
+            "workflow_score_boundary_non_activation_rate": (
+                input_result.get("workflow_score_boundary_non_activation_rate") if run_input else None
             ),
-            "boundary_relative_quality_score": input_result.get("boundary_relative_quality_score") if run_input else None,
-            "score_non_zero_rate": input_result.get("score_non_zero_rate") if run_input else None,
-            "score_boundary_non_activation_rate": (
-                input_result.get("score_boundary_non_activation_rate") if run_input else None
+            "workflow_combined_input_score": (
+                input_result.get("workflow_combined_input_score") if run_input else None
             ),
-            "combined_input_score": input_result.get("combined_input_score") if run_input else None,
+            "neuronpedia_mean_score_non_zero_rate": (
+                input_result.get("neuronpedia_mean_score_non_zero_rate") if run_input else None
+            ),
+            "neuronpedia_mean_score_boundary_non_activation_rate": (
+                input_result.get("neuronpedia_mean_score_boundary_non_activation_rate") if run_input else None
+            ),
+            "neuronpedia_mean_combined_input_score": (
+                input_result.get("neuronpedia_mean_combined_input_score") if run_input else None
+            ),
+            "relative_quality_score_non_zero_rate": (
+                input_result.get("relative_quality_score_non_zero_rate") if run_input else None
+            ),
+            "relative_quality_score_boundary_non_activation_rate": (
+                input_result.get("relative_quality_score_boundary_non_activation_rate") if run_input else None
+            ),
+            "relative_quality_combined_input_score": (
+                input_result.get("relative_quality_combined_input_score") if run_input else None
+            ),
+            "reference_count": input_result.get("reference_count") if run_input else None,
             "raw_result": (
                 {
                     "input_result": input_result,
