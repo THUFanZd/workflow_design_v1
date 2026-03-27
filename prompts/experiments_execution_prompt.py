@@ -21,24 +21,32 @@ def build_input_activation_context(*, hypothesis: str, designed_sentences: Seque
     return "\n".join(lines)
 
 
-def build_input_boundary_context(*, hypothesis: str, boundary_sentences: Sequence[str]) -> str:
+def build_input_expansion_context(
+    *,
+    hypothesis: str,
+    reference_hypothesis: str,
+    expansion_sentences: Sequence[str],
+) -> str:
     lines = []
     lines.append("Task background:")
-    lines.append("You are validating boundary cases for an input-side SAE hypothesis.")
+    lines.append("You are validating expansion cases for an input-side SAE hypothesis.")
     lines.append(
-        "Each boundary sentence should look similar to the hypothesis semantics but should ideally remain "
-        "outside the true activation set."
+        "Each sentence should target the newly expanded semantic region introduced by refinement and "
+        "should activate the feature only if the expansion is valid."
     )
+    lines.append("")
+    lines.append("Previous hypothesis (before refinement):")
+    lines.append(reference_hypothesis.strip())
     lines.append("")
     lines.append("Hypothesis:")
     lines.append(hypothesis.strip())
     lines.append("")
-    lines.append("Candidate boundary sentences:")
-    for index, sentence in enumerate(boundary_sentences, start=1):
+    lines.append("Candidate expansion sentences:")
+    for index, sentence in enumerate(expansion_sentences, start=1):
         lines.append(f"{index}. {sentence.strip()}")
     lines.append("")
     lines.append("Evaluation target:")
-    lines.append("Measure feature activation for each boundary sentence and compute non-activation rate.")
+    lines.append("Measure feature activation for each expansion sentence and compute activation rate.")
     return "\n".join(lines)
 
 

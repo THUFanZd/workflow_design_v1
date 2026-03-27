@@ -13,11 +13,13 @@ from experiments_execution_output import KL_DIV_VALUES_DEFAULT, execute_output_s
 from experiments_design import design_hypothesis_experiments
 from function import (
     DEFAULT_CANONICAL_MAP_PATH,
+    DEFAULT_MAX_TOKENS,
     TokenUsageAccumulator,
     build_default_sae_path,
     build_round_dir,
     normalize_round_id,
     read_api_key,
+    resolve_existing_round_dir,
 )
 from initial_hypothesis_generation import generate_initial_hypotheses
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
@@ -33,9 +35,9 @@ def _empty_input_side_execution(*, non_zero_threshold: float) -> Dict[str, Any]:
     return {
         "side": "input",
         "non_zero_threshold": non_zero_threshold,
+        "input_test_mode": "activation",
         "hypothesis_results": [],
         "overall_score_non_zero_rate": 0.0,
-        "overall_score_boundary_non_activation_rate": None,
     }
 
 
@@ -97,52 +99,26 @@ def _write_markdown_log(
     input_side = result["input_side_execution"]
     lines.append("## Input-side Execution")
     lines.append(f"- non_zero_threshold: {input_side['non_zero_threshold']}")
+    lines.append(f"- input_test_mode: {input_side.get('input_test_mode')}")
     lines.append(f"- overall_score_non_zero_rate: {input_side['overall_score_non_zero_rate']}")
-    lines.append(
-        "- overall_score_boundary_non_activation_rate: "
-        f"{input_side.get('overall_score_boundary_non_activation_rate')}"
-    )
     lines.append("")
     for hypothesis_result in input_side["hypothesis_results"]:
         lines.append(f"### Input Hypothesis {hypothesis_result['hypothesis_index']}")
         lines.append(f"- explanation_original: {hypothesis_result['hypothesis']}")
+        lines.append(f"- test_type: {hypothesis_result.get('test_type', 'activation')}")
+        lines.append(f"- reference_hypothesis: {hypothesis_result.get('reference_hypothesis', '')}")
         lines.append(f"- score_non_zero_rate: {hypothesis_result['score_non_zero_rate']}")
-        lines.append(
-            "- score_boundary_non_activation_rate: "
-            f"{hypothesis_result.get('score_boundary_non_activation_rate')}"
-        )
+        lines.append(f"- is_full_activation: {hypothesis_result.get('is_full_activation')}")
         lines.append(f"- mean_summary_activation: {hypothesis_result['mean_summary_activation']}")
         lines.append(f"- max_summary_activation: {hypothesis_result['max_summary_activation']}")
-        lines.append(
-            "- mean_boundary_summary_activation: "
-            f"{hypothesis_result.get('mean_boundary_summary_activation')}"
-        )
-        lines.append(
-            "- max_boundary_summary_activation: "
-            f"{hypothesis_result.get('max_boundary_summary_activation')}"
-        )
         lines.append("")
-        lines.append("#### Input Activation Context")
+        lines.append("#### Input Test Context")
         lines.append("```text")
-        lines.append(hypothesis_result["input_activation_context"])
+        lines.append(hypothesis_result.get("input_test_context", ""))
         lines.append("```")
         lines.append("| sentence_index | sentence | summary_activation | max_token | non_zero |")
         lines.append("| --- | --- | ---: | --- | --- |")
         for sentence_result in hypothesis_result["sentence_results"]:
-            sentence = str(sentence_result["sentence"]).replace("|", "\\|")
-            lines.append(
-                f"| {sentence_result['sentence_index']} | {sentence} | "
-                f"{sentence_result['summary_activation']} | {sentence_result['max_token']} | "
-                f"{sentence_result['is_non_zero']} |"
-            )
-        lines.append("")
-        lines.append("#### Input Boundary Context")
-        lines.append("```text")
-        lines.append(hypothesis_result.get("input_boundary_context", ""))
-        lines.append("```")
-        lines.append("| boundary_index | sentence | summary_activation | max_token | non_zero |")
-        lines.append("| --- | --- | ---: | --- | --- |")
-        for sentence_result in hypothesis_result.get("boundary_sentence_results", []):
             sentence = str(sentence_result["sentence"]).replace("|", "\\|")
             lines.append(
                 f"| {sentence_result['sentence_index']} | {sentence} | "
@@ -237,7 +213,7 @@ def execute_hypothesis_experiments(
     module: ModelWithSAEModule,
     round_id: Optional[str] = None,
     llm_base_url: str = DEFAULT_BASE_URL,
-    llm_model: str = DEFAULT_MODEL_NAME,
+    output_judge_llm_model: str = DEFAULT_MODEL_NAME,
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
     input_non_zero_threshold: float = 0.0,
     output_judge_num_choices: int = 3,
@@ -246,7 +222,7 @@ def execute_hypothesis_experiments(
     output_max_new_tokens: int = 25,
     output_generation_temperature: float = 0.75,
     output_judge_temperature: float = 0.0,
-    output_judge_max_tokens: int = 1024,
+    output_judge_max_tokens: int = DEFAULT_MAX_TOKENS,
     output_kl_values: Sequence[float] = KL_DIV_VALUES_DEFAULT,
     output_intervention_method: str = "blind",
     output_logit_top_k: int = 5,
@@ -301,7 +277,7 @@ def execute_hypothesis_experiments(
                 output_side_experiments=output_side_experiments,
                 module=module,
                 client=client,
-                llm_model=llm_model,
+                llm_model=output_judge_llm_model,
                 token_counter=token_counter,
                 llm_calls=llm_calls,
                 num_choices=output_judge_num_choices,
@@ -344,7 +320,7 @@ def execute_hypothesis_experiments(
         "feature_id": feature_id,
         "timestamp": ts,
         "round_id": resolved_round_id,
-        "output_judge_llm_model": llm_model,
+        "output_judge_llm_model": output_judge_llm_model,
         "run_side": run_side,
         "output_intervention_method": output_side_execution.get("output_intervention_method"),
         "output_score_name": output_side_execution.get("output_score_name"),
@@ -388,18 +364,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--num-input-sentences-per-hypothesis",
         type=int,
         default=5,
-        help="For each input-side hypothesis, generate this many activation and boundary sentences.",
+        help="For each input-side hypothesis, generate this many activation or expansion sentences.",
     )
     parser.add_argument("--width", default="16k", help="Neuronpedia source width")
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
-    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}/{feature}/{timestamp}")
     parser.add_argument("--round-id", default=None, help="Round directory under timestamp, e.g. round_1")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, reuse logs/{layer}_{feature}/{timestamp}/{round_id} intermediate JSON files instead of refetching.",
+        help="If set, reuse logs artifacts from {layer}/{feature}/{timestamp}/{round_id}.",
     )
     parser.add_argument(
         "--experiments-json-path",
@@ -409,10 +385,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--neuronpedia-api-key", default=None)
     parser.add_argument("--neuronpedia-timeout", type=int, default=30)
     parser.add_argument("--llm-base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--llm-model", default=DEFAULT_MODEL_NAME)
+    parser.add_argument(
+        "--llm-generation-model",
+        "--llm-model",
+        dest="llm_generation_model",
+        default=DEFAULT_MODEL_NAME,
+    )
+    parser.add_argument("--output-judge-llm-model", default=None)
     parser.add_argument("--llm-api-key-file", default=DEFAULT_API_KEY_FILE)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=20000)
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
 
     parser.add_argument("--model-checkpoint-path", default="google/gemma-2-2b")
     parser.add_argument("--sae-path", default=None, help="SAE path or sae-lens URI")
@@ -436,7 +418,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-judge-trials", type=int, default=1)
     parser.add_argument("--output-judge-seed", type=int, default=42)
     parser.add_argument("--output-judge-temperature", type=float, default=0.0)
-    parser.add_argument("--output-judge-max-tokens", type=int, default=10000)
+    parser.add_argument("--output-judge-max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--output-kl-values", type=float, nargs="*", default=KL_DIV_VALUES_DEFAULT)
     parser.add_argument(
         "--output-intervention-method",
@@ -455,6 +437,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
     ts = args.timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    generation_model = str(args.llm_generation_model).strip() or DEFAULT_MODEL_NAME
+    judge_model = str(args.output_judge_llm_model).strip() if args.output_judge_llm_model else generation_model
 
     if args.experiments_json_path:
         experiments_path = Path(args.experiments_json_path)
@@ -465,13 +449,19 @@ if __name__ == "__main__":
         if args.timestamp is None:
             raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
         resolved_round_id = normalize_round_id(args.round_id, round_index=1)
-        experiments_path = (
-            Path("logs")
-            / f"{args.layer_id}_{args.feature_id}"
-            / ts
-            / resolved_round_id
-            / f"layer{args.layer_id}-feature{args.feature_id}-experiments.json"
+        base_dir = resolve_existing_round_dir(
+            layer_id=str(args.layer_id),
+            feature_id=str(args.feature_id),
+            timestamp=ts,
+            round_id=resolved_round_id,
+            round_index=1,
         )
+        if base_dir is None:
+            raise FileNotFoundError(
+                f"Cannot find round directory under logs for layer={args.layer_id}, "
+                f"feature={args.feature_id}, timestamp={ts}, round_id={resolved_round_id}"
+            )
+        experiments_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-experiments.json"
         if not experiments_path.exists():
             raise FileNotFoundError(f"Cannot find experiments file: {experiments_path}")
         experiments_result = json.loads(experiments_path.read_text(encoding="utf-8"))
@@ -499,7 +489,7 @@ if __name__ == "__main__":
             timestamp=ts,
             round_id=args.round_id,
             llm_base_url=args.llm_base_url,
-            llm_model=args.llm_model,
+            llm_model=generation_model,
             llm_api_key_file=args.llm_api_key_file,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
@@ -509,7 +499,7 @@ if __name__ == "__main__":
             num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
             round_id=args.round_id,
             llm_base_url=args.llm_base_url,
-            llm_model=args.llm_model,
+            llm_model=generation_model,
             llm_api_key_file=args.llm_api_key_file,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
@@ -538,7 +528,7 @@ if __name__ == "__main__":
         module=module,
         round_id=args.round_id,
         llm_base_url=args.llm_base_url,
-        llm_model=args.llm_model,
+        output_judge_llm_model=judge_model,
         llm_api_key_file=args.llm_api_key_file,
         input_non_zero_threshold=args.input_non_zero_threshold,
         output_judge_num_choices=args.output_judge_num_choices,

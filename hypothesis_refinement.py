@@ -10,19 +10,27 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 from openai import OpenAI
 
 from function import (
+    DEFAULT_MAX_TOKENS,
     DEFAULT_CANONICAL_MAP_PATH,
     TokenUsageAccumulator,
     build_default_sae_path,
+    build_feature_dir,
     build_round_dir,
     call_llm,
     extract_json_object,
     normalize_round_id,
     read_api_key,
+    resolve_existing_round_dir,
 )
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
 from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
-from prompts.refine_prompt import HistoryScope, build_system_prompt, build_user_prompt
+from prompts.refine_prompt import (
+    HistoryScope,
+    InputRefinementMode,
+    build_system_prompt,
+    build_user_prompt,
+)
 
 SideType = Literal["input", "output"]
 RunSideType = Literal["input", "output", "both"]
@@ -192,30 +200,23 @@ def _extract_execution_evidence(
         successes = [item for item in sentence_results if bool(item.get("is_non_zero", False))]
         successes.sort(key=lambda item: _safe_float(item.get("summary_activation"), 0.0), reverse=True)
         failed = [item for item in sentence_results if not bool(item.get("is_non_zero", False))]
-        boundary_results_raw = target.get("boundary_sentence_results", [])
-        boundary_results = (
-            [item for item in boundary_results_raw if isinstance(item, dict)]
-            if isinstance(boundary_results_raw, list)
-            else []
-        )
-        boundary_successes = [item for item in boundary_results if not bool(item.get("is_non_zero", False))]
-        boundary_successes.sort(key=lambda item: _safe_float(item.get("summary_activation"), 0.0))
-        boundary_failed = [item for item in boundary_results if bool(item.get("is_non_zero", False))]
+        test_type = _clean_text(target.get("test_type")) or "activation"
+        reference_hypothesis = _clean_text(target.get("reference_hypothesis"))
         return {
+            "test_type": test_type,
+            "reference_hypothesis": reference_hypothesis,
             "score_non_zero_rate": _safe_float(target.get("score_non_zero_rate"), 0.0),
             "non_zero_count": _safe_int(target.get("non_zero_count"), 0),
             "total_sentences": _safe_int(target.get("total_sentences"), len(sentence_results)),
             "successful_example": dict(successes[0]) if successes else {},
             "failed_examples": [dict(item) for item in failed],
-            "score_boundary_non_activation_rate": (
-                _safe_float(target.get("score_boundary_non_activation_rate"), 0.0)
-                if target.get("score_boundary_non_activation_rate") is not None
-                else None
+            "successful_examples": [dict(item) for item in successes],
+            "failed_examples_count": len(failed),
+            "is_full_activation": bool(
+                _safe_int(target.get("total_sentences"), len(sentence_results)) > 0
+                and _safe_int(target.get("non_zero_count"), 0)
+                == _safe_int(target.get("total_sentences"), len(sentence_results))
             ),
-            "boundary_non_activation_count": _safe_int(target.get("boundary_non_activation_count"), 0),
-            "total_boundary_sentences": _safe_int(target.get("total_boundary_sentences"), len(boundary_results)),
-            "boundary_successful_example": dict(boundary_successes[0]) if boundary_successes else {},
-            "boundary_failed_examples": [dict(item) for item in boundary_failed],
         }
 
     output_score_name = _clean_text(side_data.get("output_score_name")) or "score_blind_accuracy"
@@ -355,11 +356,12 @@ def _build_history_evidence(
 
 
 def _is_input_full_score(execution_evidence: Dict[str, Any]) -> bool:
+    if bool(execution_evidence.get("is_full_activation", False)):
+        return True
     score_activation = execution_evidence.get("score_non_zero_rate")
-    score_boundary = execution_evidence.get("score_boundary_non_activation_rate")
-    if score_activation is None or score_boundary is None:
+    if score_activation is None:
         return False
-    return _safe_float(score_activation, 0.0) >= 1.0 and _safe_float(score_boundary, 0.0) >= 1.0
+    return _safe_float(score_activation, 0.0) >= 1.0
 
 
 def refine_hypotheses_for_side(
@@ -406,27 +408,15 @@ def refine_hypotheses_for_side(
         # current_memory is derived from current_execution; avoid duplicated evidence in prompt/log.
         if current_execution_evidence:
             current_memory_evidence = {}
-
-        if side == "input" and _is_input_full_score(current_execution_evidence):
-            refined_item = {
-                "side": side,
-                "hypothesis_index": hypothesis_index,
-                "original_hypothesis": current_hypothesis,
-                "original_reason": current_reason,
-                "score_name": current_score_name,
-                "score_value": current_score,
-                "evidence": {
-                    "current_memory": current_memory_evidence,
-                    "current_execution": current_execution_evidence,
-                    "historical_memory": history_evidence,
-                    "history_scope": history_scope,
-                    "status": "skipped_full_score",
-                },
-                "refined_reason": current_reason,
-                "refined_hypothesis": current_hypothesis,
-            }
-            refined.append(refined_item)
-            continue
+        input_refinement_mode: Optional[InputRefinementMode] = None
+        input_pre_expansion_hypothesis = ""
+        if side == "input":
+            test_type = _clean_text(current_execution_evidence.get("test_type")) or "activation"
+            if test_type == "expansion":
+                input_refinement_mode = "expansion_adjust"
+                input_pre_expansion_hypothesis = _clean_text(current_execution_evidence.get("reference_hypothesis"))
+            else:
+                input_refinement_mode = "activation_expand" if _is_input_full_score(current_execution_evidence) else "activation_repair"
 
         system_prompt = build_system_prompt(side)
         user_prompt = build_user_prompt(
@@ -440,6 +430,8 @@ def refine_hypotheses_for_side(
             history_scope=history_scope,
             historical_evidence=history_evidence,
             current_execution_evidence=current_execution_evidence,
+            input_refinement_mode=input_refinement_mode,
+            input_pre_expansion_hypothesis=input_pre_expansion_hypothesis,
         )
         messages = [
             {"role": "system", "content": system_prompt},
@@ -471,6 +463,8 @@ def refine_hypotheses_for_side(
                 "current_execution": current_execution_evidence,
                 "historical_memory": history_evidence,
                 "history_scope": history_scope,
+                "input_refinement_mode": input_refinement_mode,
+                "input_pre_expansion_hypothesis": input_pre_expansion_hypothesis,
             },
             "refined_reason": refined_reason,
             "refined_hypothesis": refined_hypothesis,
@@ -658,7 +652,7 @@ def refine_hypotheses(
     llm_model: str = DEFAULT_MODEL_NAME,
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
     temperature: float = 0.0,
-    max_tokens: int = 20000,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     run_side: RunSideType = "both",
 ) -> Dict[str, Any]:
     ts = timestamp or _clean_text(current_memory.get("timestamp")) or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -768,28 +762,35 @@ def _load_historical_memories(
     if history_rounds <= 0:
         return []
 
-    feature_dir = Path("logs") / f"{layer_id}_{feature_id}"
-    if not feature_dir.exists():
-        return []
-
     current_round = normalize_round_id(current_round_id, round_index=1)
     memory_entries: List[Tuple[str, str, Path]] = []
-    for ts_dir in feature_dir.iterdir():
-        if not ts_dir.is_dir():
+    candidate_feature_dirs = [
+        build_feature_dir(layer_id=layer_id, feature_id=feature_id),
+        Path("logs") / f"{layer_id}_{feature_id}",
+    ]
+    seen_feature_dirs: set[str] = set()
+    for feature_dir in candidate_feature_dirs:
+        feature_key = str(feature_dir)
+        if feature_key in seen_feature_dirs:
+            continue
+        seen_feature_dirs.add(feature_key)
+        if not feature_dir.exists() or not feature_dir.is_dir():
             continue
 
-        # Preferred new layout: logs/{layer}_{feature}/{timestamp}/{round_id}/...
-        for round_dir in ts_dir.iterdir():
-            if not round_dir.is_dir():
+        for ts_dir in feature_dir.iterdir():
+            if not ts_dir.is_dir():
                 continue
-            memory_path = round_dir / f"layer{layer_id}-feature{feature_id}-memory.json"
-            if memory_path.exists():
-                memory_entries.append((ts_dir.name, round_dir.name, memory_path))
 
-        # Backward-compatible legacy layout.
-        legacy_memory_path = ts_dir / f"layer{layer_id}-feature{feature_id}-memory.json"
-        if legacy_memory_path.exists():
-            memory_entries.append((ts_dir.name, "", legacy_memory_path))
+            for round_dir in ts_dir.iterdir():
+                if not round_dir.is_dir():
+                    continue
+                memory_path = round_dir / f"layer{layer_id}-feature{feature_id}-memory.json"
+                if memory_path.exists():
+                    memory_entries.append((ts_dir.name, round_dir.name, memory_path))
+
+            legacy_memory_path = ts_dir / f"layer{layer_id}-feature{feature_id}-memory.json"
+            if legacy_memory_path.exists():
+                memory_entries.append((ts_dir.name, "", legacy_memory_path))
 
     filtered = [
         item
@@ -814,12 +815,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-id", default="gemma-2-2b", help="Neuronpedia model id")
     parser.add_argument("--layer-id", required=True, help="Layer id")
     parser.add_argument("--feature-id", required=True, help="Feature id")
-    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}/{feature}/{timestamp}")
     parser.add_argument("--round-id", default=None, help="Round directory under timestamp, e.g. round_1")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, reuse existing logs/{layer}_{feature}/{timestamp}/{round_id} files for initial/experiments/execution/memory.",
+        help="If set, reuse existing logs artifacts for initial/experiments/execution/memory.",
     )
     parser.add_argument("--history-rounds", type=int, default=1, help="Use previous n rounds as historical memory.")
     parser.add_argument(
@@ -859,7 +860,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--llm-api-key-file", default=DEFAULT_API_KEY_FILE)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=2000)
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
 
     parser.add_argument("--model-checkpoint-path", default="google/gemma-2-2b")
     parser.add_argument("--sae-path", default=None, help="SAE path or sae-lens URI")
@@ -883,7 +884,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-judge-trials", type=int, default=1)
     parser.add_argument("--output-judge-seed", type=int, default=42)
     parser.add_argument("--output-judge-temperature", type=float, default=0.0)
-    parser.add_argument("--output-judge-max-tokens", type=int, default=10000)
+    parser.add_argument("--output-judge-max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--output-kl-values", type=float, nargs="*", default=KL_DIV_VALUES_DEFAULT)
     return parser
 
@@ -909,7 +910,13 @@ if __name__ == "__main__":
             round_index=memory_round_index,
         )
 
-        default_base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts / memory_round_id
+        default_base_dir = build_round_dir(
+            layer_id=layer_id,
+            feature_id=feature_id,
+            timestamp=ts,
+            round_id=memory_round_id,
+            round_index=memory_round_index,
+        )
         execution_path = (
             Path(args.execution_json_path)
             if args.execution_json_path
@@ -934,7 +941,18 @@ if __name__ == "__main__":
             raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
 
         resolved_round_id = normalize_round_id(args.round_id, round_index=1)
-        base_dir = Path("logs") / f"{args.layer_id}_{args.feature_id}" / ts / resolved_round_id
+        base_dir = resolve_existing_round_dir(
+            layer_id=str(args.layer_id),
+            feature_id=str(args.feature_id),
+            timestamp=ts,
+            round_id=resolved_round_id,
+            round_index=1,
+        )
+        if base_dir is None:
+            raise FileNotFoundError(
+                f"Cannot find round directory under logs for layer={args.layer_id}, "
+                f"feature={args.feature_id}, timestamp={ts}, round_id={resolved_round_id}"
+            )
         initial_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-initial-hypotheses.json"
         experiments_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-experiments.json"
         execution_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-experiments-execution.json"
@@ -1025,7 +1043,7 @@ if __name__ == "__main__":
             module=module,
             round_id=target_round_id,
             llm_base_url=args.llm_base_url,
-            llm_model=args.llm_model,
+            output_judge_llm_model=args.llm_model,
             llm_api_key_file=args.llm_api_key_file,
             input_non_zero_threshold=args.input_non_zero_threshold,
             output_judge_num_choices=args.output_judge_num_choices,

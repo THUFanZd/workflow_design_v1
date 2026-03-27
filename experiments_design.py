@@ -3,33 +3,31 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence
 
 from openai import OpenAI
 
 from function import (
+    DEFAULT_MAX_TOKENS,
     TokenUsageAccumulator,
     build_round_dir,
-    call_llm,
     call_llm_stream,
-    extract_usage_counts,
     extract_json_object,
     normalize_round_id,
     read_api_key,
+    resolve_existing_round_dir,
 )
-from initial_hypothesis_generation import GenerationMode, generate_initial_hypotheses
+from initial_hypothesis_generation import generate_initial_hypotheses
+from neuronpedia_feature_api import fetch_and_parse_feature_observation
+from prompts.experiments_design_prompt import InputTestType, build_system_prompt, build_user_prompt
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
 from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
-from neuronpedia_feature_api import fetch_and_parse_feature_observation
-from prompts.experiments_design_prompt import build_system_prompt, build_user_prompt
 
 SideType = Literal["input", "output"]
 RunSideType = Literal["input", "output", "both"]
-
 OUTPUT_SIDE_PLACEHOLDER = ["The explanation is simple:", "I think", "We"]
 
 
@@ -56,193 +54,14 @@ def _parse_sentence_list(raw_output: str, expected_count: int) -> List[str]:
         lines = [line for line in raw_output.splitlines() if line.strip()]
         sentences = [_normalize_sentence(line) for line in lines if _normalize_sentence(line)]
 
-    if not sentences:
-        raise ValueError(f"Failed to parse sentences from output: {raw_output}")
-
     if len(sentences) < expected_count:
         raise ValueError(
-            f"Expected {expected_count} sentences, but only parsed {len(sentences)}: {raw_output}"
+            f"Expected {expected_count} sentences, but parsed {len(sentences)} from output: {raw_output}"
         )
     return sentences[:expected_count]
 
 
-def _extract_json_any(text: str) -> Optional[Any]:
-    text = text.strip()
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    for pattern in (r"\{.*\}", r"\[.*\]"):
-        match = re.search(pattern, text, flags=re.DOTALL)
-        if not match:
-            continue
-        try:
-            return json.loads(match.group(0))
-        except Exception:
-            continue
-    return None
-
-
-def _extract_string_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        normalized = " ".join(value.split())
-        return [normalized] if normalized else []
-    if isinstance(value, list):
-        out: List[str] = []
-        for item in value:
-            out.extend(_extract_string_list(item))
-        return out
-    if isinstance(value, dict):
-        out: List[str] = []
-        for item in value.values():
-            out.extend(_extract_string_list(item))
-        return out
-    return []
-
-
-def generate_boundary_contexts(
-    client: OpenAI,
-    model: str,
-    explanation: str,
-    boundary_case_count: int = 5,
-    max_tokens: int = 5000,
-    temperature: float = 0.2,
-    token_counter: Optional[TokenUsageAccumulator] = None,
-    llm_calls: Optional[List[Dict[str, Any]]] = None,
-    call_metadata: Optional[Dict[str, Any]] = None,
-    llm_io_logger: Optional[Callable[[str, str, str], None]] = None,
-    max_retries: int = 2,
-    retry_backoff_seconds: float = 1.5,
-) -> List[str]:
-    if boundary_case_count <= 0:
-        raise ValueError("boundary_case_count must be a positive integer.")
-
-    system_prompt = (
-        "You are an expert at designing adversarial boundary test cases for SAE feature explanations."
-        " Return JSON only."
-    )
-    user_prompt = (
-        "Task: generate boundary contexts for the hypothesis below.\n\n"
-        "Definition of boundary case (critical):\n"
-        "- A boundary case is near the edge of the explained set by the feature explanation:\\\n"
-        "  it looks lexically/semantically similar,\n"
-        "  but should still fall OUTSIDE the true activation set, which means: \n"
-        "- The case should be tempting and confusable, but as long as it sticks closely to the explanation,\n"
-        "  the feature should NOT activate strongly on that case.\n"
-        "  Cases that exactly align with the explanation will activate the feature strongly,"
-        " which are not cases that you should generate.\n"
-        "- Use multiple near-miss types when possible (context shift, minimal lexical edits,\n"
-        "  homophone/orthographic variants, same surface form in a different domain, etc.).\n\n"
-        f"Hypothesis / explanation:\n{explanation}\n\n"
-        f"Generate exactly {boundary_case_count} boundary contexts.\n"
-        "Again, boundary cases should try NOT to activate the SAE feature."
-        "Each context should be a single natural sentence or short snippet.\n"
-        "Return JSON only in this format:\n"
-        "{\n"
-        '  "boundary_cases": ["case 1", "case 2", "case 3", "case 4", "case 5"]\n'
-        "}"
-    )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-
-    def _collect_candidates(raw_text: str) -> List[str]:
-        parsed = _extract_json_any(raw_text)
-        candidates: List[str] = []
-        if isinstance(parsed, dict):
-            for key in ("boundary_cases", "cases", "examples", "contexts", "items"):
-                if key in parsed:
-                    candidates.extend(_extract_string_list(parsed[key]))
-            if not candidates:
-                candidates.extend(_extract_string_list(parsed))
-        elif parsed is not None:
-            candidates.extend(_extract_string_list(parsed))
-
-        if not candidates:
-            for line in raw_text.splitlines():
-                cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
-                if cleaned:
-                    candidates.append(" ".join(cleaned.split()))
-
-        deduped: List[str] = []
-        seen = set()
-        for item in candidates:
-            if item and item not in seen:
-                seen.add(item)
-                deduped.append(item)
-        return deduped
-
-    max_attempts = max(1, int(max_retries) + 1)
-    last_content = ""
-    last_debug: Dict[str, Any] = {}
-    last_count = 0
-
-    for attempt in range(1, max_attempts + 1):
-        content, usage_obj, debug_info = call_llm(
-            client=client,
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=False,
-            return_debug=True,
-        )
-        content = content.strip().strip("`")
-        if llm_io_logger is not None:
-            llm_io_logger(system_prompt, user_prompt, content)
-
-        usage_counts = extract_usage_counts(usage_obj)
-        if token_counter is not None:
-            token_counter.add(usage_obj)
-        if llm_calls is not None:
-            record = {
-                "messages": messages,
-                "raw_output": content,
-                "usage": usage_counts,
-                "call_type": "input_boundary_context_generation",
-                "attempt": attempt,
-                "max_attempts": max_attempts,
-            }
-            if isinstance(debug_info, dict):
-                record["debug"] = {
-                    "request_mode": debug_info.get("request_mode"),
-                    "request_error": debug_info.get("request_error"),
-                    "content_type": debug_info.get("content_type"),
-                    "finish_reason": debug_info.get("finish_reason"),
-                }
-            if isinstance(call_metadata, dict):
-                record.update(call_metadata)
-            llm_calls.append(record)
-
-        deduped = _collect_candidates(content)
-        if len(deduped) >= boundary_case_count:
-            return deduped[:boundary_case_count]
-
-        last_content = content
-        last_count = len(deduped)
-        if isinstance(debug_info, dict):
-            last_debug = debug_info
-
-        if attempt < max_attempts:
-            time.sleep(max(0.0, retry_backoff_seconds) * attempt)
-
-    finish_reason = last_debug.get("finish_reason")
-    content_type = last_debug.get("content_type")
-    raise ValueError(
-        f"Boundary case generator returned {last_count} cases, "
-        f"but {boundary_case_count} are required after {max_attempts} attempts. "
-        f"finish_reason={finish_reason}, content_type={content_type}. "
-        f"Raw output: {last_content}"
-    )
-
-
-def _design_experiments_for_side(
+def _design_sentences(
     *,
     side: SideType,
     hypotheses: Sequence[str],
@@ -253,23 +72,36 @@ def _design_experiments_for_side(
     llm_calls: List[Dict[str, Any]],
     temperature: float,
     max_tokens: int,
+    input_test_mode: InputTestType = "activation",
+    previous_input_hypotheses: Optional[Sequence[str]] = None,
 ) -> List[List[str]]:
     if side == "output":
         return [list(OUTPUT_SIDE_PLACEHOLDER) for _ in hypotheses]
 
-    system_prompt = build_system_prompt(side)
     all_sentences: List[List[str]] = []
+    system_prompt = build_system_prompt(side, input_test_type=input_test_mode)
 
     for index, hypothesis in enumerate(hypotheses, start=1):
-        user_prompt = build_user_prompt(side=side, hypothesis=hypothesis, num_sentences=num_sentences)
+        previous_hypothesis = ""
+        if side == "input" and input_test_mode == "expansion" and previous_input_hypotheses is not None:
+            if 0 <= index - 1 < len(previous_input_hypotheses):
+                previous_hypothesis = str(previous_input_hypotheses[index - 1]).strip()
+
+        user_prompt = build_user_prompt(
+            side=side,
+            hypothesis=hypothesis,
+            num_sentences=num_sentences,
+            input_test_type=input_test_mode,
+            previous_hypothesis=previous_hypothesis,
+        )
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
         raw_output, usage_obj = call_llm_stream(
-            client,
-            model,
-            messages,
+            client=client,
+            model=model,
+            messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
         )
@@ -280,45 +112,16 @@ def _design_experiments_for_side(
         llm_calls.append(
             {
                 "side": side,
+                "input_test_mode": input_test_mode if side == "input" else None,
                 "hypothesis_index": index,
                 "hypothesis_text": hypothesis,
+                "previous_hypothesis": previous_hypothesis,
                 "messages": messages,
                 "raw_output": raw_output,
                 "usage": usage_counts,
             }
         )
 
-    return all_sentences
-
-
-def _design_boundary_experiments_for_input(
-    *,
-    hypotheses: Sequence[str],
-    num_sentences: int,
-    client: OpenAI,
-    model: str,
-    token_counter: TokenUsageAccumulator,
-    llm_calls: List[Dict[str, Any]],
-    max_tokens: int,
-) -> List[List[str]]:
-    all_sentences: List[List[str]] = []
-    for index, hypothesis in enumerate(hypotheses, start=1):
-        boundary_sentences = generate_boundary_contexts(
-            client=client,
-            model=model,
-            explanation=hypothesis,
-            boundary_case_count=num_sentences,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            token_counter=token_counter,
-            llm_calls=llm_calls,
-            call_metadata={
-                "side": "input",
-                "hypothesis_index": index,
-                "hypothesis_text": hypothesis,
-            },
-        )
-        all_sentences.append(boundary_sentences)
     return all_sentences
 
 
@@ -340,10 +143,7 @@ def _write_markdown_log(
         lines.append(f"- round_id: {result['round_id']}")
     lines.append(f"- num_hypothesis: {result['num_hypothesis']}")
     lines.append(f"- num_input_sentences_per_hypothesis: {result['num_input_sentences_per_hypothesis']}")
-    lines.append(
-        f"- num_input_boundary_sentences_per_hypothesis: "
-        f"{result['num_input_boundary_sentences_per_hypothesis']}"
-    )
+    lines.append(f"- input_test_mode: {result.get('input_test_mode')}")
     lines.append(f"- llm_model: {result['llm_model']}")
     lines.append("")
     lines.append("## Token Usage (Experiments Generation)")
@@ -356,11 +156,10 @@ def _write_markdown_log(
     for idx, pair in enumerate(result["input_side_experiments"], start=1):
         lines.append(f"### Input Hypothesis {idx}")
         lines.append(f"- hypothesis: {pair['hypothesis']}")
+        lines.append(f"- test_type: {pair.get('test_type', 'activation')}")
+        lines.append(f"- reference_hypothesis: {pair.get('reference_hypothesis', '')}")
         lines.append("- designed_sentences:")
-        for sentence in pair["designed_sentences"]:
-            lines.append(f"  - {sentence}")
-        lines.append("- boundary_sentences:")
-        for sentence in pair.get("boundary_sentences", []):
+        for sentence in pair.get("designed_sentences", []):
             lines.append(f"  - {sentence}")
         lines.append("")
     lines.append("## Output-side Hypotheses And Designed Sentences")
@@ -368,31 +167,26 @@ def _write_markdown_log(
         lines.append(f"### Output Hypothesis {idx}")
         lines.append(f"- hypothesis: {pair['hypothesis']}")
         lines.append("- designed_sentences:")
-        for sentence in pair["designed_sentences"]:
+        for sentence in pair.get("designed_sentences", []):
             lines.append(f"  - {sentence}")
         lines.append("")
     lines.append("## LLM Calls")
     for i, call in enumerate(llm_calls, start=1):
         lines.append(f"### Call {i}")
-        if "call_type" in call:
-            lines.append(f"- call_type: {call.get('call_type')}")
-        lines.append(f"- side: {call['side']}")
-        lines.append(f"- hypothesis_index: {call['hypothesis_index']}")
-        lines.append(f"- hypothesis_text: {call['hypothesis_text']}")
+        lines.append(f"- side: {call.get('side')}")
+        lines.append(f"- input_test_mode: {call.get('input_test_mode')}")
+        lines.append(f"- hypothesis_index: {call.get('hypothesis_index')}")
+        lines.append(f"- hypothesis_text: {call.get('hypothesis_text')}")
+        if call.get("previous_hypothesis"):
+            lines.append(f"- previous_hypothesis: {call.get('previous_hypothesis')}")
         usage = call.get("usage", {})
         lines.append(f"- prompt_tokens: {usage.get('prompt_tokens', 0)}")
         lines.append(f"- completion_tokens: {usage.get('completion_tokens', 0)}")
         lines.append(f"- total_tokens: {usage.get('total_tokens', 0)}")
-        if "attempt" in call:
-            lines.append(f"- attempt: {call.get('attempt')}/{call.get('max_attempts', 1)}")
-        debug_info = call.get("debug", {})
-        if isinstance(debug_info, dict):
-            lines.append(f"- finish_reason: {debug_info.get('finish_reason')}")
-            lines.append(f"- content_type: {debug_info.get('content_type')}")
         lines.append("")
         lines.append("#### Messages")
         lines.append("```json")
-        lines.append(json.dumps(call["messages"], ensure_ascii=False, indent=2))
+        lines.append(json.dumps(call.get("messages", []), ensure_ascii=False, indent=2))
         lines.append("```")
         lines.append("")
         lines.append("#### Raw Output")
@@ -413,8 +207,10 @@ def design_hypothesis_experiments(
     llm_model: str = DEFAULT_MODEL_NAME,
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
     temperature: float = 0.2,
-    max_tokens: int = 20000,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     run_side: RunSideType = "both",
+    input_test_mode: InputTestType = "activation",
+    previous_input_hypotheses: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     model_id = hypotheses_result.get("model_id", "unknown-model")
     layer_id = str(hypotheses_result["layer_id"])
@@ -424,8 +220,8 @@ def design_hypothesis_experiments(
         round_id or str(hypotheses_result.get("round_id", "")).strip() or None,
         round_index=1,
     )
-    input_hypotheses = list(hypotheses_result.get("input_side_hypotheses", []))
-    output_hypotheses = list(hypotheses_result.get("output_side_hypotheses", []))
+    input_hypotheses = [str(item).strip() for item in hypotheses_result.get("input_side_hypotheses", [])]
+    output_hypotheses = [str(item).strip() for item in hypotheses_result.get("output_side_hypotheses", [])]
     num_hypothesis = max(len(input_hypotheses), len(output_hypotheses))
     run_input = run_side in ("input", "both")
     run_output = run_side in ("output", "both")
@@ -438,7 +234,7 @@ def design_hypothesis_experiments(
     )
 
     if run_input:
-        input_sentences = _design_experiments_for_side(
+        input_sentences = _design_sentences(
             side="input",
             hypotheses=input_hypotheses,
             num_sentences=num_input_sentences_per_hypothesis,
@@ -448,22 +244,14 @@ def design_hypothesis_experiments(
             llm_calls=llm_calls,
             temperature=temperature,
             max_tokens=max_tokens,
-        )
-        input_boundary_sentences = _design_boundary_experiments_for_input(
-            hypotheses=input_hypotheses,
-            num_sentences=num_input_sentences_per_hypothesis,
-            client=client,
-            model=llm_model,
-            token_counter=token_counter,
-            llm_calls=llm_calls,
-            max_tokens=max_tokens,
+            input_test_mode=input_test_mode,
+            previous_input_hypotheses=previous_input_hypotheses,
         )
     else:
         input_sentences = []
-        input_boundary_sentences = []
 
     if run_output:
-        output_sentences = _design_experiments_for_side(
+        output_sentences = _design_sentences(
             side="output",
             hypotheses=output_hypotheses,
             num_sentences=num_input_sentences_per_hypothesis,
@@ -477,14 +265,20 @@ def design_hypothesis_experiments(
     else:
         output_sentences = []
 
-    base_dir = build_round_dir(
-        layer_id=layer_id,
-        feature_id=feature_id,
-        timestamp=ts,
-        round_id=resolved_round_id,
-        round_index=1,
-    )
-    base_dir.mkdir(parents=True, exist_ok=True)
+    input_experiments: List[Dict[str, Any]] = []
+    for idx, (hypothesis, sentences) in enumerate(zip(input_hypotheses, input_sentences), start=1):
+        reference_hypothesis = ""
+        if input_test_mode == "expansion" and previous_input_hypotheses is not None:
+            if 0 <= idx - 1 < len(previous_input_hypotheses):
+                reference_hypothesis = str(previous_input_hypotheses[idx - 1]).strip()
+        input_experiments.append(
+            {
+                "hypothesis": hypothesis,
+                "test_type": input_test_mode,
+                "reference_hypothesis": reference_hypothesis,
+                "designed_sentences": sentences,
+            }
+        )
 
     result: Dict[str, Any] = {
         "model_id": model_id,
@@ -496,34 +290,41 @@ def design_hypothesis_experiments(
         "generation_mode": hypotheses_result.get("generation_mode"),
         "run_side": run_side,
         "num_input_sentences_per_hypothesis": num_input_sentences_per_hypothesis,
-        "num_input_boundary_sentences_per_hypothesis": num_input_sentences_per_hypothesis,
+        "input_test_mode": input_test_mode,
         "llm_model": llm_model,
-        "input_side_experiments": [
-            {
-                "hypothesis": hyp,
-                "designed_sentences": sentences,
-                "boundary_sentences": boundary_sentences,
-            }
-            for hyp, sentences, boundary_sentences in zip(
-                input_hypotheses,
-                input_sentences,
-                input_boundary_sentences,
-            )
-        ],
+        "input_side_experiments": input_experiments,
         "output_side_experiments": [
             {"hypothesis": hyp, "designed_sentences": sentences}
             for hyp, sentences in zip(output_hypotheses, output_sentences)
         ],
         "token_usage": token_counter.as_dict(),
+        "llm_calls": llm_calls,
     }
+
+    base_dir = build_round_dir(
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=ts,
+        round_id=resolved_round_id,
+        round_index=1,
+    )
+    base_dir.mkdir(parents=True, exist_ok=True)
 
     result_json_path = base_dir / f"layer{layer_id}-feature{feature_id}-experiments.json"
     result_json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     result_md_path = base_dir / f"layer{layer_id}-feature{feature_id}-experiments.md"
     _write_markdown_log(result_md_path, result=result, llm_calls=llm_calls)
-
     return result
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Cannot find file: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON payload must be a dict: {path}")
+    return payload
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -544,18 +345,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--num-input-sentences-per-hypothesis",
         type=int,
         default=5,
-        help="For each input-side hypothesis, generate this many activation and boundary sentences.",
+        help="For each input-side hypothesis, generate this many activation or expansion sentences.",
+    )
+    parser.add_argument(
+        "--input-test-mode",
+        choices=["activation", "expansion"],
+        default="activation",
+        help="Input-side experiment type for this design run.",
+    )
+    parser.add_argument(
+        "--previous-input-hypotheses-json-path",
+        default=None,
+        help="Optional JSON path with {'input_side_hypotheses': [...]} or a raw list, used in expansion mode.",
     )
     parser.add_argument("--width", default="16k", help="Neuronpedia source width")
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
-    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}/{feature}/{timestamp}")
     parser.add_argument("--round-id", default=None, help="Round directory under timestamp, e.g. round_1")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, reuse logs/{layer}_{feature}/{timestamp}/{round_id} intermediate JSON files instead of refetching.",
+        help="If set, reuse logs artifacts from the target round directory.",
     )
     parser.add_argument("--neuronpedia-api-key", default=None)
     parser.add_argument("--neuronpedia-timeout", type=int, default=30)
@@ -563,35 +375,55 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--llm-api-key-file", default=DEFAULT_API_KEY_FILE)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=50000)
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     return parser
+
+
+def _load_previous_input_hypotheses(path_text: Optional[str]) -> Optional[List[str]]:
+    if not path_text:
+        return None
+    raw = json.loads(Path(path_text).read_text(encoding="utf-8"))
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw]
+    if not isinstance(raw, dict):
+        raise ValueError("previous-input-hypotheses JSON must be either a list or a dict.")
+    if isinstance(raw.get("input_side_hypotheses"), list):
+        return [str(item).strip() for item in raw.get("input_side_hypotheses", [])]
+    if isinstance(raw.get("hypotheses"), list):
+        return [str(item).strip() for item in raw.get("hypotheses", [])]
+    return None
 
 
 if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
 
     ts = args.timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    previous_input_hypotheses = _load_previous_input_hypotheses(args.previous_input_hypotheses_json_path)
+
     if args.reuse_from_logs:
         if args.timestamp is None:
             raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
         resolved_round_id = normalize_round_id(args.round_id, round_index=1)
-        base_dir = (
-            Path("logs")
-            / f"{args.layer_id}_{args.feature_id}"
-            / ts
-            / resolved_round_id
+        base_dir = resolve_existing_round_dir(
+            layer_id=str(args.layer_id),
+            feature_id=str(args.feature_id),
+            timestamp=ts,
+            round_id=resolved_round_id,
+            round_index=1,
         )
+        if base_dir is None:
+            raise FileNotFoundError(
+                f"Cannot find round directory under logs for layer={args.layer_id}, "
+                f"feature={args.feature_id}, timestamp={ts}, round_id={resolved_round_id}"
+            )
         observation_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-observation-input.json"
         initial_hypotheses_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-initial-hypotheses.json"
-
         if not observation_path.exists():
             raise FileNotFoundError(f"Cannot find observation input file: {observation_path}")
         if not initial_hypotheses_path.exists():
             raise FileNotFoundError(f"Cannot find initial hypotheses file: {initial_hypotheses_path}")
-
-        # Kept for workflow completeness: this is the step-1 parsed output structure.
-        _ = json.loads(observation_path.read_text(encoding="utf-8"))
-        initial_result = json.loads(initial_hypotheses_path.read_text(encoding="utf-8"))
+        _ = _load_json(observation_path)
+        initial_result = _load_json(initial_hypotheses_path)
     else:
         observation = fetch_and_parse_feature_observation(
             model_id=args.model_id,
@@ -631,5 +463,7 @@ if __name__ == "__main__":
         llm_api_key_file=args.llm_api_key_file,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        input_test_mode=str(args.input_test_mode),
+        previous_input_hypotheses=previous_input_hypotheses,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

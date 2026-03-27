@@ -73,7 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestamp", default=None, help="If omitted, use current time YYYYMMDD_HHMMSS.")
 
     parser.add_argument("--model-id", default="gemma-2-2b")
+    parser.add_argument("--llm-generation-model", default=None, help="Forwarded to workflow_runner.py")
+    parser.add_argument("--llm-judge-model", default=None, help="Forwarded to workflow_runner.py")
     parser.add_argument("--max-rounds", "--max_round", dest="max_rounds", type=int, default=1)
+    parser.add_argument("--input-activation-max-rounds", type=int, default=1)
+    parser.add_argument("--input-expansion-max-rounds", type=int, default=1)
     parser.add_argument("--num-hypothesis", type=int, default=3)
     parser.add_argument(
         "--generation-mode",
@@ -172,7 +176,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional summary json path. Default: "
-            "logs/{layer}_{feature}/{timestamp}/run_single_input_history_scope_eval_summary.json"
+            "logs/{layer}/{feature}/{timestamp}/run_single_input_history_scope_eval_summary.json"
         ),
     )
     return parser.parse_args()
@@ -199,6 +203,10 @@ def main() -> None:
         str(args.history_scope),
         "--max-rounds",
         str(args.max_rounds),
+        "--input-activation-max-rounds",
+        str(args.input_activation_max_rounds),
+        "--input-expansion-max-rounds",
+        str(args.input_expansion_max_rounds),
         "--num-hypothesis",
         str(args.num_hypothesis),
         "--generation-mode",
@@ -222,6 +230,10 @@ def main() -> None:
         workflow_cmd.append("--enable-hypothesis-merge")
     if args.top_m is not None:
         workflow_cmd.extend(["--top-m", str(args.top_m)])
+    if args.llm_generation_model:
+        workflow_cmd.extend(["--llm-generation-model", str(args.llm_generation_model)])
+    if args.llm_judge_model:
+        workflow_cmd.extend(["--llm-judge-model", str(args.llm_judge_model)])
 
     workflow_code, workflow_seconds = _run_command(workflow_cmd, dry_run=bool(args.dry_run))
 
@@ -286,7 +298,8 @@ def main() -> None:
         summary_path = (
             PROJECT_ROOT
             / "logs"
-            / f"{layer_id}_{feature_id}"
+            / str(layer_id)
+            / str(feature_id)
             / timestamp
             / "run_single_input_history_scope_eval_summary.json"
         )

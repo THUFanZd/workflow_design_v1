@@ -53,11 +53,17 @@ def _resolve_workflow_path_from_args(args: argparse.Namespace) -> Path:
             + ", ".join(missing)
         )
 
-    return (
-        Path(str(args.logs_root))
-        / f"{str(args.layer_id).strip()}_{str(args.feature_id).strip()}"
-        / str(args.timestamp).strip()
-    )
+    logs_root = Path(str(args.logs_root))
+    layer = str(args.layer_id).strip()
+    feature = str(args.feature_id).strip()
+    timestamp = str(args.timestamp).strip()
+    canonical_path = logs_root / layer / feature / timestamp
+    if canonical_path.exists():
+        return canonical_path
+    legacy_path = logs_root / f"{layer}_{feature}" / timestamp
+    if legacy_path.exists():
+        return legacy_path
+    return canonical_path
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -97,7 +103,7 @@ def _normalize_cached_input_hypothesis(
     combined_score = (
         _safe_float(combined_raw, 0.0)
         if combined_raw is not None
-        else _safe_float(score_non_zero, 0.0) + _safe_float(score_boundary, 0.0)
+        else _safe_float(score_non_zero, 0.0)
     )
     return {
         "source": source,
@@ -105,6 +111,7 @@ def _normalize_cached_input_hypothesis(
         "hypothesis": hypothesis,
         "round_index": _safe_int(cached.get("round_index"), 0),
         "round_id": str(cached.get("round_id", "")).strip() or None,
+        "test_type": str(cached.get("test_type", "")).strip() or None,
         "score_name": "combined_input_score",
         "score_value": combined_score,
         "score_non_zero_rate": score_non_zero,
@@ -420,7 +427,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Path to workflow final-result json file, or workflow timestamp directory. "
-            "If omitted, path is composed as logs/{layer-id}_{feature-id}/{timestamp}."
+            "If omitted, path is composed as logs/{layer-id}/{feature-id}/{timestamp}."
         ),
     )
     parser.add_argument("--layer-id", default=None, help="Layer id used to compose workflow path.")
@@ -498,7 +505,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--logit-top-k", type=int, default=5)
     parser.add_argument("--logit-target-kl", type=float, nargs="*", default=[0.25, 0.5, -0.25, -0.5])
-    parser.add_argument("--logit-judge-max-tokens", type=int, default=10000)
+    parser.add_argument("--logit-judge-max-tokens", type=int, default=20000)
     parser.set_defaults(blind_use_checkpoint_fallback=True)
     return parser.parse_args()
 

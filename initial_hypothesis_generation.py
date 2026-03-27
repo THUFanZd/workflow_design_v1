@@ -10,12 +10,14 @@ from typing import Any, Dict, List, Literal, Optional, Sequence
 from openai import OpenAI
 
 from function import (
+    DEFAULT_MAX_TOKENS,
     TokenUsageAccumulator,
     build_round_dir,
     call_llm_stream,
     extract_json_object,
     normalize_round_id,
     read_api_key,
+    resolve_existing_round_dir,
 )
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
@@ -127,8 +129,6 @@ def _generate_hypotheses_for_side(
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        print('raw output:')
-        print(raw_output)
         usage_counts = token_counter.add(usage_obj)
         hypotheses = _parse_hypothesis_list(raw_output, expected_count=num_hypothesis)
 
@@ -254,7 +254,7 @@ def generate_initial_hypotheses(
     llm_model: str = DEFAULT_MODEL_NAME,
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
     temperature: float = 0.2,
-    max_tokens: int = 1000,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> Dict[str, Any]:
     ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     resolved_round_id = normalize_round_id(round_id, round_index=0)
@@ -345,12 +345,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
-    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}/{feature}/{timestamp}")
     parser.add_argument("--round-id", default="round_0", help="Round directory under timestamp, e.g. round_0")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, read observation input from logs/{layer}_{feature}/{timestamp}/{round_id} instead of refetching from Neuronpedia.",
+        help="If set, read observation input from logs artifacts instead of refetching from Neuronpedia.",
     )
     parser.add_argument("--neuronpedia-api-key", default=None)
     parser.add_argument("--neuronpedia-timeout", type=int, default=30)
@@ -358,7 +358,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--llm-api-key-file", default=DEFAULT_API_KEY_FILE)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=50000)
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     return parser
 
 
@@ -369,13 +369,19 @@ if __name__ == "__main__":
     if args.reuse_from_logs:
         if args.timestamp is None:
             raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
-        observation_path = (
-            Path("logs")
-            / f"{args.layer_id}_{args.feature_id}"
-            / ts
-            / args.round_id
-            / f"layer{args.layer_id}-feature{args.feature_id}-observation-input.json"
+        base_dir = resolve_existing_round_dir(
+            layer_id=str(args.layer_id),
+            feature_id=str(args.feature_id),
+            timestamp=ts,
+            round_id=args.round_id,
+            round_index=0,
         )
+        if base_dir is None:
+            raise FileNotFoundError(
+                f"Cannot find round directory under logs for layer={args.layer_id}, "
+                f"feature={args.feature_id}, timestamp={ts}, round_id={args.round_id}"
+            )
+        observation_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-observation-input.json"
         if not observation_path.exists():
             raise FileNotFoundError(f"Cannot find observation input file: {observation_path}")
         observation = json.loads(observation_path.read_text(encoding="utf-8"))

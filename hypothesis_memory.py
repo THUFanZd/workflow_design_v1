@@ -14,6 +14,7 @@ from function import (
     build_default_sae_path,
     build_round_dir,
     normalize_round_id,
+    resolve_existing_round_dir,
 )
 from initial_hypothesis_generation import generate_initial_hypotheses
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
@@ -166,6 +167,10 @@ def _build_input_hypothesis_memory(
     experiments_item: Dict[str, Any],
     execution_item: Dict[str, Any],
 ) -> Dict[str, Any]:
+    test_type = _clean_text(experiments_item.get("test_type") or execution_item.get("test_type")) or "activation"
+    reference_hypothesis = _clean_text(
+        experiments_item.get("reference_hypothesis") or execution_item.get("reference_hypothesis")
+    )
     designed_sentences = _extract_string_list(experiments_item.get("designed_sentences"))
     sentence_results_raw = execution_item.get("sentence_results")
     sentence_results: List[Dict[str, Any]] = (
@@ -221,6 +226,8 @@ def _build_input_hypothesis_memory(
         "hypothesis_index": hypothesis_index,
         "hypothesis": hypothesis_text,
         "reason": reason,
+        "test_type": test_type,
+        "reference_hypothesis": reference_hypothesis,
         "score": score_non_zero_rate,
         "score_non_zero_rate": score_non_zero_rate,
         "non_zero_count": _safe_int(execution_item.get("non_zero_count"), 0),
@@ -448,6 +455,7 @@ def build_hypothesis_memory(
 
     sides: Dict[str, Dict[str, Any]] = {
         "input": {
+            "input_test_mode": _clean_text(input_execution.get("input_test_mode")),
             "overall_score_non_zero_rate": _safe_float(input_execution.get("overall_score_non_zero_rate"), 0.0),
             "hypotheses": input_memories,
         },
@@ -517,6 +525,7 @@ def write_hypothesis_memory_markdown(path: Path, *, memory: Dict[str, Any]) -> N
     output_side = sides.get("output", {}) if isinstance(sides, dict) else {}
 
     lines.append("## Input-side Memory")
+    lines.append(f"- input_test_mode: {input_side.get('input_test_mode', '')}")
     lines.append(f"- overall_score_non_zero_rate: {input_side.get('overall_score_non_zero_rate', 0.0)}")
     lines.append("")
     input_hypotheses = input_side.get("hypotheses", []) if isinstance(input_side, dict) else []
@@ -526,6 +535,8 @@ def write_hypothesis_memory_markdown(path: Path, *, memory: Dict[str, Any]) -> N
         lines.append(f"### Input Hypothesis {item.get('hypothesis_index', '')}")
         lines.append(f"- hypothesis: {item.get('hypothesis', '')}")
         lines.append(f"- reason: {item.get('reason', '')}")
+        lines.append(f"- test_type: {item.get('test_type', 'activation')}")
+        lines.append(f"- reference_hypothesis: {item.get('reference_hypothesis', '')}")
         lines.append(f"- score_non_zero_rate: {item.get('score_non_zero_rate', 0.0)}")
         failed_cases = item.get("failed_test_cases", [])
         failed_count = len(failed_cases) if isinstance(failed_cases, list) else 0
@@ -630,7 +641,18 @@ def _load_from_logs(
     round_id: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     resolved_round_id = normalize_round_id(round_id, round_index=1)
-    base_dir = Path("logs") / f"{layer_id}_{feature_id}" / timestamp / resolved_round_id
+    base_dir = resolve_existing_round_dir(
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=timestamp,
+        round_id=resolved_round_id,
+        round_index=1,
+    )
+    if base_dir is None:
+        raise FileNotFoundError(
+            f"Cannot find round directory under logs for layer={layer_id}, "
+            f"feature={feature_id}, timestamp={timestamp}, round_id={resolved_round_id}"
+        )
     initial_path = base_dir / f"layer{layer_id}-feature{feature_id}-initial-hypotheses.json"
     experiments_path = base_dir / f"layer{layer_id}-feature{feature_id}-experiments.json"
     execution_path = base_dir / f"layer{layer_id}-feature{feature_id}-experiments-execution.json"
@@ -661,13 +683,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
-    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}/{feature}/{timestamp}")
     parser.add_argument("--round-index", type=int, default=1, help="Round index used as memory anchor.")
     parser.add_argument("--round-id", default=None, help="Optional explicit round id for the memory record.")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, reuse logs/{layer}_{feature}/{timestamp}/{round_id} intermediate JSON files.",
+        help="If set, reuse logs artifacts from {layer}/{feature}/{timestamp}/{round_id}.",
     )
     parser.add_argument(
         "--initial-hypotheses-json-path",
@@ -720,7 +742,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-judge-trials", type=int, default=1)
     parser.add_argument("--output-judge-seed", type=int, default=42)
     parser.add_argument("--output-judge-temperature", type=float, default=0.0)
-    parser.add_argument("--output-judge-max-tokens", type=int, default=10000)
+    parser.add_argument("--output-judge-max-tokens", type=int, default=20000)
     parser.add_argument("--output-kl-values", type=float, nargs="*", default=KL_DIV_VALUES_DEFAULT)
     return parser
 
@@ -740,7 +762,13 @@ if __name__ == "__main__":
             round_index=args.round_index,
         )
 
-        default_base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts / resolved_round_id
+        default_base_dir = build_round_dir(
+            layer_id=layer_id,
+            feature_id=feature_id,
+            timestamp=ts,
+            round_id=resolved_round_id,
+            round_index=args.round_index,
+        )
         initial_path = (
             Path(args.initial_hypotheses_json_path)
             if args.initial_hypotheses_json_path
@@ -824,7 +852,7 @@ if __name__ == "__main__":
             module=module,
             round_id=target_round_id,
             llm_base_url=args.llm_base_url,
-            llm_model=args.llm_model,
+            output_judge_llm_model=args.llm_model,
             llm_api_key_file=args.llm_api_key_file,
             input_non_zero_threshold=args.input_non_zero_threshold,
             output_judge_num_choices=args.output_judge_num_choices,

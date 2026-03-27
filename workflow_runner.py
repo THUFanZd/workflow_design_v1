@@ -5,16 +5,16 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional
 
-from experiments_design import _write_markdown_log as write_experiments_markdown
 from experiments_design import design_hypothesis_experiments
-from experiments_execution import _write_markdown_log as write_execution_markdown
 from experiments_execution import execute_hypothesis_experiments
 from experiments_execution_output import KL_DIV_VALUES_DEFAULT
 from function import (
+    DEFAULT_MAX_TOKENS,
     DEFAULT_CANONICAL_MAP_PATH,
     TokenUsageAccumulator,
+    build_feature_dir,
     build_default_sae_path,
     build_round_dir,
     normalize_round_id,
@@ -81,11 +81,24 @@ def _artifact_json_path(
 
 
 def _load_json_or_raise(path: Path) -> Dict[str, Any]:
-    if not path.exists():
+    target_path = path
+    if not target_path.exists():
+        parts = list(path.parts)
+        # Backward-compatible fallback:
+        # logs/{layer}/{feature}/{timestamp}/... -> logs/{layer}_{feature}/{timestamp}/...
+        if len(parts) >= 5 and parts[0] == "logs":
+            layer_part = parts[1]
+            feature_part = parts[2]
+            legacy_parts = ["logs", f"{layer_part}_{feature_part}", *parts[3:]]
+            legacy_path = Path(*legacy_parts)
+            if legacy_path.exists():
+                target_path = legacy_path
+    if not target_path.exists():
         raise FileNotFoundError(f"Cannot find required file: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    payload = json.loads(target_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError(f"JSON payload must be a dict: {path}")
+        raise ValueError(f"JSON payload must be a dict: {target_path}")
     return payload
 
 
@@ -115,182 +128,10 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _is_input_hypothesis_full_score(item: Dict[str, Any]) -> bool:
-    score_non_zero = item.get("score_non_zero_rate")
-    score_boundary = item.get("score_boundary_non_activation_rate")
-    if score_non_zero is None or score_boundary is None:
-        return False
-    return _safe_float(score_non_zero, 0.0) >= 1.0 and _safe_float(score_boundary, 0.0) >= 1.0
-
-
-def _frozen_input_indices_from_execution(execution_result: Dict[str, Any]) -> Set[int]:
-    input_exec = execution_result.get("input_side_execution", {})
-    if not isinstance(input_exec, dict):
-        return set()
-    hypothesis_results_raw = input_exec.get("hypothesis_results", [])
-    hypothesis_results = (
-        [item for item in hypothesis_results_raw if isinstance(item, dict)]
-        if isinstance(hypothesis_results_raw, list)
-        else []
-    )
-    frozen: Set[int] = set()
-    for item in hypothesis_results:
-        index = _safe_int(item.get("hypothesis_index"), 0)
-        if index <= 0:
-            continue
-        if _is_input_hypothesis_full_score(item):
-            frozen.add(index)
-    return frozen
-
-
 def _normalize_hypothesis_list(value: Any) -> List[str]:
     if not isinstance(value, list):
         return []
     return [str(item).strip() for item in value]
-
-
-def _copy_dict(value: Any) -> Dict[str, Any]:
-    return dict(value) if isinstance(value, dict) else {}
-
-
-def _build_filtered_hypotheses_for_active_input(
-    *,
-    hypotheses_result: Dict[str, Any],
-    active_input_indices: Sequence[int],
-) -> Dict[str, Any]:
-    payload = dict(hypotheses_result)
-    input_hypotheses = _normalize_hypothesis_list(hypotheses_result.get("input_side_hypotheses", []))
-    input_reasons_raw = hypotheses_result.get("input_side_hypothesis_reasons", [])
-    input_reasons = (
-        [str(item) if item is not None else "" for item in input_reasons_raw]
-        if isinstance(input_reasons_raw, list)
-        else []
-    )
-
-    filtered_hypotheses: List[str] = []
-    filtered_reasons: List[str] = []
-    for index in active_input_indices:
-        if 1 <= index <= len(input_hypotheses):
-            filtered_hypotheses.append(input_hypotheses[index - 1])
-            filtered_reasons.append(input_reasons[index - 1] if index - 1 < len(input_reasons) else "")
-
-    payload["input_side_hypotheses"] = filtered_hypotheses
-    payload["input_side_hypothesis_reasons"] = filtered_reasons
-    return payload
-
-
-def _merge_input_experiments_from_active_and_frozen(
-    *,
-    current_hypotheses: Dict[str, Any],
-    active_indices: Sequence[int],
-    frozen_indices: Set[int],
-    active_experiments_result: Dict[str, Any],
-    previous_experiments_result: Dict[str, Any],
-) -> Dict[str, Any]:
-    merged = dict(active_experiments_result)
-    input_hypotheses = _normalize_hypothesis_list(current_hypotheses.get("input_side_hypotheses", []))
-    total_input = len(input_hypotheses)
-    active_items_raw = active_experiments_result.get("input_side_experiments", [])
-    active_items = [item for item in active_items_raw if isinstance(item, dict)] if isinstance(active_items_raw, list) else []
-    previous_items_raw = previous_experiments_result.get("input_side_experiments", [])
-    previous_items = (
-        [item for item in previous_items_raw if isinstance(item, dict)] if isinstance(previous_items_raw, list) else []
-    )
-
-    merged_items: List[Optional[Dict[str, Any]]] = [None] * total_input
-    for index in frozen_indices:
-        if 1 <= index <= len(previous_items):
-            carried = _copy_dict(previous_items[index - 1])
-            if 1 <= index <= total_input:
-                carried["hypothesis"] = input_hypotheses[index - 1]
-            merged_items[index - 1] = carried
-
-    for position, index in enumerate(active_indices):
-        if not (1 <= index <= total_input):
-            continue
-        if position >= len(active_items):
-            raise ValueError(
-                "Active input experiments count does not match expected active hypotheses count."
-            )
-        generated = _copy_dict(active_items[position])
-        generated["hypothesis"] = input_hypotheses[index - 1]
-        merged_items[index - 1] = generated
-
-    if any(item is None for item in merged_items):
-        raise ValueError("Failed to assemble merged input experiments for all hypotheses.")
-
-    merged["input_side_experiments"] = [item for item in merged_items if isinstance(item, dict)]
-    output_hypotheses = _normalize_hypothesis_list(current_hypotheses.get("output_side_hypotheses", []))
-    merged["num_hypothesis"] = max(len(input_hypotheses), len(output_hypotheses))
-    return merged
-
-
-def _merge_input_execution_from_active_and_frozen(
-    *,
-    current_hypotheses: Dict[str, Any],
-    active_indices: Sequence[int],
-    frozen_indices: Set[int],
-    active_execution_result: Dict[str, Any],
-    previous_execution_result: Dict[str, Any],
-) -> Dict[str, Any]:
-    merged = dict(active_execution_result)
-    input_hypotheses = _normalize_hypothesis_list(current_hypotheses.get("input_side_hypotheses", []))
-    total_input = len(input_hypotheses)
-
-    active_input_exec = active_execution_result.get("input_side_execution", {})
-    active_items_raw = active_input_exec.get("hypothesis_results", []) if isinstance(active_input_exec, dict) else []
-    active_items = [item for item in active_items_raw if isinstance(item, dict)] if isinstance(active_items_raw, list) else []
-
-    previous_input_exec = previous_execution_result.get("input_side_execution", {})
-    previous_items_raw = previous_input_exec.get("hypothesis_results", []) if isinstance(previous_input_exec, dict) else []
-    previous_items = (
-        [item for item in previous_items_raw if isinstance(item, dict)] if isinstance(previous_items_raw, list) else []
-    )
-
-    merged_items: List[Optional[Dict[str, Any]]] = [None] * total_input
-    for index in frozen_indices:
-        if 1 <= index <= len(previous_items):
-            carried = _copy_dict(previous_items[index - 1])
-            carried["hypothesis_index"] = index
-            if 1 <= index <= total_input:
-                carried["hypothesis"] = input_hypotheses[index - 1]
-            merged_items[index - 1] = carried
-
-    for position, index in enumerate(active_indices):
-        if not (1 <= index <= total_input):
-            continue
-        if position >= len(active_items):
-            raise ValueError(
-                "Active input execution count does not match expected active hypotheses count."
-            )
-        generated = _copy_dict(active_items[position])
-        generated["hypothesis_index"] = index
-        generated["hypothesis"] = input_hypotheses[index - 1]
-        merged_items[index - 1] = generated
-
-    if any(item is None for item in merged_items):
-        raise ValueError("Failed to assemble merged input execution for all hypotheses.")
-
-    boundary_values = [
-        _safe_float(item.get("score_boundary_non_activation_rate"), 0.0)
-        for item in merged_items
-        if isinstance(item, dict) and item.get("score_boundary_non_activation_rate") is not None
-    ]
-    non_zero_values = [
-        _safe_float(item.get("score_non_zero_rate"), 0.0)
-        for item in merged_items
-        if isinstance(item, dict)
-    ]
-    merged_input_execution = dict(active_input_exec) if isinstance(active_input_exec, dict) else {}
-    merged_input_execution["hypothesis_results"] = [item for item in merged_items if isinstance(item, dict)]
-    merged_input_execution["overall_score_non_zero_rate"] = (
-        (sum(non_zero_values) / len(non_zero_values)) if non_zero_values else 0.0
-    )
-    merged_input_execution["overall_score_boundary_non_activation_rate"] = (
-        (sum(boundary_values) / len(boundary_values)) if boundary_values else None
-    )
-    merged["input_side_execution"] = merged_input_execution
-    return merged
 
 
 def _format_elapsed(total_seconds: float) -> str:
@@ -334,45 +175,29 @@ def _build_input_hypothesis_selection_payload(
         )
         for item in hypothesis_results:
             score_non_zero_rate = _safe_float(item.get("score_non_zero_rate"), 0.0)
-            boundary_score_raw = item.get("score_boundary_non_activation_rate")
-            boundary_score_for_ranking = (
-                _safe_float(boundary_score_raw, 0.0) if boundary_score_raw is not None else 0.0
-            )
-            combined_score = score_non_zero_rate + boundary_score_for_ranking
+            test_type = _clean_text(item.get("test_type")) or "activation"
+            test_type_rank = 1 if test_type == "expansion" else 0
             entries.append(
                 {
                     "round_index": round_index,
                     "round_id": round_id,
                     "hypothesis_index": _safe_int(item.get("hypothesis_index"), 0),
                     "hypothesis": _clean_text(item.get("hypothesis")),
+                    "test_type": test_type,
                     "score_non_zero_rate": score_non_zero_rate,
-                    "score_boundary_non_activation_rate": (
-                        _safe_float(boundary_score_raw, 0.0) if boundary_score_raw is not None else None
-                    ),
-                    "score_boundary_non_activation_rate_for_ranking": boundary_score_for_ranking,
-                    "combined_score": combined_score,
+                    "combined_score": score_non_zero_rate,
+                    "test_type_rank": test_type_rank,
                     "non_zero_count": _safe_int(item.get("non_zero_count"), 0),
                     "total_sentences": _safe_int(item.get("total_sentences"), 0),
-                    "boundary_non_activation_count": _safe_int(item.get("boundary_non_activation_count"), 0),
-                    "total_boundary_sentences": _safe_int(item.get("total_boundary_sentences"), 0),
                     "designed_sentences": (
                         list(item.get("designed_sentences", []))
                         if isinstance(item.get("designed_sentences"), list)
                         else []
                     ),
-                    "boundary_sentences": (
-                        list(item.get("boundary_sentences", []))
-                        if isinstance(item.get("boundary_sentences"), list)
-                        else []
-                    ),
+                    "reference_hypothesis": _clean_text(item.get("reference_hypothesis")),
                     "sentence_results": (
                         list(item.get("sentence_results", []))
                         if isinstance(item.get("sentence_results"), list)
-                        else []
-                    ),
-                    "boundary_sentence_results": (
-                        list(item.get("boundary_sentence_results", []))
-                        if isinstance(item.get("boundary_sentence_results"), list)
                         else []
                     ),
                     "source_execution_round_path": str(
@@ -390,7 +215,8 @@ def _build_input_hypothesis_selection_payload(
     ranked_entries = sorted(
         entries,
         key=lambda item: (
-            -_safe_float(item.get("combined_score"), 0.0),
+            -_safe_float(item.get("score_non_zero_rate"), 0.0),
+            -_safe_int(item.get("test_type_rank"), 0),
             -_safe_int(item.get("round_index"), -1),
             _safe_int(item.get("hypothesis_index"), 10**9),
         ),
@@ -403,7 +229,7 @@ def _build_input_hypothesis_selection_payload(
         "feature_id": feature_id,
         "timestamp": timestamp,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "score_formula": "score_non_zero_rate + score_boundary_non_activation_rate",
+        "score_formula": "score_non_zero_rate (tie-breaker: prefer expansion rounds, then newer rounds)",
         "total_candidates": len(ranked_entries),
         "best_hypothesis": best_hypothesis,
         "hypotheses": ranked_entries,
@@ -462,8 +288,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-id", default="gemma-2-2b", help="Neuronpedia model id")
     parser.add_argument("--layer-id", required=True, help="Layer id")
     parser.add_argument("--feature-id", required=True, help="Feature id")
-    parser.add_argument("--timestamp", default=None, help="Timestamp directory under logs/{layer}_{feature}/")
-    parser.add_argument("--max-rounds", type=int, default=1, help="Maximum refinement rounds (round_1..round_n).")
+    parser.add_argument("--timestamp", default=None, help="Timestamp directory under logs/{layer}/{feature}/")
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=None,
+        help="Legacy override for refinement rounds after baseline. If omitted, input-side rounds use p+q schedule.",
+    )
+    parser.add_argument(
+        "--input-activation-max-rounds",
+        type=int,
+        default=1,
+        help="Input-side activation test rounds p (includes baseline round_0).",
+    )
+    parser.add_argument(
+        "--input-expansion-max-rounds",
+        type=int,
+        default=1,
+        help="Input-side expansion test rounds q.",
+    )
     parser.add_argument(
         "--start-round",
         type=int,
@@ -486,7 +329,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="Reuse artifacts before start point from logs/{layer}_{feature}/{timestamp}/{round_id}.",
+        help="Reuse artifacts before start point from logs/{layer}/{feature}/{timestamp}/{round_id}.",
     )
 
     parser.add_argument("--num-hypothesis", type=int, default=3, help="Hypothesis count n for each side")
@@ -506,7 +349,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--num-input-sentences-per-hypothesis",
         type=int,
         default=5,
-        help="Input-side designed activation and boundary sentences per hypothesis.",
+        help="Input-side designed activation or expansion sentences per hypothesis.",
     )
     parser.add_argument("--top-m", type=int, default=None, help="Refine top-m hypotheses per side (default=all).")
     parser.add_argument(
@@ -541,10 +384,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--neuronpedia-timeout", type=int, default=30)
 
     parser.add_argument("--llm-base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--llm-model", default=DEFAULT_MODEL_NAME)
+    parser.add_argument(
+        "--llm-generation-model",
+        "--llm-model",
+        dest="llm_generation_model",
+        default=DEFAULT_MODEL_NAME,
+        help="LLM model used for hypothesis generation/refinement/experiment design.",
+    )
+    parser.add_argument(
+        "--llm-judge-model",
+        default=None,
+        help="LLM model used for judge-style calls (output-side intervention judge). Defaults to generation model.",
+    )
     parser.add_argument("--llm-api-key-file", default=DEFAULT_API_KEY_FILE)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=50000)
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
 
     parser.add_argument("--model-checkpoint-path", default="google/gemma-2-2b")
     parser.add_argument("--sae-path", default=None, help="SAE path or sae-lens URI")
@@ -564,7 +418,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-judge-trials", type=int, default=1)
     parser.add_argument("--output-judge-seed", type=int, default=42)
     parser.add_argument("--output-judge-temperature", type=float, default=0.0)
-    parser.add_argument("--output-judge-max-tokens", type=int, default=10000)
+    parser.add_argument("--output-judge-max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--output-kl-values", type=float, nargs="*", default=KL_DIV_VALUES_DEFAULT)
     parser.add_argument(
         "--output-intervention-method",
@@ -584,9 +438,34 @@ if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
     workflow_start_time = time.perf_counter()
     merge_enabled = bool(args.enable_hypothesis_merge)
+    generation_model = str(args.llm_generation_model).strip() or DEFAULT_MODEL_NAME
+    judge_model = str(args.llm_judge_model).strip() if args.llm_judge_model else generation_model
+    activation_max_rounds = _safe_int(args.input_activation_max_rounds, 1)
+    expansion_max_rounds = _safe_int(args.input_expansion_max_rounds, 1)
+    if activation_max_rounds < 1:
+        raise ValueError("--input-activation-max-rounds must be >= 1.")
+    if expansion_max_rounds < 0:
+        raise ValueError("--input-expansion-max-rounds must be >= 0.")
+    scheduled_input_total_rounds = activation_max_rounds + expansion_max_rounds
+    if scheduled_input_total_rounds < 1:
+        raise ValueError("input-side total rounds p+q must be >= 1.")
+    if args.max_rounds is not None and args.max_rounds < 0:
+        raise ValueError("--max-rounds must be >= 0 when provided.")
+    if args.max_rounds is not None:
+        # Legacy override: --max-rounds counts refinement rounds after baseline.
+        scheduled_input_total_rounds = max(int(args.max_rounds) + 1, 1)
+        if scheduled_input_total_rounds < activation_max_rounds:
+            raise ValueError(
+                "--max-rounds is too small for --input-activation-max-rounds "
+                "(need max_rounds + 1 >= input_activation_max_rounds)."
+            )
+        expansion_max_rounds = max(scheduled_input_total_rounds - activation_max_rounds, 0)
 
-    if args.max_rounds < 0:
-        raise ValueError("--max-rounds must be >= 0.")
+    if args.side in ("input", "both"):
+        effective_max_rounds = max(scheduled_input_total_rounds - 1, 0)
+    else:
+        effective_max_rounds = max(int(args.max_rounds), 0) if args.max_rounds is not None else max(scheduled_input_total_rounds - 1, 0)
+
     if args.start_round < 0:
         raise ValueError("--start-round must be >= 0.")
     if args.start_round == 0 and args.start_step not in (1, 2, 3, 4, 5):
@@ -597,8 +476,8 @@ if __name__ == "__main__":
             if merge_enabled:
                 raise ValueError("When --start-round>=1 with merge enabled, --start-step must be one of 1/2/3/4/5.")
             raise ValueError("When --start-round>=1 with merge disabled, --start-step must be one of 1/2/3/4.")
-    if args.start_round > args.max_rounds and args.start_round > 0:
-        raise ValueError("--start-round cannot be greater than --max-rounds.")
+    if args.start_round > effective_max_rounds and args.start_round > 0:
+        raise ValueError("--start-round cannot be greater than effective max rounds.")
     if args.history_rounds is not None and args.history_rounds < 0:
         raise ValueError("--history-rounds must be >= 0 when provided.")
     if (args.start_round != 0 or args.start_step != 1) and not args.reuse_from_logs:
@@ -667,7 +546,7 @@ if __name__ == "__main__":
             timestamp=ts,
             round_id=_round_id_from_index(0),
             llm_base_url=args.llm_base_url,
-            llm_model=args.llm_model,
+            llm_model=generation_model,
             llm_api_key_file=args.llm_api_key_file,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
@@ -695,6 +574,9 @@ if __name__ == "__main__":
     last_output_intervention_method = str(args.output_intervention_method)
     last_output_score_name = "score_blind_accuracy"
     last_output_logit_top_k = args.output_logit_top_k
+    current_input_test_mode: str = "activation"
+    input_activation_rounds_done = 0
+    input_expansion_rounds_done = 0
 
     def update_last_output_meta(
         execution_result_payload: Dict[str, Any],
@@ -731,9 +613,10 @@ if __name__ == "__main__":
             hypotheses_result=current_hypotheses,
             num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
             run_side=args.side,
+            input_test_mode=current_input_test_mode,
             round_id=baseline_round_id,
             llm_base_url=args.llm_base_url,
-            llm_model=args.llm_model,
+            llm_model=generation_model,
             llm_api_key_file=args.llm_api_key_file,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
@@ -775,7 +658,7 @@ if __name__ == "__main__":
             run_side=args.side,
             round_id=baseline_round_id,
             llm_base_url=args.llm_base_url,
-            llm_model=args.llm_model,
+            output_judge_llm_model=judge_model,
             llm_api_key_file=args.llm_api_key_file,
             input_non_zero_threshold=args.input_non_zero_threshold,
             output_judge_num_choices=args.output_judge_num_choices,
@@ -813,6 +696,28 @@ if __name__ == "__main__":
     last_executed_hypotheses = current_hypotheses
     previous_execution_result = baseline_execution_result
     previous_experiments_result = baseline_experiments_result
+    if args.side in ("input", "both"):
+        baseline_mode = _clean_text(
+            baseline_experiments_result.get("input_test_mode")
+            or baseline_execution_result.get("input_side_execution", {}).get("input_test_mode")
+            or current_input_test_mode
+        ) or "activation"
+        baseline_activation_full = (
+            _safe_float(
+                baseline_execution_result.get("input_side_execution", {}).get("overall_score_non_zero_rate"),
+                0.0,
+            )
+            >= 1.0
+        )
+        if baseline_mode == "expansion":
+            input_expansion_rounds_done += 1
+            current_input_test_mode = "expansion"
+        else:
+            input_activation_rounds_done += 1
+            if baseline_activation_full or input_activation_rounds_done >= activation_max_rounds:
+                current_input_test_mode = "expansion"
+            else:
+                current_input_test_mode = "activation"
 
     baseline_memory_path = _artifact_json_path(
         layer_id=layer_id,
@@ -841,7 +746,11 @@ if __name__ == "__main__":
     round_memories[0] = baseline_memory_result
     previous_memory_result = baseline_memory_result
 
-    for round_index in range(1, args.max_rounds + 1):
+    for round_index in range(1, effective_max_rounds + 1):
+        if args.side in ("input", "both"):
+            if current_input_test_mode == "expansion" and input_expansion_rounds_done >= expansion_max_rounds:
+                break
+
         round_id = _round_id_from_index(round_index)
         round_design_step_index = 3 if merge_enabled else 2
         round_execution_step_index = 4 if merge_enabled else 3
@@ -919,7 +828,7 @@ if __name__ == "__main__":
                 timestamp=ts,
                 round_id=round_id,
                 llm_base_url=args.llm_base_url,
-                llm_model=args.llm_model,
+                llm_model=generation_model,
                 llm_api_key_file=args.llm_api_key_file,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
@@ -952,7 +861,7 @@ if __name__ == "__main__":
                     timestamp=ts,
                     round_id=round_id,
                     llm_base_url=args.llm_base_url,
-                    llm_model=args.llm_model,
+                    llm_model=generation_model,
                     llm_api_key_file=args.llm_api_key_file,
                     temperature=args.temperature,
                     max_tokens=args.max_tokens,
@@ -973,24 +882,9 @@ if __name__ == "__main__":
             round_index=round_index,
         )
         last_executed_hypotheses = current_hypotheses
-
-        frozen_input_indices: Set[int] = set()
-        if args.side in ("input", "both") and isinstance(previous_execution_result, dict):
-            frozen_candidates = _frozen_input_indices_from_execution(previous_execution_result)
-            before_input = _normalize_hypothesis_list(hypotheses_before_refine.get("input_side_hypotheses", []))
-            after_input = _normalize_hypothesis_list(current_hypotheses.get("input_side_hypotheses", []))
-            for idx in frozen_candidates:
-                if 1 <= idx <= len(before_input) and 1 <= idx <= len(after_input):
-                    if before_input[idx - 1] == after_input[idx - 1]:
-                        frozen_input_indices.add(idx)
-
-        total_input_hypotheses = len(_normalize_hypothesis_list(current_hypotheses.get("input_side_hypotheses", [])))
-        active_input_indices = [
-            idx for idx in range(1, total_input_hypotheses + 1) if idx not in frozen_input_indices
-        ]
-        hypotheses_for_design = _build_filtered_hypotheses_for_active_input(
-            hypotheses_result=current_hypotheses,
-            active_input_indices=active_input_indices,
+        input_test_mode_for_round = current_input_test_mode if args.side in ("input", "both") else "activation"
+        previous_input_hypotheses_for_design = _normalize_hypothesis_list(
+            hypotheses_before_refine.get("input_side_hypotheses", [])
         )
 
         experiments_path = _artifact_json_path(
@@ -1007,37 +901,21 @@ if __name__ == "__main__":
             round_index=round_index,
             step_index=round_design_step_index,
         ):
-            active_experiments_result = design_hypothesis_experiments(
-                hypotheses_result=hypotheses_for_design,
+            experiments_result = design_hypothesis_experiments(
+                hypotheses_result=current_hypotheses,
                 num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
                 run_side=args.side,
+                input_test_mode=input_test_mode_for_round,
+                previous_input_hypotheses=previous_input_hypotheses_for_design,
                 round_id=round_id,
                 llm_base_url=args.llm_base_url,
-                llm_model=args.llm_model,
+                llm_model=generation_model,
                 llm_api_key_file=args.llm_api_key_file,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
             )
-            if frozen_input_indices:
-                if previous_experiments_result is None:
-                    raise ValueError("Missing previous experiments result for frozen input hypotheses.")
-                experiments_result = _merge_input_experiments_from_active_and_frozen(
-                    current_hypotheses=current_hypotheses,
-                    active_indices=active_input_indices,
-                    frozen_indices=frozen_input_indices,
-                    active_experiments_result=active_experiments_result,
-                    previous_experiments_result=previous_experiments_result,
-                )
-                _save_json(experiments_path, experiments_result)
-                write_experiments_markdown(
-                    experiments_path.with_suffix(".md"),
-                    result=experiments_result,
-                    llm_calls=active_experiments_result.get("llm_calls", []),
-                )
-            else:
-                experiments_result = active_experiments_result
             executed_steps.append(f"{round_id}_step_{round_design_step_index}_experiments_design")
-            track_usage(active_experiments_result, executed=True)
+            track_usage(experiments_result, executed=True)
         else:
             experiments_result = _load_json_or_raise(experiments_path)
             loaded_steps.append(f"{round_id}_step_{round_design_step_index}_experiments_design")
@@ -1072,23 +950,13 @@ if __name__ == "__main__":
                     feature_index=int(feature_id),
                     device=args.device,
                 )
-            experiments_for_execution = dict(experiments_result)
-            if frozen_input_indices:
-                active_input_experiments = []
-                all_input_experiments = experiments_result.get("input_side_experiments", [])
-                if isinstance(all_input_experiments, list):
-                    for idx in active_input_indices:
-                        if 1 <= idx <= len(all_input_experiments) and isinstance(all_input_experiments[idx - 1], dict):
-                            active_input_experiments.append(dict(all_input_experiments[idx - 1]))
-                experiments_for_execution["input_side_experiments"] = active_input_experiments
-
-            active_execution_result = execute_hypothesis_experiments(
-                experiments_result=experiments_for_execution,
+            execution_result = execute_hypothesis_experiments(
+                experiments_result=experiments_result,
                 module=module,
                 run_side=args.side,
                 round_id=round_id,
                 llm_base_url=args.llm_base_url,
-                llm_model=args.llm_model,
+                output_judge_llm_model=judge_model,
                 llm_api_key_file=args.llm_api_key_file,
                 input_non_zero_threshold=args.input_non_zero_threshold,
                 output_judge_num_choices=args.output_judge_num_choices,
@@ -1106,26 +974,8 @@ if __name__ == "__main__":
                 output_logit_force_refresh_kl_cache=args.output_logit_force_refresh_kl_cache,
                 output_logit_include_special_tokens=args.output_logit_include_special_tokens,
             )
-            if frozen_input_indices:
-                if previous_execution_result is None:
-                    raise ValueError("Missing previous execution result for frozen input hypotheses.")
-                execution_result = _merge_input_execution_from_active_and_frozen(
-                    current_hypotheses=current_hypotheses,
-                    active_indices=active_input_indices,
-                    frozen_indices=frozen_input_indices,
-                    active_execution_result=active_execution_result,
-                    previous_execution_result=previous_execution_result,
-                )
-                _save_json(execution_path, execution_result)
-                write_execution_markdown(
-                    execution_path.with_suffix(".md"),
-                    result=execution_result,
-                    llm_calls=execution_result.get("llm_calls", []),
-                )
-            else:
-                execution_result = active_execution_result
             executed_steps.append(f"{round_id}_step_{round_execution_step_index}_experiments_execution")
-            track_usage(active_execution_result, executed=True)
+            track_usage(execution_result, executed=True)
         else:
             execution_result = _load_json_or_raise(execution_path)
             loaded_steps.append(f"{round_id}_step_{round_execution_step_index}_experiments_execution")
@@ -1177,7 +1027,30 @@ if __name__ == "__main__":
         previous_memory_result = memory_result
         last_round_executed = round_index
 
-        if converged_this_round:
+        if args.side in ("input", "both"):
+            used_mode = _clean_text(
+                experiments_result.get("input_test_mode")
+                or execution_result.get("input_side_execution", {}).get("input_test_mode")
+                or input_test_mode_for_round
+            ) or input_test_mode_for_round
+            full_activation = (
+                _safe_float(
+                    execution_result.get("input_side_execution", {}).get("overall_score_non_zero_rate"),
+                    0.0,
+                )
+                >= 1.0
+            )
+            if used_mode == "expansion":
+                input_expansion_rounds_done += 1
+                current_input_test_mode = "expansion"
+            else:
+                input_activation_rounds_done += 1
+                if full_activation or input_activation_rounds_done >= activation_max_rounds:
+                    current_input_test_mode = "expansion"
+                else:
+                    current_input_test_mode = "activation"
+
+        if args.side not in ("input", "both") and converged_this_round:
             converged = True
             converged_round = round_index
             break
@@ -1191,7 +1064,7 @@ if __name__ == "__main__":
     final_input_reasons = list(final_hypotheses_source.get("input_side_hypothesis_reasons", []))
     final_output_reasons = list(final_hypotheses_source.get("output_side_hypothesis_reasons", []))
 
-    ts_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts
+    ts_dir = build_feature_dir(layer_id=layer_id, feature_id=feature_id) / ts
     ts_dir.mkdir(parents=True, exist_ok=True)
 
     input_hypothesis_cache_path = (
@@ -1214,8 +1087,8 @@ if __name__ == "__main__":
             "round_id": _round_id_from_index(last_round_executed if last_round_executed > 0 else 0),
             "hypothesis_index": 1 if fallback_hypothesis else 0,
             "hypothesis": fallback_hypothesis,
+            "test_type": None,
             "score_non_zero_rate": None,
-            "score_boundary_non_activation_rate": None,
             "combined_score": None,
         }
 
@@ -1228,7 +1101,8 @@ if __name__ == "__main__":
     memory_lines.append(f"- layer_id: {layer_id}")
     memory_lines.append(f"- feature_id: {feature_id}")
     memory_lines.append(f"- timestamp: {ts}")
-    memory_lines.append(f"- max_rounds: {args.max_rounds}")
+    memory_lines.append(f"- scheduled_input_total_rounds_p_plus_q: {scheduled_input_total_rounds}")
+    memory_lines.append(f"- effective_refinement_rounds: {effective_max_rounds}")
     memory_lines.append("")
     memory_lines.append("## Round Memories")
     if round_memories:
@@ -1240,7 +1114,7 @@ if __name__ == "__main__":
             memory_lines.append("```")
             memory_lines.append("")
     else:
-        memory_lines.append("- no iterative memory generated (max_rounds=0)")
+        memory_lines.append("- no iterative memory generated (effective_max_rounds=0)")
     workflow_memory_md.write_text("\n".join(memory_lines) + "\n", encoding="utf-8")
 
     final_dir = ts_dir / "final_result"
@@ -1250,7 +1124,13 @@ if __name__ == "__main__":
         "layer_id": layer_id,
         "feature_id": feature_id,
         "timestamp": ts,
-        "max_rounds": args.max_rounds,
+        "max_rounds": effective_max_rounds,
+        "input_activation_max_rounds": activation_max_rounds,
+        "input_expansion_max_rounds": expansion_max_rounds,
+        "scheduled_input_total_rounds": scheduled_input_total_rounds,
+        "input_activation_rounds_done": input_activation_rounds_done,
+        "input_expansion_rounds_done": input_expansion_rounds_done,
+        "last_input_test_mode": current_input_test_mode,
         "executed_rounds": last_round_executed,
         "converged": converged,
         "converged_round": converged_round,
@@ -1287,7 +1167,13 @@ if __name__ == "__main__":
     lines.append(f"- layer_id: {layer_id}")
     lines.append(f"- feature_id: {feature_id}")
     lines.append(f"- timestamp: {ts}")
-    lines.append(f"- max_rounds: {args.max_rounds}")
+    lines.append(f"- max_rounds: {effective_max_rounds}")
+    lines.append(f"- input_activation_max_rounds: {activation_max_rounds}")
+    lines.append(f"- input_expansion_max_rounds: {expansion_max_rounds}")
+    lines.append(f"- scheduled_input_total_rounds: {scheduled_input_total_rounds}")
+    lines.append(f"- input_activation_rounds_done: {input_activation_rounds_done}")
+    lines.append(f"- input_expansion_rounds_done: {input_expansion_rounds_done}")
+    lines.append(f"- last_input_test_mode: {current_input_test_mode}")
     lines.append(f"- executed_rounds: {last_round_executed}")
     lines.append(f"- converged: {converged}")
     lines.append(f"- converged_round: {converged_round}")
@@ -1314,10 +1200,8 @@ if __name__ == "__main__":
     lines.append("## Best Input Hypothesis For Final Evaluation")
     lines.append(f"- round_id: {best_input_hypothesis.get('round_id')}")
     lines.append(f"- hypothesis_index: {best_input_hypothesis.get('hypothesis_index')}")
+    lines.append(f"- test_type: {best_input_hypothesis.get('test_type')}")
     lines.append(f"- score_non_zero_rate: {best_input_hypothesis.get('score_non_zero_rate')}")
-    lines.append(
-        f"- score_boundary_non_activation_rate: {best_input_hypothesis.get('score_boundary_non_activation_rate')}"
-    )
     lines.append(f"- combined_score: {best_input_hypothesis.get('combined_score')}")
     lines.append("```text")
     lines.append(str(best_input_hypothesis.get("hypothesis", "")))

@@ -9,6 +9,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 from openai import OpenAI
 
 DEFAULT_CANONICAL_MAP_PATH = Path("support_info") / "canonical_map.txt"
+DEFAULT_MAX_TOKENS = 20000
 
 
 def _safe_int(value: Any) -> int:
@@ -53,6 +54,18 @@ def normalize_round_id(round_id: Optional[str], *, round_index: Optional[int] = 
     return "round_1"
 
 
+def build_feature_dir(*, layer_id: str, feature_id: str) -> Path:
+    """
+    Canonical feature directory layout:
+    logs/{layer_id}/{feature_id}
+    """
+    return Path("logs") / str(layer_id) / str(feature_id)
+
+
+def build_timestamp_dir(*, layer_id: str, feature_id: str, timestamp: str) -> Path:
+    return build_feature_dir(layer_id=layer_id, feature_id=feature_id) / str(timestamp)
+
+
 def build_round_dir(
     *,
     layer_id: str,
@@ -62,7 +75,49 @@ def build_round_dir(
     round_index: Optional[int] = None,
 ) -> Path:
     resolved_round_id = normalize_round_id(round_id, round_index=round_index)
-    return Path("logs") / f"{layer_id}_{feature_id}" / str(timestamp) / resolved_round_id
+    return build_timestamp_dir(layer_id=layer_id, feature_id=feature_id, timestamp=timestamp) / resolved_round_id
+
+
+def resolve_existing_timestamp_dir(
+    *,
+    layer_id: str,
+    feature_id: str,
+    timestamp: str,
+) -> Optional[Path]:
+    """
+    Resolve timestamp dir for reading with backward compatibility.
+    Prefer new layout logs/{layer}/{feature}/{timestamp}, fallback to legacy
+    logs/{layer}_{feature}/{timestamp}.
+    """
+    new_dir = build_timestamp_dir(layer_id=layer_id, feature_id=feature_id, timestamp=timestamp)
+    if new_dir.exists():
+        return new_dir
+    legacy_dir = Path("logs") / f"{layer_id}_{feature_id}" / str(timestamp)
+    if legacy_dir.exists():
+        return legacy_dir
+    return None
+
+
+def resolve_existing_round_dir(
+    *,
+    layer_id: str,
+    feature_id: str,
+    timestamp: str,
+    round_id: Optional[str] = None,
+    round_index: Optional[int] = None,
+) -> Optional[Path]:
+    resolved_round_id = normalize_round_id(round_id, round_index=round_index)
+    ts_dir = resolve_existing_timestamp_dir(
+        layer_id=layer_id,
+        feature_id=feature_id,
+        timestamp=timestamp,
+    )
+    if ts_dir is None:
+        return None
+    round_dir = ts_dir / resolved_round_id
+    if round_dir.exists():
+        return round_dir
+    return None
 
 
 def extract_average_l0_from_canonical_map(

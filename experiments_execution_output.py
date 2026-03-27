@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Sequence
 
 from openai import OpenAI
 
-from function import TokenUsageAccumulator, call_llm
+from function import DEFAULT_MAX_TOKENS, TokenUsageAccumulator, call_llm
 from prompts.experiments_execution_prompt import build_output_judge_system_prompt, build_output_judge_user_prompt
 
 if TYPE_CHECKING:
@@ -172,7 +172,7 @@ def execute_output_side_experiments(
     max_new_tokens: int = 25,
     generation_temperature: float = 0.75,
     judge_temperature: float = 0.0,
-    judge_max_tokens: int = 1024,
+    judge_max_tokens: int = DEFAULT_MAX_TOKENS,
     kl_values: Sequence[float] = KL_DIV_VALUES_DEFAULT,
     intervention_method: OutputInterventionMethod = "blind",
     logit_top_k: int = 5,

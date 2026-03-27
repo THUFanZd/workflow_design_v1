@@ -1,42 +1,20 @@
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Literal, Sequence
 
 from model_with_sae import ModelWithSAEModule
 from prompts.experiments_execution_prompt import (
     build_input_activation_context,
-    build_input_boundary_context,
+    build_input_expansion_context,
 )
 
-
-def _load_compare_generate_boundary_contexts():
-    compare_path = (
-        Path(__file__).resolve().parent
-        / "explanation_quality_evaluation"
-        / "input-side-evaluation"
-        / "compare_explanations_with_llm.py"
-    )
-    spec = importlib.util.spec_from_file_location("compare_explanations_with_llm_shared", str(compare_path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to load module spec from {compare_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return getattr(module, "generate_boundary_contexts")
-
-
-def generate_boundary_contexts(*args: Any, **kwargs: Any) -> List[str]:
-    compare_generate_boundary_contexts = _load_compare_generate_boundary_contexts()
-    return compare_generate_boundary_contexts(*args, **kwargs)
+InputTestType = Literal["activation", "expansion"]
 
 
 def _extract_designed_sentences(experiment_item: Dict[str, Any]) -> List[str]:
     raw = experiment_item.get("designed_sentences")
     if not isinstance(raw, list):
-        raise ValueError("Each input-side experiment item must contain a list field 'designed_sentences'.")
+        raise ValueError("Each input-side experiment item must contain list field 'designed_sentences'.")
     sentences: List[str] = []
     for item in raw:
         if isinstance(item, str) and item.strip():
@@ -44,17 +22,15 @@ def _extract_designed_sentences(experiment_item: Dict[str, Any]) -> List[str]:
     return sentences
 
 
-def _extract_boundary_sentences(experiment_item: Dict[str, Any]) -> List[str]:
-    raw = experiment_item.get("boundary_sentences")
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise ValueError("Field 'boundary_sentences' must be a list when provided.")
-    sentences: List[str] = []
-    for item in raw:
-        if isinstance(item, str) and item.strip():
-            sentences.append(item.strip())
-    return sentences
+def _extract_test_type(experiment_item: Dict[str, Any]) -> InputTestType:
+    raw = str(experiment_item.get("test_type", "activation")).strip().lower()
+    if raw not in ("activation", "expansion"):
+        return "activation"
+    return "expansion" if raw == "expansion" else "activation"
+
+
+def _extract_reference_hypothesis(experiment_item: Dict[str, Any]) -> str:
+    return str(experiment_item.get("reference_hypothesis", "")).strip()
 
 
 def _extract_max_token(trace: Dict[str, Any]) -> str:
@@ -124,77 +100,60 @@ def execute_input_side_experiments(
 
     for hypothesis_index, item in enumerate(input_side_experiments, start=1):
         hypothesis_text = str(item.get("hypothesis", "")).strip()
+        test_type = _extract_test_type(item)
+        reference_hypothesis = _extract_reference_hypothesis(item)
         sentences = _extract_designed_sentences(item)
-        boundary_sentences = _extract_boundary_sentences(item)
 
-        activation_metrics = _run_sentence_batch(
+        metrics = _run_sentence_batch(
             module=module,
             sentences=sentences,
             non_zero_threshold=non_zero_threshold,
         )
-        boundary_metrics = _run_sentence_batch(
-            module=module,
-            sentences=boundary_sentences,
-            non_zero_threshold=non_zero_threshold,
-        )
-        boundary_non_activation_count = (
-            boundary_metrics["total_sentences"] - boundary_metrics["non_zero_count"]
-        )
-        boundary_non_activation_rate = (
-            boundary_non_activation_count / boundary_metrics["total_sentences"]
-            if boundary_metrics["total_sentences"] > 0
-            else None
-        )
+
+        if test_type == "expansion":
+            input_test_context = build_input_expansion_context(
+                hypothesis=hypothesis_text,
+                reference_hypothesis=reference_hypothesis,
+                expansion_sentences=sentences,
+            )
+        else:
+            input_test_context = build_input_activation_context(
+                hypothesis=hypothesis_text,
+                designed_sentences=sentences,
+            )
 
         hypothesis_results.append(
             {
                 "hypothesis_index": hypothesis_index,
                 "hypothesis": hypothesis_text,
+                "test_type": test_type,
+                "reference_hypothesis": reference_hypothesis,
                 "designed_sentences": sentences,
-                "boundary_sentences": boundary_sentences,
-                "input_activation_context": build_input_activation_context(
-                    hypothesis=hypothesis_text,
-                    designed_sentences=sentences,
+                "input_test_context": input_test_context,
+                "sentence_results": metrics["sentence_results"],
+                "non_zero_count": metrics["non_zero_count"],
+                "total_sentences": metrics["total_sentences"],
+                "score_non_zero_rate": metrics["score_non_zero_rate"],
+                "mean_summary_activation": metrics["mean_summary_activation"],
+                "max_summary_activation": metrics["max_summary_activation"],
+                "is_full_activation": bool(
+                    metrics["total_sentences"] > 0 and metrics["non_zero_count"] == metrics["total_sentences"]
                 ),
-                "input_boundary_context": build_input_boundary_context(
-                    hypothesis=hypothesis_text,
-                    boundary_sentences=boundary_sentences,
-                ),
-                "sentence_results": activation_metrics["sentence_results"],
-                "non_zero_count": activation_metrics["non_zero_count"],
-                "total_sentences": activation_metrics["total_sentences"],
-                "score_non_zero_rate": activation_metrics["score_non_zero_rate"],
-                "mean_summary_activation": activation_metrics["mean_summary_activation"],
-                "max_summary_activation": activation_metrics["max_summary_activation"],
-                "boundary_sentence_results": boundary_metrics["sentence_results"],
-                "boundary_non_zero_count": boundary_metrics["non_zero_count"],
-                "total_boundary_sentences": boundary_metrics["total_sentences"],
-                "score_boundary_non_zero_rate": boundary_metrics["score_non_zero_rate"],
-                "boundary_non_activation_count": boundary_non_activation_count,
-                "score_boundary_non_activation_rate": boundary_non_activation_rate,
-                "mean_boundary_summary_activation": boundary_metrics["mean_summary_activation"],
-                "max_boundary_summary_activation": boundary_metrics["max_summary_activation"],
             }
         )
 
     if hypothesis_results:
         overall_score = sum(item["score_non_zero_rate"] for item in hypothesis_results) / len(hypothesis_results)
-        boundary_values = [
-            item["score_boundary_non_activation_rate"]
-            for item in hypothesis_results
-            if item.get("score_boundary_non_activation_rate") is not None
-        ]
-        overall_boundary_score = (
-            sum(boundary_values) / len(boundary_values) if boundary_values else None
-        )
     else:
         overall_score = 0.0
-        overall_boundary_score = None
+
+    unique_test_types = sorted({str(item.get("test_type", "activation")) for item in hypothesis_results})
+    input_test_mode = unique_test_types[0] if len(unique_test_types) == 1 else "mixed"
 
     return {
         "side": "input",
         "non_zero_threshold": non_zero_threshold,
+        "input_test_mode": input_test_mode,
         "hypothesis_results": hypothesis_results,
         "overall_score_non_zero_rate": overall_score,
-        "overall_score_boundary_non_activation_rate": overall_boundary_score,
     }

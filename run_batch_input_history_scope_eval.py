@@ -121,6 +121,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sample-per-layer", type=int, default=2)
     parser.add_argument("--max-rounds", "--max_round", dest="max_rounds", type=int, default=1)
+    parser.add_argument("--input-activation-max-rounds", type=int, default=1)
+    parser.add_argument("--input-expansion-max-rounds", type=int, default=1)
+    parser.add_argument("--llm-generation-model", default=None, help="Forwarded to run_single/workflow.")
+    parser.add_argument("--llm-judge-model", default=None, help="Forwarded to run_single/workflow.")
     parser.add_argument("--num-hypothesis", type=int, default=3)
     parser.add_argument(
         "--generation-mode",
@@ -274,6 +278,10 @@ def main() -> None:
                 history_scope,
                 "--max-rounds",
                 str(args.max_rounds),
+                "--input-activation-max-rounds",
+                str(args.input_activation_max_rounds),
+                "--input-expansion-max-rounds",
+                str(args.input_expansion_max_rounds),
                 "--num-hypothesis",
                 str(args.num_hypothesis),
                 "--generation-mode",
@@ -309,6 +317,10 @@ def main() -> None:
                 single_cmd.append("--enable-hypothesis-merge")
             if args.top_m is not None:
                 single_cmd.extend(["--top-m", str(args.top_m)])
+            if args.llm_generation_model:
+                single_cmd.extend(["--llm-generation-model", str(args.llm_generation_model)])
+            if args.llm_judge_model:
+                single_cmd.extend(["--llm-judge-model", str(args.llm_judge_model)])
             if bool(args.force_run_input_eval):
                 single_cmd.append("--force-run-input-eval")
             single_returncode, _ = _run_command(single_cmd, dry_run=bool(args.dry_run))

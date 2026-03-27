@@ -25,7 +25,7 @@ class RoundScore:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Traverse logs/{layer-id}_{feature-id}/{timestamp}_{suffix}/ and draw "
+            "Traverse logs/{layer-id}/{feature-id}/{timestamp}/ and draw "
             "per-hypothesis score-vs-round line charts."
         )
     )
@@ -58,11 +58,19 @@ def parse_args() -> argparse.Namespace:
 def collect_run_dirs(logs_root: Path) -> list[Path]:
     if not logs_root.exists():
         return []
+    candidates: list[Path] = []
+    candidates.extend(sorted(p for p in logs_root.glob("*/*/*") if p.is_dir()))
+    candidates.extend(sorted(p for p in logs_root.glob("*/*") if p.is_dir()))
     run_dirs: list[Path] = []
-    for feature_dir in sorted(p for p in logs_root.iterdir() if p.is_dir()):
-        for run_dir in sorted(p for p in feature_dir.iterdir() if p.is_dir()):
+    seen: set[str] = set()
+    for run_dir in candidates:
+        key = str(run_dir.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        if any(p.is_dir() and ROUND_DIR_PATTERN.match(p.name) for p in run_dir.iterdir()):
             run_dirs.append(run_dir)
-    return run_dirs
+    return sorted(run_dirs)
 
 
 def extract_round_json(run_dir: Path, round_dir: Path) -> dict[str, Any] | None:
@@ -127,13 +135,10 @@ def collect_side_round_scores(run_dir: Path, side: str) -> dict[int, list[RoundS
                 if not isinstance(hyp_idx, int):
                     continue
                 values = {
-                    "score_activation_rate": _safe_float(
+                    "score_non_zero_rate": _safe_float(
                         item.get("score_activation_rate")
                         if "score_activation_rate" in item
                         else item.get("score_non_zero_rate")
-                    ),
-                    "score_boundary_non_activation_rate": _safe_float(
-                        item.get("score_boundary_non_activation_rate")
                     ),
                 }
                 series.setdefault(hyp_idx, []).append(
@@ -180,12 +185,10 @@ def plot_input_hypothesis(
 ) -> None:
     round_scores = sorted(round_scores, key=lambda x: x.round_idx)
     xs = [it.round_idx for it in round_scores]
-    y1 = [it.values.get("score_activation_rate") for it in round_scores]
-    y2 = [it.values.get("score_boundary_non_activation_rate") for it in round_scores]
+    y1 = [it.values.get("score_non_zero_rate") for it in round_scores]
 
     plt.figure(figsize=(8, 5))
-    plt.plot(xs, y1, marker="o", label="score_activation_rate")
-    plt.plot(xs, y2, marker="o", label="score_boundary_non_activation_rate")
+    plt.plot(xs, y1, marker="o", label="score_non_zero_rate")
     plt.xticks(xs)
     plt.ylim(-0.05, 1.05)
     plt.xlabel("round")
