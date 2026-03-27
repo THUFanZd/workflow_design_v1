@@ -21,7 +21,6 @@ DEFAULT_OUTPUT_ROOT = (
 )
 HISTORY_SCOPES = ("same_hypothesis", "all_hypotheses")
 TARGET_LAYERS = (6, 12, 18, 24)
-FIXED_FEATURE = (0, 12154)
 
 
 @dataclass
@@ -57,15 +56,61 @@ def _discover_features_for_layer(
     return feature_ids
 
 
+def _parse_pair_text(text: str) -> Tuple[int, int]:
+    raw = str(text).strip()
+    if not raw:
+        raise ValueError("Empty target pair.")
+
+    normalized = raw.replace("(", "").replace(")", "").replace(" ", "")
+    if ":" in normalized:
+        parts = normalized.split(":")
+    elif "," in normalized:
+        parts = normalized.split(",")
+    else:
+        raise ValueError(f"Invalid pair format: {text!r}. Use layer,feature or layer:feature.")
+
+    if len(parts) != 2:
+        raise ValueError(f"Invalid pair format: {text!r}.")
+    return int(parts[0]), int(parts[1])
+
+
+def _collect_manual_pairs(args: argparse.Namespace) -> List[Tuple[int, int]]:
+    pairs: List[Tuple[int, int]] = []
+
+    if args.target_pairs:
+        for item in args.target_pairs:
+            pairs.append(_parse_pair_text(item))
+
+    if args.target_pairs_file:
+        path = Path(str(args.target_pairs_file))
+        if not path.exists():
+            raise FileNotFoundError(f"target pairs file not found: {path}")
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            pairs.append(_parse_pair_text(line))
+
+    deduped: List[Tuple[int, int]] = []
+    seen = set()
+    for pair in pairs:
+        if pair in seen:
+            continue
+        seen.add(pair)
+        deduped.append(pair)
+    return deduped
+
+
 def _build_selection(
     *,
     output_root: Path,
     sae_name: str,
     seed: int,
     sample_per_layer: int,
+    manual_pairs: Sequence[Tuple[int, int]],
 ) -> List[Tuple[int, int]]:
     rng = random.Random(seed)
-    selected: List[Tuple[int, int]] = [FIXED_FEATURE]
+    selected: List[Tuple[int, int]] = []
     for layer_id in TARGET_LAYERS:
         feature_ids = _discover_features_for_layer(
             output_root=output_root,
@@ -78,7 +123,17 @@ def _build_selection(
             )
         sampled = sorted(rng.sample(feature_ids, sample_per_layer))
         selected.extend((layer_id, fid) for fid in sampled)
-    return selected
+
+    selected.extend((int(layer_id), int(feature_id)) for layer_id, feature_id in manual_pairs)
+
+    deduped: List[Tuple[int, int]] = []
+    seen = set()
+    for pair in selected:
+        if pair in seen:
+            continue
+        seen.add(pair)
+        deduped.append(pair)
+    return deduped
 
 
 def _run_command(cmd: Sequence[str], *, dry_run: bool) -> Tuple[int, float]:
@@ -120,6 +175,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sample-per-layer", type=int, default=2)
+    parser.add_argument(
+        "--target-pairs",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Optional extra layer-feature pairs, e.g. 6,12345 6:12346.",
+    )
+    parser.add_argument(
+        "--target-pairs-file",
+        type=str,
+        default=None,
+        help="Optional file with one pair per line: layer,feature or layer:feature.",
+    )
     parser.add_argument("--max-rounds", "--max_round", dest="max_rounds", type=int, default=1)
     parser.add_argument("--input-activation-max-rounds", type=int, default=1)
     parser.add_argument("--input-expansion-max-rounds", type=int, default=1)
@@ -228,11 +296,13 @@ def main() -> None:
     args = parse_args()
     output_root = Path(str(args.output_root))
     now_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    manual_pairs = _collect_manual_pairs(args)
     selection = _build_selection(
         output_root=output_root,
         sae_name=str(args.sae_name),
         seed=int(args.seed),
         sample_per_layer=int(args.sample_per_layer),
+        manual_pairs=manual_pairs,
     )
 
     print("Selected features:")
@@ -362,6 +432,8 @@ def main() -> None:
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "seed": int(args.seed),
         "sample_per_layer": int(args.sample_per_layer),
+        "target_layers": list(TARGET_LAYERS),
+        "manual_pairs": [{"layer_id": l, "feature_id": f} for l, f in manual_pairs],
         "max_rounds": int(args.max_rounds),
         "num_hypothesis": int(args.num_hypothesis),
         "generation_mode": str(args.generation_mode),

@@ -329,7 +329,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="Reuse artifacts before start point from logs/{layer}/{feature}/{timestamp}/{round_id}.",
+        help="Reuse artifacts before start point from logs/{layer_id}/{feature_id}/{timestamp}/{round_id}.",
     )
 
     parser.add_argument("--num-hypothesis", type=int, default=3, help="Hypothesis count n for each side")

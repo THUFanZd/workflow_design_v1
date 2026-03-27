@@ -359,7 +359,7 @@ def merge_refined_hypotheses(
     llm_model: str = DEFAULT_MODEL_NAME,
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
     temperature: float = 0.0,
-    max_tokens: int = 20000,
+    max_tokens: int = 10000,
 ) -> Dict[str, Any]:
     ts = timestamp or _clean_text(refined_hypotheses_result.get("timestamp")) or datetime.now().strftime("%Y%m%d_%H%M%S")
     preferred_round_id = round_id or _clean_text(refined_hypotheses_result.get("round_id")) or None

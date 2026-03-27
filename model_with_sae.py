@@ -723,14 +723,19 @@ class ModelWithSAEModule:
         feature_index: int,
         value: Union[float, torch.Tensor],
         mode: str,
+        intervention_scope: str = "all_tokens",
     ) -> torch.Tensor:
         if feature_index < 0 or feature_index >= features.shape[-1]:
             raise ValueError(f"Feature {feature_index} out of range for {features.shape[-1]} features.")
         if mode not in {"clamp", "add"}:
             raise ValueError("mode must be one of: clamp, add")
+        if intervention_scope not in {"all_tokens", "last_token_only"}:
+            raise ValueError("intervention_scope must be one of: all_tokens, last_token_only")
 
         steered = features.clone()
         target = steered[..., feature_index]
+        if intervention_scope == "last_token_only":
+            target = target[:, -1:]
         if torch.is_tensor(value):
             v = value.to(device=target.device, dtype=target.dtype)
             if v.ndim == 0:
@@ -789,6 +794,7 @@ class ModelWithSAEModule:
         value: Union[float, torch.Tensor],
         mode: str = "add",
         attention_mask: Optional[torch.Tensor] = None,
+        intervention_scope: str = "all_tokens",
     ) -> torch.Tensor:
         if self.model is None:
             raise RuntimeError("Model not loaded.")
@@ -796,6 +802,8 @@ class ModelWithSAEModule:
             raise ValueError("input_ids must be shape [batch, seq].")
         if mode not in {"clamp", "add"}:
             raise ValueError("mode must be one of: clamp, add")
+        if intervention_scope not in {"all_tokens", "last_token_only"}:
+            raise ValueError("intervention_scope must be one of: all_tokens, last_token_only")
 
         input_ids = input_ids.to(self.device)
         attention_mask = self._coerce_attention_mask(input_ids, attention_mask)
@@ -809,10 +817,13 @@ class ModelWithSAEModule:
             sae_obj = self.sae["__sae_lens_obj__"]
 
             def _hook_fn(act, hook):  # noqa: ARG001
+                target = act[:, :, feature_index]
+                if intervention_scope == "last_token_only":
+                    target = target[:, -1:]
                 if mode == "clamp":
-                    act[:, :, feature_index] = value
+                    target[...] = value
                 else:
-                    act[:, :, feature_index] = act[:, :, feature_index] + value
+                    target[...] = target + value
                 return act
 
             return self.model.run_with_hooks_with_saes(
@@ -827,7 +838,13 @@ class ModelWithSAEModule:
             hidden = hook_output[0] if isinstance(hook_output, tuple) else hook_output
             clean_features = self._encode_with_sae(hidden)
             clean_recon = self._decode_with_sae(clean_features)
-            steered_features = self._apply_feature_intervention(clean_features, feature_index, value, mode)
+            steered_features = self._apply_feature_intervention(
+                clean_features,
+                feature_index,
+                value,
+                mode,
+                intervention_scope=intervention_scope,
+            )
             steered_recon = self._decode_with_sae(steered_features)
             steered_hidden = steered_recon + (hidden - clean_recon)
             if isinstance(hook_output, tuple):
