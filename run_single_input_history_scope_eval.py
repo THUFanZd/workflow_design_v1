@@ -172,7 +172,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional summary json path. Default: "
-            "logs/{layer}_{feature}/{timestamp}/run_single_input_history_scope_eval_summary.json"
+            "logs/{layer_id}/{feature_id}/{timestamp}/run_single_input_history_scope_eval_summary.json"
         ),
     )
     return parser.parse_args()
@@ -286,7 +286,8 @@ def main() -> None:
         summary_path = (
             PROJECT_ROOT
             / "logs"
-            / f"{layer_id}_{feature_id}"
+            / str(layer_id)
+            / str(feature_id)
             / timestamp
             / "run_single_input_history_scope_eval_summary.json"
         )

@@ -462,7 +462,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-id", default="gemma-2-2b", help="Neuronpedia model id")
     parser.add_argument("--layer-id", required=True, help="Layer id")
     parser.add_argument("--feature-id", required=True, help="Feature id")
-    parser.add_argument("--timestamp", default=None, help="Timestamp directory under logs/{layer}_{feature}/")
+    parser.add_argument("--timestamp", default=None, help="Timestamp directory under logs/{layer_id}/{feature_id}/")
     parser.add_argument("--max-rounds", type=int, default=1, help="Maximum refinement rounds (round_1..round_n).")
     parser.add_argument(
         "--start-round",
@@ -486,7 +486,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="Reuse artifacts before start point from logs/{layer}_{feature}/{timestamp}/{round_id}.",
+        help="Reuse artifacts before start point from logs/{layer_id}/{feature_id}/{timestamp}/{round_id}.",
     )
 
     parser.add_argument("--num-hypothesis", type=int, default=3, help="Hypothesis count n for each side")
@@ -544,7 +544,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--llm-api-key-file", default=DEFAULT_API_KEY_FILE)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=50000)
+    parser.add_argument("--max-tokens", type=int, default=10000)
 
     parser.add_argument("--model-checkpoint-path", default="google/gemma-2-2b")
     parser.add_argument("--sae-path", default=None, help="SAE path or sae-lens URI")
@@ -1191,7 +1191,7 @@ if __name__ == "__main__":
     final_input_reasons = list(final_hypotheses_source.get("input_side_hypothesis_reasons", []))
     final_output_reasons = list(final_hypotheses_source.get("output_side_hypothesis_reasons", []))
 
-    ts_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts
+    ts_dir = Path("logs") / layer_id / feature_id / ts
     ts_dir.mkdir(parents=True, exist_ok=True)
 
     input_hypothesis_cache_path = (

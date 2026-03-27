@@ -289,7 +289,7 @@ def generate_boundary_contexts(
     model: str,
     explanation: str,
     boundary_case_count: int = 5,
-    max_tokens: int = 5000,
+    max_tokens: int = 10000,
     temperature: float = 0.2,
     llm_io_logger: Optional[Any] = None,
 ) -> List[str]:
@@ -538,7 +538,7 @@ def judge_should_activate(
     model: str,
     explanation: str,
     context: str,
-    max_tokens: int = 5000,
+    max_tokens: int = 10000,
 ) -> Decision:
     system_prompt = (
         "You are a strict evaluator of SAE feature explanations."

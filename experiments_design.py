@@ -110,7 +110,7 @@ def generate_boundary_contexts(
     model: str,
     explanation: str,
     boundary_case_count: int = 5,
-    max_tokens: int = 5000,
+    max_tokens: int = 10000,
     temperature: float = 0.2,
     token_counter: Optional[TokenUsageAccumulator] = None,
     llm_calls: Optional[List[Dict[str, Any]]] = None,
@@ -413,7 +413,7 @@ def design_hypothesis_experiments(
     llm_model: str = DEFAULT_MODEL_NAME,
     llm_api_key_file: str = DEFAULT_API_KEY_FILE,
     temperature: float = 0.2,
-    max_tokens: int = 20000,
+    max_tokens: int = 10000,
     run_side: RunSideType = "both",
 ) -> Dict[str, Any]:
     model_id = hypotheses_result.get("model_id", "unknown-model")
@@ -563,7 +563,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--llm-api-key-file", default=DEFAULT_API_KEY_FILE)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=50000)
+    parser.add_argument("--max-tokens", type=int, default=10000)
     return parser
 
 

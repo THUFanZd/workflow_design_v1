@@ -63,7 +63,8 @@ def _resolve_workflow_path_from_args(args: argparse.Namespace) -> Path:
 
     return (
         Path(str(args.logs_root))
-        / f"{str(args.layer_id).strip()}_{str(args.feature_id).strip()}"
+        / str(args.layer_id).strip()
+        / str(args.feature_id).strip()
         / str(args.timestamp).strip()
     )
 
@@ -858,7 +859,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Path to workflow final-result json file, or workflow timestamp directory. "
-            "If omitted, path is composed as logs/{layer-id}_{feature-id}/{timestamp}."
+            "If omitted, path is composed as logs/{layer-id}/{feature-id}/{timestamp}."
         ),
     )
     parser.add_argument("--layer-id", default=None, help="Layer id used to compose workflow path.")

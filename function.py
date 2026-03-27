@@ -62,7 +62,7 @@ def build_round_dir(
     round_index: Optional[int] = None,
 ) -> Path:
     resolved_round_id = normalize_round_id(round_id, round_index=round_index)
-    return Path("logs") / f"{layer_id}_{feature_id}" / str(timestamp) / resolved_round_id
+    return Path("logs") / str(layer_id) / str(feature_id) / str(timestamp) / resolved_round_id
 
 
 def extract_average_l0_from_canonical_map(
