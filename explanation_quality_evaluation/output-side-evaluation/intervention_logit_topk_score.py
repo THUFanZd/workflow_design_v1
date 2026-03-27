@@ -21,6 +21,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from experiments_design import OUTPUT_SIDE_PLACEHOLDER
 from function import DEFAULT_CANONICAL_MAP_PATH, build_default_sae_path, call_llm, extract_usage_counts
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
+from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
+from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
 
 if TYPE_CHECKING:
     from model_with_sae import ModelWithSAEModule
@@ -444,8 +446,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--api-key", type=str, default=None)
     parser.add_argument("--api-key-file", type=str, default=DEFAULT_API_KEY_FILE)
-    parser.add_argument("--openai-model", type=str, default="zai-org/glm-4.7")
-    parser.add_argument("--openai-base-url", type=str, default="https://api.ppio.com/openai")
+    parser.add_argument("--openai-model", type=str, default=DEFAULT_MODEL_NAME)
+    parser.add_argument("--openai-base-url", type=str, default=DEFAULT_BASE_URL)
     parser.add_argument("--judge-max-tokens", type=int, default=10000, help="Max tokens for each LLM judge call")
 
     parser.add_argument(

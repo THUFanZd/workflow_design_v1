@@ -13,6 +13,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from function import build_default_sae_path
 from model_with_sae import ModelWithSAEModule
 from neuronpedia_feature_api import extract_explanations, fetch_feature_json
+from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
+from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
+from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -882,9 +885,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-m", type=int, default=5)
     parser.add_argument("--input-n", type=int, default=5)
     parser.add_argument("--input-non-activation-context-count", type=int, default=5)
-    parser.add_argument("--input-llm-model", default="zai-org/glm-4.7", help="Deprecated no-op.")
-    parser.add_argument("--input-ppio-base-url", default="https://api.ppio.com/openai", help="Deprecated no-op.")
-    parser.add_argument("--input-ppio-api-key-file", default=None, help="Deprecated no-op.")
+    parser.add_argument("--input-llm-model", default=DEFAULT_MODEL_NAME, help="Deprecated no-op.")
+    parser.add_argument("--input-base-url", default=DEFAULT_BASE_URL, help="Deprecated no-op.")
+    parser.add_argument("--input-api-key-file", default=None, help="Deprecated no-op.")
     parser.add_argument("--input-disable-boundary-score", action="store_true", help="Deprecated no-op.")
     parser.add_argument(
         "--force-run-input-eval",
@@ -901,9 +904,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sae-device", default="auto")
 
     parser.add_argument("--output-eval-mode", choices=["blind", "logit"], default="blind")
-    parser.add_argument("--output-api-key-file", default=None)
-    parser.add_argument("--output-openai-model", default="zai-org/glm-4.7")
-    parser.add_argument("--output-openai-base-url", default="https://api.ppio.com/openai")
+    parser.add_argument("--output-api-key-file", default=DEFAULT_API_KEY_FILE)
+    parser.add_argument("--output-openai-model", default=DEFAULT_MODEL_NAME)
+    parser.add_argument("--output-openai-base-url", default=DEFAULT_BASE_URL)
     parser.add_argument(
         "--run-mode",
         choices=["both", "input", "output", "none"],

@@ -1,8 +1,10 @@
+from pathlib import Path
+
 from openai import OpenAI
 
-base_url = "https://api.ppio.com/openai"
-api_key = "sk_c5Y5ITLRO436DN6Y93BRQ733ukLavbpo_qViGETeZAA"
-model = "zai-org/glm-4.7"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key = Path("C:\\Users\\lzx\\Desktop\\\u7814\u4e00\u4e0b\\keys\\ali_api_key.txt").read_text(encoding="utf-8").strip()
+model = "qwen-plus"
 
 client = OpenAI(
     base_url=base_url,

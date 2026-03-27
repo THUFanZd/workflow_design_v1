@@ -21,10 +21,10 @@ from neuronpedia_feature_api import extract_explanations, fetch_feature_json
 
 Decision = Literal["ACTIVATE", "DO_NOT_ACTIVATE"]
 
-DEFAULT_PPIO_BASE_URL = "https://api.ppio.com/openai"
-DEFAULT_MODEL = "zai-org/glm-4.7"
+DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_MODEL = "qwen-plus"
 DEFAULT_API_KEY_FILE = (
-    "C:\\Users\\lzx\\Desktop\\\u7814\u4e00\u4e0b\\ppio_api_key.txt"
+    "C:\\Users\\lzx\\Desktop\\\u7814\u4e00\u4e0b\\keys\\ali_api_key.txt"
 )
 DEBUG_LLM_IO_PATH = Path("./outputs/llm_inout.md")
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "explanation_quality_evaluation" / "input-side-evaluation" / "outputs"
@@ -952,8 +952,8 @@ def compare_with_neuronpedia_explanations(
     neuronpedia_api_key: Optional[str] = None,
     neuronpedia_timeout: int = 30,
     llm_model: str = DEFAULT_MODEL,
-    ppio_base_url: str = DEFAULT_PPIO_BASE_URL,
-    ppio_api_key_file: str = DEFAULT_API_KEY_FILE,
+    base_url: str = DEFAULT_BASE_URL,
+    api_key_file: str = DEFAULT_API_KEY_FILE,
     enable_activation_score: bool = True,
     enable_non_activation_score: bool = True,
     enable_boundary_score: bool = True,
@@ -1076,7 +1076,7 @@ def compare_with_neuronpedia_explanations(
         raise ValueError("No non-activation contexts available for evaluation.")
 
     need_llm = enable_activation_score or enable_non_activation_score or enable_boundary_score
-    client: Optional[OpenAI] = build_client(ppio_api_key_file, ppio_base_url) if need_llm else None
+    client: Optional[OpenAI] = build_client(api_key_file, base_url) if need_llm else None
 
     my_decisions: List[Decision] = []
     my_non_activation_decisions: List[Decision] = []
@@ -1545,11 +1545,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--neuronpedia-timeout", type=int, default=30, help="Neuronpedia timeout")
     parser.add_argument("--llm-model", default=DEFAULT_MODEL, help="Judge model id")
-    parser.add_argument("--ppio-base-url", default=DEFAULT_PPIO_BASE_URL, help="PPIO OpenAI base URL")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="LLM OpenAI-compatible base URL")
     parser.add_argument(
-        "--ppio-api-key-file",
+        "--api-key-file",
         default=DEFAULT_API_KEY_FILE,
-        help="Path to API key file used by llmapi.py",
+        help="Path to the default LLM API key file",
     )
     parser.add_argument(
         "--disable-activation-score",
@@ -1666,8 +1666,8 @@ def main() -> None:
         neuronpedia_api_key=args.neuronpedia_api_key,
         neuronpedia_timeout=args.neuronpedia_timeout,
         llm_model=args.llm_model,
-        ppio_base_url=args.ppio_base_url,
-        ppio_api_key_file=args.ppio_api_key_file,
+        base_url=args.base_url,
+        api_key_file=args.api_key_file,
         enable_activation_score=not args.disable_activation_score,
         enable_non_activation_score=not args.disable_non_activation_score,
         enable_boundary_score=not args.disable_boundary_score,

@@ -29,6 +29,8 @@ from function import (
 )
 from prompts.experiments_execution_prompt import build_output_judge_system_prompt, build_output_judge_user_prompt
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
+from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
+from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
 
 if TYPE_CHECKING:
     from model_with_sae import ModelWithSAEModule
@@ -878,8 +880,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-max-tokens", type=int, default=10000)
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--api-key-file", default=DEFAULT_API_KEY_FILE)
-    parser.add_argument("--openai-model", default="zai-org/glm-4.7")
-    parser.add_argument("--openai-base-url", default="https://api.ppio.com/openai")
+    parser.add_argument("--openai-model", default=DEFAULT_MODEL_NAME)
+    parser.add_argument("--openai-base-url", default=DEFAULT_BASE_URL)
     parser.set_defaults(prefer_existing=True)
     return parser.parse_args()
 
