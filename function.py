@@ -57,9 +57,9 @@ def normalize_round_id(round_id: Optional[str], *, round_index: Optional[int] = 
 def build_feature_dir(*, layer_id: str, feature_id: str) -> Path:
     """
     Canonical feature directory layout:
-    logs/{layer_id}/{feature_id}
+    logs/layer-{layer_id}/feature-{feature_id}
     """
-    return Path("logs") / str(layer_id) / str(feature_id)
+    return Path("logs") / f"layer-{str(layer_id)}" / f"feature-{str(feature_id)}"
 
 
 def build_timestamp_dir(*, layer_id: str, feature_id: str, timestamp: str) -> Path:
@@ -86,12 +86,16 @@ def resolve_existing_timestamp_dir(
 ) -> Optional[Path]:
     """
     Resolve timestamp dir for reading with backward compatibility.
-    Prefer new layout logs/{layer}/{feature}/{timestamp}, fallback to legacy
+    Prefer new layout logs/layer-{layer}/feature-{feature}/{timestamp}, then fallback
+    to old layout logs/{layer}/{feature}/{timestamp}, then legacy
     logs/{layer}_{feature}/{timestamp}.
     """
     new_dir = build_timestamp_dir(layer_id=layer_id, feature_id=feature_id, timestamp=timestamp)
     if new_dir.exists():
         return new_dir
+    old_dir = Path("logs") / str(layer_id) / str(feature_id) / str(timestamp)
+    if old_dir.exists():
+        return old_dir
     legacy_dir = Path("logs") / f"{layer_id}_{feature_id}" / str(timestamp)
     if legacy_dir.exists():
         return legacy_dir

@@ -54,7 +54,7 @@ def _input_mode_instructions(mode: InputRefinementMode) -> str:
             "1) Treat current hypothesis as a proven subset of the true feature set.\n"
             "2) Expand the hypothesis scope beyond this subset.\n"
             "3) Use historical trajectory to avoid reusing earlier failed meanings.\n"
-            "4) Keep the expanded hypothesis precise and testable."
+            "4) Keep the expanded hypothesis precise and testable, and not too complex."
         )
     return (
         "Current input-side mode: expansion test.\n"

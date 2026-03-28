@@ -683,7 +683,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
-    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}/{feature}/{timestamp}")
+    parser.add_argument(
+        "--timestamp",
+        default=None,
+        help="Custom timestamp for logs/layer-{layer_id}/feature-{feature_id}/{timestamp}",
+    )
     parser.add_argument("--round-index", type=int, default=1, help="Round index used as memory anchor.")
     parser.add_argument("--round-id", default=None, help="Optional explicit round id for the memory record.")
     parser.add_argument(

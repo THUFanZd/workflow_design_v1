@@ -188,7 +188,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional file with one pair per line: layer,feature or layer:feature.",
     )
-    parser.add_argument("--max-rounds", "--max_round", dest="max_rounds", type=int, default=1)
     parser.add_argument("--input-activation-max-rounds", type=int, default=1)
     parser.add_argument("--input-expansion-max-rounds", type=int, default=1)
     parser.add_argument("--llm-generation-model", default=None, help="Forwarded to run_single/workflow.")
@@ -239,12 +238,6 @@ def parse_args() -> argparse.Namespace:
         default=1,
         choices=[1, 2, 3],
         help="Passed to final_explanation_evaluation_runner.py --input-selection-method.",
-    )
-    parser.add_argument(
-        "--input-max-explanations",
-        type=int,
-        default=3,
-        help="Passed to final_explanation_evaluation_runner.py --input-max-explanations.",
     )
     parser.add_argument(
         "--input-m",
@@ -346,8 +339,6 @@ def main() -> None:
                 "input",
                 "--history-scope",
                 history_scope,
-                "--max-rounds",
-                str(args.max_rounds),
                 "--input-activation-max-rounds",
                 str(args.input_activation_max_rounds),
                 "--input-expansion-max-rounds",
@@ -372,8 +363,6 @@ def main() -> None:
                 str(args.sae_name),
                 "--final-run-mode",
                 str(args.final_run_mode),
-                "--input-max-explanations",
-                str(args.input_max_explanations),
                 "--input-selection-method",
                 str(args.input_selection_method),
                 "--input-m",
@@ -434,7 +423,9 @@ def main() -> None:
         "sample_per_layer": int(args.sample_per_layer),
         "target_layers": list(TARGET_LAYERS),
         "manual_pairs": [{"layer_id": l, "feature_id": f} for l, f in manual_pairs],
-        "max_rounds": int(args.max_rounds),
+        "input_activation_max_rounds": int(args.input_activation_max_rounds),
+        "input_expansion_max_rounds": int(args.input_expansion_max_rounds),
+        "effective_max_rounds": int(args.input_activation_max_rounds) + int(args.input_expansion_max_rounds) - 1,
         "num_hypothesis": int(args.num_hypothesis),
         "generation_mode": str(args.generation_mode),
         "num_input_sentences_per_hypothesis": int(args.num_input_sentences_per_hypothesis),
@@ -444,7 +435,6 @@ def main() -> None:
         "selection_method": int(args.selection_method),
         "observation_m": int(args.observation_m),
         "observation_n": int(args.observation_n),
-        "input_max_explanations": int(args.input_max_explanations),
         "input_selection_method": int(args.input_selection_method),
         "input_m": int(args.input_m),
         "input_n": int(args.input_n),

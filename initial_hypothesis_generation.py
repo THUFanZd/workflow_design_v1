@@ -30,6 +30,7 @@ from prompts.hypothesis_generation_prompt import (
 )
 
 SideType = Literal["input", "output"]
+RunSideType = Literal["input", "output", "both"]
 GenerationMode = Literal["single_call", "iterative"]
 
 
@@ -198,6 +199,7 @@ def _write_markdown_log(
     if "round_id" in result:
         lines.append(f"- round_id: {result['round_id']}")
     lines.append(f"- num_hypothesis: {result['num_hypothesis']}")
+    lines.append(f"- run_side: {result.get('run_side', 'both')}")
     lines.append(f"- generation_mode: {result['generation_mode']}")
     lines.append(f"- llm_model: {result['llm_model']}")
     lines.append("")
@@ -207,14 +209,21 @@ def _write_markdown_log(
     lines.append(f"- completion_tokens: {token_usage['completion_tokens']}")
     lines.append(f"- total_tokens: {token_usage['total_tokens']}")
     lines.append("")
-    lines.append("## Input-side Hypotheses")
-    for idx, hyp in enumerate(result["input_side_hypotheses"], start=1):
-        lines.append(f"{idx}. {hyp}")
-    lines.append("")
-    lines.append("## Output-side Hypotheses")
-    for idx, hyp in enumerate(result["output_side_hypotheses"], start=1):
-        lines.append(f"{idx}. {hyp}")
-    lines.append("")
+    run_side = str(result.get("run_side", "both"))
+    if run_side in ("input", "both"):
+        lines.append("## Input-side Hypotheses")
+        for idx, hyp in enumerate(result["input_side_hypotheses"], start=1):
+            lines.append(f"{idx}. {hyp}")
+        if not result["input_side_hypotheses"]:
+            lines.append("- (none)")
+        lines.append("")
+    if run_side in ("output", "both"):
+        lines.append("## Output-side Hypotheses")
+        for idx, hyp in enumerate(result["output_side_hypotheses"], start=1):
+            lines.append(f"{idx}. {hyp}")
+        if not result["output_side_hypotheses"]:
+            lines.append("- (none)")
+        lines.append("")
     lines.append("## LLM Calls")
     for i, call in enumerate(llm_calls, start=1):
         lines.append(f"### Call {i}")
@@ -248,6 +257,7 @@ def generate_initial_hypotheses(
     feature_id: str,
     num_hypothesis: int,
     generation_mode: GenerationMode,
+    run_side: RunSideType = "both",
     timestamp: Optional[str] = None,
     round_id: Optional[str] = "round_0",
     llm_base_url: str = DEFAULT_BASE_URL,
@@ -258,9 +268,8 @@ def generate_initial_hypotheses(
 ) -> Dict[str, Any]:
     ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     resolved_round_id = normalize_round_id(round_id, round_index=0)
-
-    input_observation = _get_side_observation(observation, "input")
-    output_observation = _get_side_observation(observation, "output")
+    if run_side not in ("input", "output", "both"):
+        raise ValueError(f"Unsupported run_side: {run_side}")
 
     client = OpenAI(
         base_url=llm_base_url,
@@ -270,30 +279,36 @@ def generate_initial_hypotheses(
     token_counter = TokenUsageAccumulator()
     llm_calls: List[Dict[str, Any]] = []
 
-    input_hypotheses = _generate_hypotheses_for_side(
-        client=client,
-        model=llm_model,
-        side="input",
-        side_observation=input_observation,
-        num_hypothesis=num_hypothesis,
-        generation_mode=generation_mode,
-        token_counter=token_counter,
-        llm_calls=llm_calls,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    output_hypotheses = _generate_hypotheses_for_side(
-        client=client,
-        model=llm_model,
-        side="output",
-        side_observation=output_observation,
-        num_hypothesis=num_hypothesis,
-        generation_mode=generation_mode,
-        token_counter=token_counter,
-        llm_calls=llm_calls,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    input_hypotheses: List[str] = []
+    output_hypotheses: List[str] = []
+    if run_side in ("input", "both"):
+        input_observation = _get_side_observation(observation, "input")
+        input_hypotheses = _generate_hypotheses_for_side(
+            client=client,
+            model=llm_model,
+            side="input",
+            side_observation=input_observation,
+            num_hypothesis=num_hypothesis,
+            generation_mode=generation_mode,
+            token_counter=token_counter,
+            llm_calls=llm_calls,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    if run_side in ("output", "both"):
+        output_observation = _get_side_observation(observation, "output")
+        output_hypotheses = _generate_hypotheses_for_side(
+            client=client,
+            model=llm_model,
+            side="output",
+            side_observation=output_observation,
+            num_hypothesis=num_hypothesis,
+            generation_mode=generation_mode,
+            token_counter=token_counter,
+            llm_calls=llm_calls,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
     base_dir = build_round_dir(
         layer_id=layer_id,
@@ -310,6 +325,7 @@ def generate_initial_hypotheses(
         "feature_id": feature_id,
         "timestamp": ts,
         "round_id": resolved_round_id,
+        "run_side": run_side,
         "num_hypothesis": num_hypothesis,
         "generation_mode": generation_mode,
         "llm_model": llm_model,
@@ -341,11 +357,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="single_call",
         help="single_call: one call outputs n hypotheses; iterative: n calls output n hypotheses",
     )
+    parser.add_argument(
+        "--side",
+        choices=["input", "output", "both"],
+        default="both",
+        help="Generate initial hypotheses for input/output side or both.",
+    )
     parser.add_argument("--width", default="16k", help="Neuronpedia source width")
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
-    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}/{feature}/{timestamp}")
+    parser.add_argument(
+        "--timestamp",
+        default=None,
+        help="Custom timestamp for logs/layer-{layer_id}/feature-{feature_id}/{timestamp}",
+    )
     parser.add_argument("--round-id", default="round_0", help="Round directory under timestamp, e.g. round_0")
     parser.add_argument(
         "--reuse-from-logs",
@@ -407,6 +433,7 @@ if __name__ == "__main__":
         feature_id=args.feature_id,
         num_hypothesis=args.num_hypothesis,
         generation_mode=args.generation_mode,
+        run_side=args.side,
         timestamp=ts,
         round_id=args.round_id,
         llm_base_url=args.llm_base_url,

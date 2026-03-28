@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence, Tuple
 
+from function import build_feature_dir
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -75,7 +77,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default="gemma-2-2b")
     parser.add_argument("--llm-generation-model", default=None, help="Forwarded to workflow_runner.py")
     parser.add_argument("--llm-judge-model", default=None, help="Forwarded to workflow_runner.py")
-    parser.add_argument("--max-rounds", "--max_round", dest="max_rounds", type=int, default=1)
     parser.add_argument("--input-activation-max-rounds", type=int, default=1)
     parser.add_argument("--input-expansion-max-rounds", type=int, default=1)
     parser.add_argument("--num-hypothesis", type=int, default=3)
@@ -141,12 +142,6 @@ def parse_args() -> argparse.Namespace:
         help="Passed to final_explanation_evaluation_runner.py --input-selection-method.",
     )
     parser.add_argument(
-        "--input-max-explanations",
-        type=int,
-        default=3,
-        help="Passed to final_explanation_evaluation_runner.py --input-max-explanations.",
-    )
-    parser.add_argument(
         "--input-m",
         type=int,
         default=5,
@@ -176,7 +171,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional summary json path. Default: "
-            "logs/{layer}/{feature}/{timestamp}/run_single_input_history_scope_eval_summary.json"
+            "logs/layer-{layer}/feature-{feature}/{timestamp}/run_single_input_history_scope_eval_summary.json"
         ),
     )
     return parser.parse_args()
@@ -201,8 +196,6 @@ def main() -> None:
         str(args.side),
         "--history-scope",
         str(args.history_scope),
-        "--max-rounds",
-        str(args.max_rounds),
         "--input-activation-max-rounds",
         str(args.input_activation_max_rounds),
         "--input-expansion-max-rounds",
@@ -256,8 +249,6 @@ def main() -> None:
             str(args.width),
             "--run-mode",
             str(args.final_run_mode),
-            "--input-max-explanations",
-            str(args.input_max_explanations),
             "--input-selection-method",
             str(args.input_selection_method),
             "--input-m",
@@ -295,11 +286,10 @@ def main() -> None:
     if args.summary_output:
         summary_path = Path(str(args.summary_output))
     else:
+        feature_dir = build_feature_dir(layer_id=str(layer_id), feature_id=str(feature_id))
         summary_path = (
             PROJECT_ROOT
-            / "logs"
-            / str(layer_id)
-            / str(feature_id)
+            / feature_dir
             / timestamp
             / "run_single_input_history_scope_eval_summary.json"
         )

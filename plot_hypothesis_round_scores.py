@@ -25,7 +25,7 @@ class RoundScore:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Traverse logs/{layer-id}/{feature-id}/{timestamp}/ and draw "
+            "Traverse logs/layer-{layer-id}/feature-{feature-id}/{timestamp}/ and draw "
             "per-hypothesis score-vs-round line charts."
         )
     )

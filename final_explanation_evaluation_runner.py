@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from function import build_default_sae_path
+from function import build_default_sae_path, build_feature_dir
 from model_with_sae import ModelWithSAEModule
 from neuronpedia_feature_api import extract_explanations, fetch_feature_json
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
@@ -65,9 +65,15 @@ def _resolve_workflow_path_from_args(args: argparse.Namespace) -> Path:
     layer = str(args.layer_id).strip()
     feature = str(args.feature_id).strip()
     timestamp = str(args.timestamp).strip()
-    canonical_path = logs_root / layer / feature / timestamp
+
+    # New canonical layout: logs/layer-{layer_id}/feature-{feature_id}/{timestamp}
+    canonical_path = logs_root / build_feature_dir(layer_id=layer, feature_id=feature).relative_to("logs") / timestamp
     if canonical_path.exists():
         return canonical_path
+    # Backward-compatible old layout: logs/{layer_id}/{feature_id}/{timestamp}
+    old_path = logs_root / layer / feature / timestamp
+    if old_path.exists():
+        return old_path
     legacy_path = logs_root / f"{layer}_{feature}" / timestamp
     if legacy_path.exists():
         return legacy_path
@@ -108,11 +114,9 @@ def _normalize_cached_input_hypothesis(
     score_non_zero = _safe_float(score_non_zero_raw, 0.0) if score_non_zero_raw is not None else None
     score_boundary = _safe_float(score_boundary_raw, 0.0) if score_boundary_raw is not None else None
     combined_raw = cached.get("combined_score")
-    combined_score = (
-        _safe_float(combined_raw, 0.0)
-        if combined_raw is not None
-        else _safe_float(score_non_zero, 0.0)
-    )
+    combined_score = _safe_float(combined_raw, 0.0) if combined_raw is not None else score_non_zero
+    score_name = "combined_input_score" if score_boundary is not None else "score_non_zero_rate"
+    score_value = combined_score if score_boundary is not None else score_non_zero
     return {
         "source": source,
         "hypothesis_index": _safe_int(cached.get("hypothesis_index"), 0),
@@ -120,8 +124,8 @@ def _normalize_cached_input_hypothesis(
         "round_index": _safe_int(cached.get("round_index"), 0),
         "round_id": str(cached.get("round_id", "")).strip() or None,
         "test_type": str(cached.get("test_type", "")).strip() or None,
-        "score_name": "combined_input_score",
-        "score_value": combined_score,
+        "score_name": score_name,
+        "score_value": score_value,
         "score_non_zero_rate": score_non_zero,
         "score_boundary_non_activation_rate": score_boundary,
         "combined_score": combined_score,
@@ -569,34 +573,54 @@ def _extract_workflow_input_scores(
     selected_input_cache_raw: Optional[Dict[str, Any]],
     execution_payload: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    def _build_input_score_payload(
+        *,
+        source: str,
+        non_zero_raw: Any,
+        boundary_raw: Any,
+        designed_sentences_raw: Any,
+        boundary_sentences_raw: Any,
+    ) -> Optional[Dict[str, Any]]:
+        if non_zero_raw is None:
+            return None
+        non_zero = _safe_float(non_zero_raw, 0.0)
+        boundary = _safe_float(boundary_raw, 0.0) if boundary_raw is not None else None
+        combined = non_zero + boundary if boundary is not None else non_zero
+        return {
+            "source": source,
+            "score_non_zero_rate": non_zero,
+            "score_boundary_non_activation_rate": boundary,
+            "combined_input_score": combined,
+            "designed_sentences": list(designed_sentences_raw)
+            if isinstance(designed_sentences_raw, list)
+            else [],
+            "boundary_sentences": list(boundary_sentences_raw)
+            if isinstance(boundary_sentences_raw, list)
+            else [],
+        }
+
     if isinstance(selected_input_cache_raw, dict):
-        non_zero = selected_input_cache_raw.get("score_non_zero_rate")
-        boundary = selected_input_cache_raw.get("score_boundary_non_activation_rate")
-        if non_zero is not None and boundary is not None:
-            return {
-                "source": "workflow_input_side_cache.best_hypothesis",
-                "score_non_zero_rate": _safe_float(non_zero, 0.0),
-                "score_boundary_non_activation_rate": _safe_float(boundary, 0.0),
-                "combined_input_score": _safe_float(non_zero, 0.0) + _safe_float(boundary, 0.0),
-                "designed_sentences": list(selected_input_cache_raw.get("designed_sentences", []))
-                if isinstance(selected_input_cache_raw.get("designed_sentences"), list)
-                else [],
-                "boundary_sentences": list(selected_input_cache_raw.get("boundary_sentences", []))
-                if isinstance(selected_input_cache_raw.get("boundary_sentences"), list)
-                else [],
-            }
+        cached_scores = _build_input_score_payload(
+            source="workflow_input_side_cache.best_hypothesis",
+            non_zero_raw=selected_input_cache_raw.get("score_non_zero_rate"),
+            boundary_raw=selected_input_cache_raw.get("score_boundary_non_activation_rate"),
+            designed_sentences_raw=selected_input_cache_raw.get("designed_sentences", []),
+            boundary_sentences_raw=selected_input_cache_raw.get("boundary_sentences", []),
+        )
+        if cached_scores is not None:
+            return cached_scores
 
     non_zero_sel = selected_input.get("score_non_zero_rate")
     boundary_sel = selected_input.get("score_boundary_non_activation_rate")
-    if non_zero_sel is not None and boundary_sel is not None:
-        return {
-            "source": str(selected_input.get("source", "selected_input")),
-            "score_non_zero_rate": _safe_float(non_zero_sel, 0.0),
-            "score_boundary_non_activation_rate": _safe_float(boundary_sel, 0.0),
-            "combined_input_score": _safe_float(non_zero_sel, 0.0) + _safe_float(boundary_sel, 0.0),
-            "designed_sentences": [],
-            "boundary_sentences": [],
-        }
+    selected_scores = _build_input_score_payload(
+        source=str(selected_input.get("source", "selected_input")),
+        non_zero_raw=non_zero_sel,
+        boundary_raw=boundary_sel,
+        designed_sentences_raw=[],
+        boundary_sentences_raw=[],
+    )
+    if selected_scores is not None:
+        return selected_scores
 
     if isinstance(execution_payload, dict):
         input_side = execution_payload.get("input_side_execution", {})
@@ -612,26 +636,19 @@ def _extract_workflow_input_scores(
                     continue
                 if target_text and hypothesis_text and hypothesis_text != target_text:
                     continue
-                non_zero = item.get("score_non_zero_rate")
-                boundary = item.get("score_boundary_non_activation_rate")
-                if non_zero is None or boundary is None:
-                    continue
-                return {
-                    "source": "round_execution_input_side",
-                    "score_non_zero_rate": _safe_float(non_zero, 0.0),
-                    "score_boundary_non_activation_rate": _safe_float(boundary, 0.0),
-                    "combined_input_score": _safe_float(non_zero, 0.0) + _safe_float(boundary, 0.0),
-                    "designed_sentences": list(item.get("designed_sentences", []))
-                    if isinstance(item.get("designed_sentences"), list)
-                    else [],
-                    "boundary_sentences": list(item.get("boundary_sentences", []))
-                    if isinstance(item.get("boundary_sentences"), list)
-                    else [],
-                }
+                item_scores = _build_input_score_payload(
+                    source="round_execution_input_side",
+                    non_zero_raw=item.get("score_non_zero_rate"),
+                    boundary_raw=item.get("score_boundary_non_activation_rate"),
+                    designed_sentences_raw=item.get("designed_sentences", []),
+                    boundary_sentences_raw=item.get("boundary_sentences", []),
+                )
+                if item_scores is not None:
+                    return item_scores
 
     raise ValueError(
         "Failed to recover workflow cached input-side SAE scores "
-        "(score_non_zero_rate / score_boundary_non_activation_rate)."
+        "(score_non_zero_rate)."
     )
 
 
@@ -642,7 +659,6 @@ def _evaluate_neuronpedia_input_with_sae(
     feature_id: int,
     module: ModelWithSAEModule,
     non_zero_threshold: float,
-    max_explanations: int,
     selection_method: int,
     m: int,
     n: int,
@@ -659,7 +675,7 @@ def _evaluate_neuronpedia_input_with_sae(
         api_key=neuronpedia_api_key,
         timeout=neuronpedia_timeout,
     )
-    reference_explanations = extract_explanations(payload, limit=max(1, int(max_explanations)))
+    reference_explanations = extract_explanations(payload, limit=1)
     if not reference_explanations:
         raise ValueError("No explanation found in Neuronpedia response.")
 
@@ -783,6 +799,12 @@ def _extract_logit_summary(logit_payload: Dict[str, Any]) -> Dict[str, Any]:
 def _write_summary_markdown(path: Path, *, payload: Dict[str, Any]) -> None:
     metadata = payload.get("metadata", {})
     selected = payload.get("selected_hypotheses", {})
+    selected_input = selected.get("input", {}) if isinstance(selected, dict) else {}
+    selected_output = selected.get("output", {}) if isinstance(selected, dict) else {}
+    if not isinstance(selected_input, dict):
+        selected_input = {}
+    if not isinstance(selected_output, dict):
+        selected_output = {}
     input_eval = payload.get("input_evaluation", {})
     output_eval = payload.get("output_evaluation", {})
 
@@ -799,19 +821,19 @@ def _write_summary_markdown(path: Path, *, payload: Dict[str, Any]) -> None:
     lines.append(f"- workflow_final_result: {metadata.get('workflow_final_result_path')}")
     lines.append("")
     lines.append("## Selected Input Hypothesis")
-    lines.append(f"- source: {selected.get('input', {}).get('source')}")
-    lines.append(f"- score_name: {selected.get('input', {}).get('score_name')}")
-    lines.append(f"- score_value: {selected.get('input', {}).get('score_value')}")
+    lines.append(f"- source: {selected_input.get('source')}")
+    lines.append(f"- score_name: {selected_input.get('score_name')}")
+    lines.append(f"- score_value: {selected_input.get('score_value')}")
     lines.append("```text")
-    lines.append(str(selected.get("input", {}).get("hypothesis", "")))
+    lines.append(str(selected_input.get("hypothesis", "")))
     lines.append("```")
     lines.append("")
     lines.append("## Selected Output Hypothesis")
-    lines.append(f"- source: {selected.get('output', {}).get('source')}")
-    lines.append(f"- score_name: {selected.get('output', {}).get('score_name')}")
-    lines.append(f"- score_value: {selected.get('output', {}).get('score_value')}")
+    lines.append(f"- source: {selected_output.get('source')}")
+    lines.append(f"- score_name: {selected_output.get('score_name')}")
+    lines.append(f"- score_value: {selected_output.get('score_value')}")
     lines.append("```text")
-    lines.append(str(selected.get("output", {}).get("hypothesis", "")))
+    lines.append(str(selected_output.get("hypothesis", "")))
     lines.append("```")
     lines.append("")
     lines.append("## Input-side Metrics")
@@ -865,7 +887,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Path to workflow final-result json file, or workflow timestamp directory. "
-            "If omitted, path is composed as logs/{layer-id}/{feature-id}/{timestamp}."
+            "If omitted, path is composed as logs/layer-{layer-id}/feature-{feature-id}/{timestamp}."
         ),
     )
     parser.add_argument("--layer-id", default=None, help="Layer id used to compose workflow path.")
@@ -887,7 +909,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    parser.add_argument("--input-max-explanations", type=int, default=3)
     parser.add_argument("--input-selection-method", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--input-m", type=int, default=5)
     parser.add_argument("--input-n", type=int, default=5)
@@ -995,28 +1016,41 @@ def main() -> None:
     if execution_path.exists():
         execution_payload = _load_json(execution_path)
 
-    selected_input_from_workflow, selected_input_cache_raw, input_cache_path = _pick_best_input_hypothesis_from_workflow(
-        final_result_payload=final_result,
-        workflow_timestamp_dir=workflow_timestamp_dir,
-    )
-    if selected_input_from_workflow is not None:
-        selected_input = selected_input_from_workflow
-    else:
-        selected_input = _pick_best_hypothesis(
+    run_input = args.run_mode in ("both", "input")
+    run_output = args.run_mode in ("both", "output")
+    if args.run_mode == "none":
+        _log_progress("Run mode is 'none': skip input-side and output-side evaluation execution.")
+
+    selected_input: Optional[Dict[str, Any]] = None
+    selected_output: Optional[Dict[str, Any]] = None
+    selected_input_cache_raw: Optional[Dict[str, Any]] = None
+    input_cache_path: Optional[Path] = None
+
+    if run_input:
+        selected_input_from_workflow, selected_input_cache_raw, input_cache_path = _pick_best_input_hypothesis_from_workflow(
+            final_result_payload=final_result,
+            workflow_timestamp_dir=workflow_timestamp_dir,
+        )
+        if selected_input_from_workflow is not None:
+            selected_input = selected_input_from_workflow
+        else:
+            selected_input = _pick_best_hypothesis(
+                final_result_payload=final_result,
+                refined_payload=refined_payload,
+                execution_payload=execution_payload,
+                side="input",
+            )
+    if run_output:
+        selected_output = _pick_best_hypothesis(
             final_result_payload=final_result,
             refined_payload=refined_payload,
             execution_payload=execution_payload,
-            side="input",
+            side="output",
         )
-    selected_output = _pick_best_hypothesis(
-        final_result_payload=final_result,
-        refined_payload=refined_payload,
-        execution_payload=execution_payload,
-        side="output",
-    )
+
     _log_progress(
-        f"Selected hypotheses (input idx={selected_input.get('hypothesis_index')}, "
-        f"output idx={selected_output.get('hypothesis_index')})"
+        f"Selected hypotheses (input idx={selected_input.get('hypothesis_index') if selected_input else 'N/A'}, "
+        f"output idx={selected_output.get('hypothesis_index') if selected_output else 'N/A'})"
     )
 
     source = _build_source(layer_id=layer_id, sae_name=str(args.sae_name), width=str(args.width))
@@ -1033,16 +1067,13 @@ def main() -> None:
         / "intervention_logit_topk_score.py"
     )
 
-    run_input = args.run_mode in ("both", "input")
-    run_output = args.run_mode in ("both", "output")
-    if args.run_mode == "none":
-        _log_progress("Run mode is 'none': skip input-side and output-side evaluation execution.")
-
     input_result_path: Optional[Path] = None
     input_result: Dict[str, Any] = {}
     input_eval_status = "skipped"
     used_cached_input_scores = False
     if run_input:
+        if selected_input is None:
+            raise ValueError("No input-side hypothesis found in workflow artifacts.")
         workflow_input_scores = _extract_workflow_input_scores(
             selected_input=selected_input,
             selected_input_cache_raw=selected_input_cache_raw,
@@ -1087,7 +1118,6 @@ def main() -> None:
             feature_id=feature_id,
             module=module,
             non_zero_threshold=float(args.input_non_zero_threshold),
-            max_explanations=int(args.input_max_explanations),
             selection_method=int(args.input_selection_method),
             m=int(args.input_m),
             n=int(args.input_n),
@@ -1099,8 +1129,16 @@ def main() -> None:
         )
 
         workflow_non_zero = _safe_float(workflow_input_scores.get("score_non_zero_rate"), 0.0)
-        workflow_boundary_rate = _safe_float(workflow_input_scores.get("score_boundary_non_activation_rate"), 0.0)
-        workflow_combined = _safe_float(workflow_input_scores.get("combined_input_score"), 0.0)
+        workflow_boundary_raw = workflow_input_scores.get("score_boundary_non_activation_rate")
+        workflow_boundary_rate = (
+            _safe_float(workflow_boundary_raw, 0.0) if workflow_boundary_raw is not None else None
+        )
+        workflow_combined_raw = workflow_input_scores.get("combined_input_score")
+        workflow_combined = (
+            _safe_float(workflow_combined_raw, 0.0)
+            if workflow_combined_raw is not None
+            else workflow_non_zero
+        )
         np_non_zero = neuronpedia_eval.get("neuronpedia_mean_score_non_zero_rate")
         np_boundary_rate = neuronpedia_eval.get("neuronpedia_mean_score_boundary_non_activation_rate")
         np_combined = neuronpedia_eval.get("neuronpedia_mean_combined_input_score")
@@ -1120,7 +1158,11 @@ def main() -> None:
             ),
             "relative_quality_score_boundary_non_activation_rate": (
                 (workflow_boundary_rate / _safe_float(np_boundary_rate, 0.0))
-                if np_boundary_rate is not None and _safe_float(np_boundary_rate, 0.0) > 0
+                if (
+                    workflow_boundary_rate is not None
+                    and np_boundary_rate is not None
+                    and _safe_float(np_boundary_rate, 0.0) > 0
+                )
                 else None
             ),
             "relative_quality_combined_input_score": (
@@ -1152,6 +1194,8 @@ def main() -> None:
     output_payload: Dict[str, Any] = {}
     output_summary: Dict[str, Any] = {}
     if run_output:
+        if selected_output is None:
+            raise ValueError("No output-side hypothesis found in workflow artifacts.")
         if args.output_eval_mode == "blind":
             output_cmd: List[str] = [
                 sys.executable,

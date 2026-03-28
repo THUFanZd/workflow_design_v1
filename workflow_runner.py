@@ -85,14 +85,23 @@ def _load_json_or_raise(path: Path) -> Dict[str, Any]:
     if not target_path.exists():
         parts = list(path.parts)
         # Backward-compatible fallback:
-        # logs/{layer}/{feature}/{timestamp}/... -> logs/{layer}_{feature}/{timestamp}/...
+        # logs/layer-{layer}/feature-{feature}/{timestamp}/...
+        # -> logs/{layer}/{feature}/{timestamp}/...
+        # -> logs/{layer}_{feature}/{timestamp}/...
         if len(parts) >= 5 and parts[0] == "logs":
             layer_part = parts[1]
             feature_part = parts[2]
-            legacy_parts = ["logs", f"{layer_part}_{feature_part}", *parts[3:]]
-            legacy_path = Path(*legacy_parts)
-            if legacy_path.exists():
-                target_path = legacy_path
+            if layer_part.startswith("layer-") and feature_part.startswith("feature-"):
+                layer_id = layer_part[len("layer-") :]
+                feature_id = feature_part[len("feature-") :]
+
+                old_path = Path("logs") / layer_id / feature_id / Path(*parts[3:])
+                if old_path.exists():
+                    target_path = old_path
+                else:
+                    legacy_path = Path("logs") / f"{layer_id}_{feature_id}" / Path(*parts[3:])
+                    if legacy_path.exists():
+                        target_path = legacy_path
     if not target_path.exists():
         raise FileNotFoundError(f"Cannot find required file: {path}")
 
@@ -288,12 +297,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-id", default="gemma-2-2b", help="Neuronpedia model id")
     parser.add_argument("--layer-id", required=True, help="Layer id")
     parser.add_argument("--feature-id", required=True, help="Feature id")
-    parser.add_argument("--timestamp", default=None, help="Timestamp directory under logs/{layer}/{feature}/")
     parser.add_argument(
-        "--max-rounds",
-        type=int,
+        "--timestamp",
         default=None,
-        help="Legacy override for refinement rounds after baseline. If omitted, input-side rounds use p+q schedule.",
+        help="Timestamp directory under logs/layer-{layer_id}/feature-{feature_id}/",
     )
     parser.add_argument(
         "--input-activation-max-rounds",
@@ -311,7 +318,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--start-round",
         type=int,
         default=0,
-        help="Round index to start real execution from. round_0 is baseline (not counted in max-rounds).",
+        help="Round index to start real execution from. round_0 is the baseline round.",
     )
     parser.add_argument(
         "--start-step",
@@ -329,7 +336,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="Reuse artifacts before start point from logs/{layer_id}/{feature_id}/{timestamp}/{round_id}.",
+        help=(
+            "Reuse artifacts before start point from "
+            "logs/layer-{layer_id}/feature-{feature_id}/{timestamp}/{round_id}."
+        ),
     )
 
     parser.add_argument("--num-hypothesis", type=int, default=3, help="Hypothesis count n for each side")
@@ -365,8 +375,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help=(
-            "Use at most previous n historical memory rounds during refinement. "
-            "Default: all available historical rounds."
+            "Use at most the most recent n memory rounds as historical context during refinement "
+            "(includes the immediately previous round). "
+            "Default: 1."
         ),
     )
     parser.add_argument(
@@ -449,22 +460,7 @@ if __name__ == "__main__":
     scheduled_input_total_rounds = activation_max_rounds + expansion_max_rounds
     if scheduled_input_total_rounds < 1:
         raise ValueError("input-side total rounds p+q must be >= 1.")
-    if args.max_rounds is not None and args.max_rounds < 0:
-        raise ValueError("--max-rounds must be >= 0 when provided.")
-    if args.max_rounds is not None:
-        # Legacy override: --max-rounds counts refinement rounds after baseline.
-        scheduled_input_total_rounds = max(int(args.max_rounds) + 1, 1)
-        if scheduled_input_total_rounds < activation_max_rounds:
-            raise ValueError(
-                "--max-rounds is too small for --input-activation-max-rounds "
-                "(need max_rounds + 1 >= input_activation_max_rounds)."
-            )
-        expansion_max_rounds = max(scheduled_input_total_rounds - activation_max_rounds, 0)
-
-    if args.side in ("input", "both"):
-        effective_max_rounds = max(scheduled_input_total_rounds - 1, 0)
-    else:
-        effective_max_rounds = max(int(args.max_rounds), 0) if args.max_rounds is not None else max(scheduled_input_total_rounds - 1, 0)
+    effective_max_rounds = max(scheduled_input_total_rounds - 1, 0)
 
     if args.start_round < 0:
         raise ValueError("--start-round must be >= 0.")
@@ -543,6 +539,7 @@ if __name__ == "__main__":
             feature_id=feature_id,
             num_hypothesis=args.num_hypothesis,
             generation_mode=args.generation_mode,
+            run_side=args.side,
             timestamp=ts,
             round_id=_round_id_from_index(0),
             llm_base_url=args.llm_base_url,
@@ -796,11 +793,12 @@ if __name__ == "__main__":
         _log_stage("refine hypotheses...", workflow_start_time)
         if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=1):
             historical_memories: List[Dict[str, Any]] = []
-            history_end = round_index - 1
+            # Collect the most recent n rounds up to (and including) round_index-1.
+            history_end_exclusive = round_index
             history_start = 0
             if args.history_rounds is not None:
-                history_start = max(0, history_end - args.history_rounds)
-            for hist_round in range(history_start, history_end):
+                history_start = max(0, history_end_exclusive - args.history_rounds)
+            for hist_round in range(history_start, history_end_exclusive):
                 if hist_round not in round_memories:
                     hist_memory_path = _artifact_json_path(
                         layer_id=layer_id,
