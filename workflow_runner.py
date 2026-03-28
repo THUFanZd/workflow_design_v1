@@ -5,7 +5,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, TypedDict
 
 from experiments_design import _write_markdown_log as write_experiments_markdown
 from experiments_design import design_hypothesis_experiments
@@ -596,6 +596,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 WorkflowState = Dict[str, Any]
+
+
+class WorkflowLangGraphState(TypedDict):
+    ctx: WorkflowState
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -1414,6 +1418,25 @@ def _route_after_round_memory(state: WorkflowState) -> str:
     return "advance_round"
 
 
+def _wrap_graph_node(handler: Callable[[WorkflowState], WorkflowState]) -> Callable[[WorkflowLangGraphState], WorkflowLangGraphState]:
+    def _wrapped(graph_state: WorkflowLangGraphState) -> WorkflowLangGraphState:
+        return {"ctx": handler(graph_state["ctx"])}
+
+    return _wrapped
+
+
+def _route_after_baseline_memory_graph(graph_state: WorkflowLangGraphState) -> str:
+    return _route_after_baseline_memory(graph_state["ctx"])
+
+
+def _route_after_refine_graph(graph_state: WorkflowLangGraphState) -> str:
+    return _route_after_refine(graph_state["ctx"])
+
+
+def _route_after_round_memory_graph(graph_state: WorkflowLangGraphState) -> str:
+    return _route_after_round_memory(graph_state["ctx"])
+
+
 def _invoke_without_langgraph(state: WorkflowState) -> WorkflowState:
     handlers = {
         "collect_observation": collect_observation_node,
@@ -1459,20 +1482,20 @@ def _invoke_without_langgraph(state: WorkflowState) -> WorkflowState:
 
 
 def _build_langgraph_app() -> Any:
-    workflow = StateGraph(dict)
-    workflow.add_node("collect_observation", collect_observation_node)
-    workflow.add_node("generate_initial_hypotheses", generate_initial_hypotheses_node)
-    workflow.add_node("design_baseline_experiments", design_baseline_experiments_node)
-    workflow.add_node("execute_baseline_experiments", execute_baseline_experiments_node)
-    workflow.add_node("build_baseline_memory", build_baseline_memory_node)
-    workflow.add_node("refine_round", refine_round_node)
-    workflow.add_node("merge_round", merge_round_node)
-    workflow.add_node("prepare_round", prepare_round_node)
-    workflow.add_node("design_round_experiments", design_round_experiments_node)
-    workflow.add_node("execute_round_experiments", execute_round_experiments_node)
-    workflow.add_node("build_round_memory", build_round_memory_node)
-    workflow.add_node("advance_round", advance_round_node)
-    workflow.add_node("finalize", finalize_node)
+    workflow = StateGraph(WorkflowLangGraphState)
+    workflow.add_node("collect_observation", _wrap_graph_node(collect_observation_node))
+    workflow.add_node("generate_initial_hypotheses", _wrap_graph_node(generate_initial_hypotheses_node))
+    workflow.add_node("design_baseline_experiments", _wrap_graph_node(design_baseline_experiments_node))
+    workflow.add_node("execute_baseline_experiments", _wrap_graph_node(execute_baseline_experiments_node))
+    workflow.add_node("build_baseline_memory", _wrap_graph_node(build_baseline_memory_node))
+    workflow.add_node("refine_round", _wrap_graph_node(refine_round_node))
+    workflow.add_node("merge_round", _wrap_graph_node(merge_round_node))
+    workflow.add_node("prepare_round", _wrap_graph_node(prepare_round_node))
+    workflow.add_node("design_round_experiments", _wrap_graph_node(design_round_experiments_node))
+    workflow.add_node("execute_round_experiments", _wrap_graph_node(execute_round_experiments_node))
+    workflow.add_node("build_round_memory", _wrap_graph_node(build_round_memory_node))
+    workflow.add_node("advance_round", _wrap_graph_node(advance_round_node))
+    workflow.add_node("finalize", _wrap_graph_node(finalize_node))
 
     workflow.add_edge(START, "collect_observation")
     workflow.add_edge("collect_observation", "generate_initial_hypotheses")
@@ -1481,12 +1504,12 @@ def _build_langgraph_app() -> Any:
     workflow.add_edge("execute_baseline_experiments", "build_baseline_memory")
     workflow.add_conditional_edges(
         "build_baseline_memory",
-        _route_after_baseline_memory,
+        _route_after_baseline_memory_graph,
         {"refine_round": "refine_round", "finalize": "finalize"},
     )
     workflow.add_conditional_edges(
         "refine_round",
-        _route_after_refine,
+        _route_after_refine_graph,
         {"merge_round": "merge_round", "prepare_round": "prepare_round"},
     )
     workflow.add_edge("merge_round", "prepare_round")
@@ -1495,7 +1518,7 @@ def _build_langgraph_app() -> Any:
     workflow.add_edge("execute_round_experiments", "build_round_memory")
     workflow.add_conditional_edges(
         "build_round_memory",
-        _route_after_round_memory,
+        _route_after_round_memory_graph,
         {"advance_round": "advance_round", "finalize": "finalize"},
     )
     workflow.add_edge("advance_round", "refine_round")
@@ -1508,7 +1531,7 @@ def run_workflow(args: argparse.Namespace) -> Dict[str, Any]:
     backend = "langgraph" if LANGGRAPH_AVAILABLE else "fallback"
     state = _build_initial_state(args, backend=backend)
     if LANGGRAPH_AVAILABLE:
-        final_state = _build_langgraph_app().invoke(state)
+        final_state = _build_langgraph_app().invoke({"ctx": state})["ctx"]
     else:
         final_state = _invoke_without_langgraph(state)
     return final_state["final_result"]
