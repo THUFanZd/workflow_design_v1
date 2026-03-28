@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -10,9 +11,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from openai import OpenAI
+
 from function import build_default_sae_path, build_feature_dir
+from function import TokenUsageAccumulator, call_llm_stream, extract_json_object, read_api_key
+from experiments_design import generate_boundary_contexts
 from model_with_sae import ModelWithSAEModule
 from neuronpedia_feature_api import extract_explanations, fetch_feature_json
+from prompts.experiments_design_prompt import build_system_prompt, build_user_prompt
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
 from support_info.llm_api_info import base_url as DEFAULT_BASE_URL
 from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
@@ -348,166 +354,193 @@ def _run_command_with_progress(
         time.sleep(1.0)
 
 
+def _neuronpedia_input_eval_cache_path(*, logs_root: Path, layer_id: str, feature_id: int) -> Path:
+    return (
+        logs_root
+        / build_feature_dir(
+            layer_id=str(layer_id).strip(),
+            feature_id=str(feature_id).strip(),
+        ).relative_to("logs")
+        / "neuronpedia-input-eval-cache.json"
+    )
+
+
+def _build_neuronpedia_input_eval_cache_signature(
+    *,
+    model_id: str,
+    source: str,
+    feature_id: int,
+    width: str,
+    sae_identity: str,
+    max_explanations: int,
+    non_activation_context_count: int,
+    non_zero_threshold: float,
+    activation_count_per_reference: int,
+    boundary_count_per_reference: int,
+    input_llm_model: str,
+    input_base_url: str,
+    input_llm_temperature: float,
+    input_llm_max_tokens: int,
+) -> str:
+    payload = {
+        "input_reference_generation_mode": "workflow_isomorphic_llm_v1",
+        "model_id": str(model_id).strip(),
+        "source": str(source).strip(),
+        "feature_id": int(feature_id),
+        "width": str(width).strip(),
+        "sae_identity": str(sae_identity).strip(),
+        "max_explanations": int(max_explanations),
+        "non_activation_context_count": int(non_activation_context_count),
+        "non_zero_threshold": float(non_zero_threshold),
+        "activation_count_per_reference": int(activation_count_per_reference),
+        "boundary_count_per_reference": int(boundary_count_per_reference),
+        "input_llm_model": str(input_llm_model).strip(),
+        "input_base_url": str(input_base_url).strip(),
+        "input_llm_temperature": float(input_llm_temperature),
+        "input_llm_max_tokens": int(input_llm_max_tokens),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _load_neuronpedia_input_eval_cache(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"entries": {}}
+    payload = _load_json(path)
+    entries = payload.get("entries")
+    if not isinstance(entries, dict):
+        payload["entries"] = {}
+    return payload
+
+
+def _save_neuronpedia_input_eval_cache(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
 def _build_source(layer_id: str, sae_name: str, width: str) -> str:
     return f"{layer_id}-{sae_name}-{width}"
 
 
-def _restore_sentence(tokens: Sequence[Any]) -> str:
-    text = "".join(str(token) for token in tokens)
-    replacements = {
-        "\u2581": " ",
-        "\u0120": " ",
-        "\u010a": "\n",
-    }
-    for src, dst in replacements.items():
-        text = text.replace(src, dst)
-    return " ".join(text.split())
+def _normalize_sentence(text: str) -> str:
+    stripped = text.strip().strip('"').strip("'")
+    stripped = re.sub(r"^\d+[\).\s-]+", "", stripped)
+    return " ".join(stripped.split())
 
 
-def _safe_max_token_from_activation(activation: Dict[str, Any]) -> str:
-    tokens = activation.get("tokens")
-    max_idx = activation.get("maxValueTokenIndex")
-    if not isinstance(tokens, list) or not isinstance(max_idx, int):
-        return ""
-    if max_idx < 0 or max_idx >= len(tokens):
-        return ""
-    token = tokens[max_idx]
-    return token if isinstance(token, str) else str(token)
+def _parse_sentence_list(raw_output: str, expected_count: int) -> List[str]:
+    parsed = extract_json_object(raw_output)
+    sentences: List[str] = []
+
+    if isinstance(parsed, dict):
+        candidate = parsed.get("sentences")
+        if isinstance(candidate, list):
+            sentences = [
+                _normalize_sentence(item)
+                for item in candidate
+                if isinstance(item, str) and _normalize_sentence(item)
+            ]
+
+    if not sentences:
+        lines = [line for line in raw_output.splitlines() if line.strip()]
+        sentences = [_normalize_sentence(line) for line in lines if _normalize_sentence(line)]
+
+    if not sentences:
+        raise ValueError(f"Failed to parse sentences from output: {raw_output}")
+
+    if len(sentences) < expected_count:
+        raise ValueError(
+            f"Expected {expected_count} sentences, but only parsed {len(sentences)}: {raw_output}"
+        )
+    return sentences[:expected_count]
 
 
-def _select_activation_contexts(
+def _generate_activation_sentences_with_llm(
     *,
-    feature_payload: Dict[str, Any],
-    selection_method: int,
-    m: int,
-    n: int,
+    client: OpenAI,
+    model: str,
+    reference_explanation: str,
+    sentence_count: int,
+    max_tokens: int,
+    temperature: float,
+    token_counter: TokenUsageAccumulator,
+    llm_calls: List[Dict[str, Any]],
+    reference_index: int,
 ) -> List[str]:
-    if selection_method not in (1, 2, 3):
-        raise ValueError("selection_method must be 1, 2, or 3.")
-    if m < 0 or n < 0:
-        raise ValueError("m and n must be non-negative integers.")
-
-    activations_raw = feature_payload.get("activations") or []
-    activations: List[Dict[str, Any]] = [item for item in activations_raw if isinstance(item, dict)]
-
-    selected_indices: List[int] = []
-    if selection_method == 1:
-        total = len(activations)
-        first_count = min(m, total)
-        selected_indices = list(range(first_count))
-        for idx in range(first_count, total):
-            if len(selected_indices) >= first_count + n:
-                break
-            current_token = _safe_max_token_from_activation(activations[idx])
-            last_token = (
-                _safe_max_token_from_activation(activations[selected_indices[-1]])
-                if selected_indices
-                else ""
-            )
-            if current_token != last_token:
-                selected_indices.append(idx)
-        target = first_count + n
-        if len(selected_indices) < target:
-            for idx in range(first_count, total):
-                if len(selected_indices) >= target:
-                    break
-                if idx not in selected_indices:
-                    selected_indices.append(idx)
-    elif selection_method == 2:
-        for idx, item in enumerate(activations):
-            if not selected_indices:
-                selected_indices.append(idx)
-            else:
-                current_token = _safe_max_token_from_activation(item)
-                last_token = _safe_max_token_from_activation(activations[selected_indices[-1]])
-                if current_token != last_token:
-                    selected_indices.append(idx)
-            if len(selected_indices) >= n:
-                break
-    else:
-        count = min(m, len(activations))
-        selected_indices = list(range(count))
-
-    contexts: List[str] = []
-    for idx in selected_indices:
-        tokens = activations[idx].get("tokens") or []
-        context = _restore_sentence(tokens)
-        if context:
-            contexts.append(context)
-    return contexts
-
-
-def _select_non_activation_contexts(
-    *,
-    feature_payload: Dict[str, Any],
-    count: int,
-) -> List[str]:
-    if count <= 0:
-        raise ValueError("count must be positive.")
-    activations = feature_payload.get("activations") or []
-    tail = activations[-count:]
-    contexts: List[str] = []
-    for item in tail:
-        if not isinstance(item, dict):
-            continue
-        tokens = item.get("tokens") or []
-        context = _restore_sentence(tokens)
-        if context:
-            contexts.append(context)
-    return contexts
-
-
-_KEYWORD_STOPWORDS = {
-    "the", "and", "that", "this", "with", "from", "into", "about", "over", "under", "between",
-    "while", "where", "when", "what", "which", "their", "there", "have", "has", "were", "been",
-    "being", "them", "they", "these", "those", "will", "would", "could", "should", "your", "you",
-    "for", "are", "not", "but", "can", "all", "its", "our", "out", "any", "may", "than", "then",
-}
-
-
-def _extract_keywords(text: str, *, max_keywords: int = 12) -> List[str]:
-    words = re.findall(r"[A-Za-z][A-Za-z0-9_'-]{2,}", text.lower())
-    seen: set[str] = set()
-    out: List[str] = []
-    for word in words:
-        if word in _KEYWORD_STOPWORDS:
-            continue
-        if word in seen:
-            continue
-        seen.add(word)
-        out.append(word)
-        if len(out) >= max_keywords:
-            break
-    return out
-
-
-def _rank_contexts_by_overlap(contexts: Sequence[str], keywords: Sequence[str]) -> List[str]:
-    if not contexts:
+    if sentence_count <= 0:
         return []
-    if not keywords:
-        return list(contexts)
-    scored: List[Tuple[int, int, str]] = []
-    for idx, context in enumerate(contexts):
-        low = context.lower()
-        overlap = sum(1 for key in keywords if key in low)
-        scored.append((overlap, idx, context))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    return [item[2] for item in scored]
+
+    system_prompt = build_system_prompt("input")
+    user_prompt = build_user_prompt(
+        side="input",
+        hypothesis=reference_explanation,
+        num_sentences=sentence_count,
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    raw_output, usage_obj = call_llm_stream(
+        client,
+        model,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    usage_counts = token_counter.add(usage_obj)
+    designed_sentences = _parse_sentence_list(raw_output, expected_count=sentence_count)
+    llm_calls.append(
+        {
+            "call_type": "input_activation_sentence_generation",
+            "reference_index": reference_index,
+            "reference_explanation": reference_explanation,
+            "messages": messages,
+            "raw_output": raw_output,
+            "usage": usage_counts,
+        }
+    )
+    return designed_sentences
 
 
 def _generate_sentence_sets_for_reference(
     *,
+    client: OpenAI,
+    model: str,
+    reference_index: int,
     reference_explanation: str,
-    activation_candidates: Sequence[str],
-    boundary_candidates: Sequence[str],
     activation_count: int,
     boundary_count: int,
+    max_tokens: int,
+    temperature: float,
+    token_counter: TokenUsageAccumulator,
+    llm_calls: List[Dict[str, Any]],
 ) -> Tuple[List[str], List[str]]:
-    keywords = _extract_keywords(reference_explanation)
-    ranked_activation = _rank_contexts_by_overlap(activation_candidates, keywords)
-    ranked_boundary = _rank_contexts_by_overlap(boundary_candidates, keywords)
-    designed = [ctx for ctx in ranked_activation[: max(activation_count, 0)] if ctx]
-    boundary = [ctx for ctx in ranked_boundary[: max(boundary_count, 0)] if ctx]
+    designed = _generate_activation_sentences_with_llm(
+        client=client,
+        model=model,
+        reference_explanation=reference_explanation,
+        sentence_count=max(activation_count, 0),
+        max_tokens=max_tokens,
+        temperature=temperature,
+        token_counter=token_counter,
+        llm_calls=llm_calls,
+        reference_index=reference_index,
+    )
+    boundary = generate_boundary_contexts(
+        client=client,
+        model=model,
+        explanation=reference_explanation,
+        boundary_case_count=max(boundary_count, 0),
+        max_tokens=max_tokens,
+        temperature=0.0,
+        token_counter=token_counter,
+        llm_calls=llm_calls,
+        call_metadata={
+            "call_type": "input_boundary_context_generation",
+            "reference_index": reference_index,
+            "reference_explanation": reference_explanation,
+        },
+    ) if boundary_count > 0 else []
     return designed, boundary
 
 
@@ -657,17 +690,49 @@ def _evaluate_neuronpedia_input_with_sae(
     model_id: str,
     source: str,
     feature_id: int,
+    width: str,
+    sae_identity: str,
     module: ModelWithSAEModule,
     non_zero_threshold: float,
-    selection_method: int,
-    m: int,
-    n: int,
+    max_explanations: int,
     non_activation_context_count: int,
     activation_count_per_reference: int,
     boundary_count_per_reference: int,
+    input_llm_model: str,
+    input_base_url: str,
+    input_api_key_file: str,
+    input_llm_temperature: float,
+    input_llm_max_tokens: int,
     neuronpedia_api_key: Optional[str],
     neuronpedia_timeout: int,
-) -> Dict[str, Any]:
+    cache_path: Path,
+) -> Tuple[Dict[str, Any], bool]:
+    signature = _build_neuronpedia_input_eval_cache_signature(
+        model_id=model_id,
+        source=source,
+        feature_id=feature_id,
+        width=width,
+        sae_identity=sae_identity,
+        max_explanations=max_explanations,
+        non_activation_context_count=non_activation_context_count,
+        non_zero_threshold=non_zero_threshold,
+        activation_count_per_reference=activation_count_per_reference,
+        boundary_count_per_reference=boundary_count_per_reference,
+        input_llm_model=input_llm_model,
+        input_base_url=input_base_url,
+        input_llm_temperature=input_llm_temperature,
+        input_llm_max_tokens=input_llm_max_tokens,
+    )
+    cache_payload = _load_neuronpedia_input_eval_cache(cache_path)
+    cache_entries = cache_payload.get("entries", {})
+    if isinstance(cache_entries, dict):
+        cached = cache_entries.get(signature)
+        if isinstance(cached, dict):
+            cached_result = dict(cached.get("result", cached))
+            if cached_result:
+                cached_result["cache_signature"] = signature
+                return cached_result, True
+
     payload = fetch_feature_json(
         model_id=model_id,
         source=source,
@@ -675,34 +740,31 @@ def _evaluate_neuronpedia_input_with_sae(
         api_key=neuronpedia_api_key,
         timeout=neuronpedia_timeout,
     )
-    reference_explanations = extract_explanations(payload, limit=1)
+    reference_explanations = extract_explanations(payload, limit=max(1, int(max_explanations)))
     if not reference_explanations:
         raise ValueError("No explanation found in Neuronpedia response.")
 
-    activation_candidates = _select_activation_contexts(
-        feature_payload=payload,
-        selection_method=selection_method,
-        m=m,
-        n=n,
+    input_api_key = read_api_key(input_api_key_file)
+    llm_client = OpenAI(
+        base_url=input_base_url,
+        api_key=input_api_key,
     )
-    if not activation_candidates:
-        raise ValueError("No activation contexts available for Neuronpedia evaluation.")
-
-    boundary_candidates = _select_non_activation_contexts(
-        feature_payload=payload,
-        count=max(non_activation_context_count, boundary_count_per_reference, 1),
-    )
-    if not boundary_candidates:
-        raise ValueError("No non-activation contexts available for Neuronpedia boundary evaluation.")
+    token_counter = TokenUsageAccumulator()
+    llm_calls: List[Dict[str, Any]] = []
 
     details: List[Dict[str, Any]] = []
-    for explanation in reference_explanations:
+    for ref_index, explanation in enumerate(reference_explanations, start=1):
         designed_sentences, boundary_sentences = _generate_sentence_sets_for_reference(
+            client=llm_client,
+            model=input_llm_model,
+            reference_index=ref_index,
             reference_explanation=explanation,
-            activation_candidates=activation_candidates,
-            boundary_candidates=boundary_candidates,
             activation_count=activation_count_per_reference,
             boundary_count=boundary_count_per_reference,
+            max_tokens=input_llm_max_tokens,
+            temperature=input_llm_temperature,
+            token_counter=token_counter,
+            llm_calls=llm_calls,
         )
         activation_metrics = _run_sentence_batch_with_sae(
             module=module,
@@ -761,7 +823,7 @@ def _evaluate_neuronpedia_input_with_sae(
         for item in details
         if item.get("combined_input_score") is not None
     ]
-    return {
+    result = {
         "reference_explanations": reference_explanations,
         "reference_count": len(reference_explanations),
         "reference_details": details,
@@ -774,9 +836,41 @@ def _evaluate_neuronpedia_input_with_sae(
         "neuronpedia_mean_combined_input_score": (
             (sum(combined_values) / len(combined_values)) if combined_values else None
         ),
-        "activation_candidate_pool": activation_candidates,
-        "boundary_candidate_pool": boundary_candidates,
+        "activation_candidate_pool": [],
+        "boundary_candidate_pool": [],
+        "reference_sentence_generation_mode": "workflow_isomorphic_llm_v1",
+        "input_llm_model": input_llm_model,
+        "input_base_url": input_base_url,
+        "input_llm_temperature": input_llm_temperature,
+        "input_llm_max_tokens": input_llm_max_tokens,
+        "llm_calls": llm_calls,
+        "llm_token_usage": token_counter.as_dict(),
     }
+    cache_entries[signature] = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "params": {
+            "input_reference_generation_mode": "workflow_isomorphic_llm_v1",
+            "model_id": str(model_id).strip(),
+            "source": str(source).strip(),
+            "feature_id": int(feature_id),
+            "width": str(width).strip(),
+            "sae_identity": str(sae_identity).strip(),
+            "max_explanations": int(max_explanations),
+            "non_activation_context_count": int(non_activation_context_count),
+            "non_zero_threshold": float(non_zero_threshold),
+            "activation_count_per_reference": int(activation_count_per_reference),
+            "boundary_count_per_reference": int(boundary_count_per_reference),
+            "input_llm_model": str(input_llm_model).strip(),
+            "input_base_url": str(input_base_url).strip(),
+            "input_llm_temperature": float(input_llm_temperature),
+            "input_llm_max_tokens": int(input_llm_max_tokens),
+        },
+        "result": result,
+    }
+    cache_payload["entries"] = cache_entries
+    _save_neuronpedia_input_eval_cache(cache_path, cache_payload)
+    result["cache_signature"] = signature
+    return result, False
 
 
 def _extract_logit_summary(logit_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -840,6 +934,8 @@ def _write_summary_markdown(path: Path, *, payload: Dict[str, Any]) -> None:
     lines.append(f"- status: {input_eval.get('status')}")
     lines.append(f"- method: {input_eval.get('method')}")
     lines.append(f"- used_workflow_cached_scores: {input_eval.get('used_workflow_cached_scores')}")
+    lines.append(f"- used_neuronpedia_input_eval_cache: {input_eval.get('used_neuronpedia_input_eval_cache')}")
+    lines.append(f"- neuronpedia_input_eval_cache_path: {input_eval.get('neuronpedia_input_eval_cache_path')}")
     lines.append(f"- workflow_score_non_zero_rate: {input_eval.get('workflow_score_non_zero_rate')}")
     lines.append(
         f"- workflow_score_boundary_non_activation_rate: {input_eval.get('workflow_score_boundary_non_activation_rate')}"
@@ -909,13 +1005,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    parser.add_argument("--input-selection-method", type=int, default=1, choices=[1, 2, 3])
-    parser.add_argument("--input-m", type=int, default=5)
-    parser.add_argument("--input-n", type=int, default=5)
+    parser.add_argument("--input-max-explanations", type=int, default=3)
     parser.add_argument("--input-non-activation-context-count", type=int, default=5)
-    parser.add_argument("--input-llm-model", default=DEFAULT_MODEL_NAME, help="Deprecated no-op.")
-    parser.add_argument("--input-base-url", default=DEFAULT_BASE_URL, help="Deprecated no-op.")
-    parser.add_argument("--input-api-key-file", default=None, help="Deprecated no-op.")
+    parser.add_argument("--input-llm-model", default=DEFAULT_MODEL_NAME)
+    parser.add_argument("--input-base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--input-api-key-file", default=DEFAULT_API_KEY_FILE)
+    parser.add_argument("--input-llm-temperature", type=float, default=0.0)
+    parser.add_argument("--input-llm-max-tokens", type=int, default=10000)
     parser.add_argument("--input-disable-boundary-score", action="store_true", help="Deprecated no-op.")
     parser.add_argument(
         "--force-run-input-eval",
@@ -1071,6 +1167,8 @@ def main() -> None:
     input_result: Dict[str, Any] = {}
     input_eval_status = "skipped"
     used_cached_input_scores = False
+    used_neuronpedia_input_eval_cache = False
+    neuronpedia_input_eval_cache_path: Optional[Path] = None
     if run_input:
         if selected_input is None:
             raise ValueError("No input-side hypothesis found in workflow artifacts.")
@@ -1083,15 +1181,15 @@ def main() -> None:
 
         workflow_designed = list(workflow_input_scores.get("designed_sentences", []))
         workflow_boundary = list(workflow_input_scores.get("boundary_sentences", []))
-        activation_count = (
-            len(workflow_designed)
-            if workflow_designed
-            else max(1, int(args.input_m) + int(args.input_n))
-        )
         boundary_count = (
             len(workflow_boundary)
             if workflow_boundary
             else max(1, int(args.input_non_activation_context_count))
+        )
+        activation_count = (
+            len(workflow_designed)
+            if workflow_designed
+            else boundary_count
         )
 
         _log_progress("Initializing SAE module for Neuronpedia input-side scoring")
@@ -1110,22 +1208,46 @@ def main() -> None:
             feature_index=int(feature_id),
             device=str(args.device),
         )
+        sae_identity = (
+            f"sae_path:{sae_path}"
+            if args.sae_path
+            else (
+                "sae_release:"
+                f"{sae_release}|average_l0:{str(args.sae_average_l0)}|canonical_map:{str(args.sae_canonical_map)}"
+            )
+        )
+        neuronpedia_input_eval_cache_path = _neuronpedia_input_eval_cache_path(
+            logs_root=Path(str(args.logs_root)),
+            layer_id=layer_id,
+            feature_id=feature_id,
+        )
 
-        _log_progress("Scoring Neuronpedia reference explanations with SAE-only input-side method")
-        neuronpedia_eval = _evaluate_neuronpedia_input_with_sae(
+        _log_progress("Scoring Neuronpedia reference explanations with workflow-isomorphic LLM+SAE input-side method")
+        input_api_key_file = (
+            str(args.input_api_key_file).strip()
+            if str(args.input_api_key_file or "").strip()
+            else str(DEFAULT_API_KEY_FILE)
+        )
+        neuronpedia_eval, used_neuronpedia_input_eval_cache = _evaluate_neuronpedia_input_with_sae(
             model_id=model_id,
             source=source,
             feature_id=feature_id,
+            width=str(args.width),
+            sae_identity=sae_identity,
             module=module,
             non_zero_threshold=float(args.input_non_zero_threshold),
-            selection_method=int(args.input_selection_method),
-            m=int(args.input_m),
-            n=int(args.input_n),
+            max_explanations=int(args.input_max_explanations),
             non_activation_context_count=int(args.input_non_activation_context_count),
             activation_count_per_reference=activation_count,
             boundary_count_per_reference=boundary_count,
+            input_llm_model=str(args.input_llm_model),
+            input_base_url=str(args.input_base_url),
+            input_api_key_file=input_api_key_file,
+            input_llm_temperature=float(args.input_llm_temperature),
+            input_llm_max_tokens=int(args.input_llm_max_tokens),
             neuronpedia_api_key=args.neuronpedia_api_key,
             neuronpedia_timeout=int(args.neuronpedia_timeout),
+            cache_path=neuronpedia_input_eval_cache_path,
         )
 
         workflow_non_zero = _safe_float(workflow_input_scores.get("score_non_zero_rate"), 0.0)
@@ -1175,6 +1297,10 @@ def main() -> None:
             "workflow_input_score_source": workflow_input_scores.get("source"),
             "workflow_input_score_details": workflow_input_scores,
             "neuronpedia_evaluation": neuronpedia_eval,
+            "used_neuronpedia_input_eval_cache": used_neuronpedia_input_eval_cache,
+            "neuronpedia_input_eval_cache_path": (
+                str(neuronpedia_input_eval_cache_path) if neuronpedia_input_eval_cache_path is not None else None
+            ),
         }
         input_result_path = (
             Path(args.input_output_root)
@@ -1342,6 +1468,7 @@ def main() -> None:
             "status": input_eval_status,
             "method": input_result.get("method") if run_input else None,
             "used_workflow_cached_scores": used_cached_input_scores,
+            "used_neuronpedia_input_eval_cache": used_neuronpedia_input_eval_cache if run_input else None,
             "workflow_score_non_zero_rate": (
                 input_result.get("workflow_score_non_zero_rate") if run_input else None
             ),
@@ -1370,6 +1497,9 @@ def main() -> None:
                 input_result.get("relative_quality_combined_input_score") if run_input else None
             ),
             "reference_count": input_result.get("reference_count") if run_input else None,
+            "neuronpedia_input_eval_cache_path": (
+                input_result.get("neuronpedia_input_eval_cache_path") if run_input else None
+            ),
             "raw_result": (
                 {
                     "input_result": input_result,

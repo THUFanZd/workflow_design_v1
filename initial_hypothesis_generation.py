@@ -12,6 +12,7 @@ from openai import OpenAI
 from function import (
     DEFAULT_MAX_TOKENS,
     TokenUsageAccumulator,
+    build_feature_dir,
     build_round_dir,
     call_llm_stream,
     extract_json_object,

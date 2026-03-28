@@ -20,6 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 class RunSummary:
     layer_id: int
     feature_id: int
+    side: str
+    final_run_mode: str
     history_scope: str
     merge_enabled: bool
     timestamp: str
@@ -118,41 +120,16 @@ def parse_args() -> argparse.Namespace:
         "--observation-m",
         type=int,
         default=2,
-        help="Passed to workflow_runner.py --observation-m (used by selection-method=1).",
+        help="Passed only to workflow_runner.py --observation-m (workflow observation sampling).",
     )
     parser.add_argument(
         "--observation-n",
         type=int,
         default=2,
-        help="Passed to workflow_runner.py --observation-n (used by selection-method=1).",
+        help="Passed only to workflow_runner.py --observation-n (workflow observation sampling).",
     )
 
     parser.add_argument("--sae-name", default="gemmascope-res")
-    parser.add_argument(
-        "--final-run-mode",
-        choices=["both", "input", "output", "none"],
-        default="both",
-        help="Passed to final_explanation_evaluation_runner.py --run-mode.",
-    )
-    parser.add_argument(
-        "--input-selection-method",
-        type=int,
-        default=1,
-        choices=[1, 2, 3],
-        help="Passed to final_explanation_evaluation_runner.py --input-selection-method.",
-    )
-    parser.add_argument(
-        "--input-m",
-        type=int,
-        default=5,
-        help="Passed to final_explanation_evaluation_runner.py --input-m.",
-    )
-    parser.add_argument(
-        "--input-n",
-        type=int,
-        default=5,
-        help="Passed to final_explanation_evaluation_runner.py --input-n.",
-    )
     parser.add_argument(
         "--input-non-activation-context-count",
         type=int,
@@ -182,6 +159,7 @@ def main() -> None:
     timestamp = _resolve_timestamp(args)
     layer_id = int(args.layer_id)
     feature_id = int(args.feature_id)
+    final_run_mode = str(args.side)
 
     workflow_cmd = [
         str(args.python_exe),
@@ -248,13 +226,7 @@ def main() -> None:
             "--width",
             str(args.width),
             "--run-mode",
-            str(args.final_run_mode),
-            "--input-selection-method",
-            str(args.input_selection_method),
-            "--input-m",
-            str(args.input_m),
-            "--input-n",
-            str(args.input_n),
+            final_run_mode,
             "--input-non-activation-context-count",
             str(args.input_non_activation_context_count),
         ]
@@ -268,6 +240,8 @@ def main() -> None:
     summary = RunSummary(
         layer_id=layer_id,
         feature_id=feature_id,
+        side=str(args.side),
+        final_run_mode=final_run_mode,
         history_scope=str(args.history_scope),
         merge_enabled=bool(args.enable_hypothesis_merge),
         timestamp=timestamp,

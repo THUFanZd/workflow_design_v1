@@ -224,44 +224,19 @@ def parse_args() -> argparse.Namespace:
         "--observation-m",
         type=int,
         default=2,
-        help="Passed to workflow_runner.py --observation-m (used by selection-method=1).",
+        help="Passed only to workflow_runner.py --observation-m (workflow observation sampling).",
     )
     parser.add_argument(
         "--observation-n",
         type=int,
         default=2,
-        help="Passed to workflow_runner.py --observation-n (used by selection-method=1).",
-    )
-    parser.add_argument(
-        "--input-selection-method",
-        type=int,
-        default=1,
-        choices=[1, 2, 3],
-        help="Passed to final_explanation_evaluation_runner.py --input-selection-method.",
-    )
-    parser.add_argument(
-        "--input-m",
-        type=int,
-        default=5,
-        help="Passed to final_explanation_evaluation_runner.py --input-m.",
-    )
-    parser.add_argument(
-        "--input-n",
-        type=int,
-        default=5,
-        help="Passed to final_explanation_evaluation_runner.py --input-n.",
+        help="Passed only to workflow_runner.py --observation-n (workflow observation sampling).",
     )
     parser.add_argument(
         "--input-non-activation-context-count",
         type=int,
         default=5,
         help="Passed to final_explanation_evaluation_runner.py --input-non-activation-context-count.",
-    )
-    parser.add_argument(
-        "--final-run-mode",
-        choices=["both", "input", "output", "none"],
-        default="both",
-        help="Passed to final_explanation_evaluation_runner.py --run-mode.",
     )
     parser.add_argument(
         "--continue-on-error",
@@ -361,14 +336,6 @@ def main() -> None:
                 str(args.observation_n),
                 "--sae-name",
                 str(args.sae_name),
-                "--final-run-mode",
-                str(args.final_run_mode),
-                "--input-selection-method",
-                str(args.input_selection_method),
-                "--input-m",
-                str(args.input_m),
-                "--input-n",
-                str(args.input_n),
                 "--input-non-activation-context-count",
                 str(args.input_non_activation_context_count),
             ]
@@ -435,9 +402,6 @@ def main() -> None:
         "selection_method": int(args.selection_method),
         "observation_m": int(args.observation_m),
         "observation_n": int(args.observation_n),
-        "input_selection_method": int(args.input_selection_method),
-        "input_m": int(args.input_m),
-        "input_n": int(args.input_n),
         "input_non_activation_context_count": int(args.input_non_activation_context_count),
         "final_run_mode": str(args.final_run_mode),
         "force_run_input_eval": bool(args.force_run_input_eval),

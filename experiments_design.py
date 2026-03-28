@@ -61,6 +61,119 @@ def _parse_sentence_list(raw_output: str, expected_count: int) -> List[str]:
     return sentences[:expected_count]
 
 
+def _extract_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        normalized = " ".join(value.split())
+        return [normalized] if normalized else []
+    if isinstance(value, list):
+        items: List[str] = []
+        for item in value:
+            items.extend(_extract_string_list(item))
+        return items
+    if isinstance(value, dict):
+        items = []
+        for item in value.values():
+            items.extend(_extract_string_list(item))
+        return items
+    return []
+
+
+def generate_boundary_contexts(
+    *,
+    client: OpenAI,
+    model: str,
+    explanation: str,
+    boundary_case_count: int = 5,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    temperature: float = 0.2,
+    token_counter: Optional[TokenUsageAccumulator] = None,
+    llm_calls: Optional[List[Dict[str, Any]]] = None,
+    call_metadata: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    if boundary_case_count <= 0:
+        raise ValueError("boundary_case_count must be a positive integer.")
+
+    system_prompt = (
+        "You are an expert at designing adversarial boundary test cases for SAE feature explanations. "
+        "Return JSON only."
+    )
+    user_prompt = (
+        "Task: generate boundary contexts for the hypothesis below.\n\n"
+        "Definition of boundary case (critical):\n"
+        "- A boundary case is near the edge of the explained set by the feature explanation:\n"
+        "  it looks lexically or semantically similar,\n"
+        "  but should still fall outside the true activation set.\n"
+        "- The case should be tempting and confusable, but the feature should not activate strongly on it.\n"
+        "- Use multiple near-miss types when possible, such as context shift, minimal lexical edits,\n"
+        "  orthographic variants, or the same surface form in a different domain.\n\n"
+        f"Hypothesis / explanation:\n{explanation}\n\n"
+        f"Generate exactly {boundary_case_count} boundary contexts.\n"
+        "Each context should be a single natural sentence or short snippet.\n"
+        "Return JSON only in this format:\n"
+        "{\n"
+        '  "boundary_cases": ["case 1", "case 2", "case 3"]\n'
+        "}"
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    raw_output, usage_obj = call_llm_stream(
+        client=client,
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+    usage_counts: Optional[Dict[str, int]] = None
+    if token_counter is not None:
+        usage_counts = token_counter.add(usage_obj)
+
+    parsed = extract_json_object(raw_output)
+    candidates: List[str] = []
+    if isinstance(parsed, dict):
+        for key in ("boundary_cases", "cases", "examples", "contexts", "items"):
+            if key in parsed:
+                candidates.extend(_extract_string_list(parsed[key]))
+        if not candidates:
+            candidates.extend(_extract_string_list(parsed))
+
+    if not candidates:
+        for line in raw_output.splitlines():
+            cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+            if cleaned:
+                candidates.append(" ".join(cleaned.split()))
+
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if item and item not in seen:
+            seen.add(item)
+            deduped.append(item)
+
+    if llm_calls is not None:
+        payload: Dict[str, Any] = dict(call_metadata or {})
+        payload.update(
+            {
+                "messages": messages,
+                "raw_output": raw_output,
+            }
+        )
+        if usage_counts is not None:
+            payload["usage"] = usage_counts
+        llm_calls.append(payload)
+
+    if len(deduped) < boundary_case_count:
+        raise ValueError(
+            f"Boundary case generator returned {len(deduped)} cases, "
+            f"but {boundary_case_count} are required. Raw output: {raw_output}"
+        )
+    return deduped[:boundary_case_count]
+
+
 def _design_sentences(
     *,
     side: SideType,

@@ -16,6 +16,7 @@ from function import (
     DEFAULT_MAX_TOKENS,
     TokenUsageAccumulator,
     build_default_sae_path,
+    build_feature_dir,
     build_round_dir,
     normalize_round_id,
     read_api_key,

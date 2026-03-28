@@ -12,6 +12,7 @@ from experiments_design import design_hypothesis_experiments
 from function import (
     DEFAULT_CANONICAL_MAP_PATH,
     build_default_sae_path,
+    build_feature_dir,
     build_round_dir,
     normalize_round_id,
     resolve_existing_round_dir,

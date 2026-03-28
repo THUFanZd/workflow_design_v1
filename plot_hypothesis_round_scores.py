@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 
 
 ROUND_DIR_PATTERN = re.compile(r"^round_(\d+)$")
+LAYER_DIR_PATTERN = re.compile(r"^layer-\d+$")
+FEATURE_DIR_PATTERN = re.compile(r"^feature-\d+$")
 
 
 @dataclass
