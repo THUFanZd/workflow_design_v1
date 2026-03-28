@@ -29,6 +29,16 @@ from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
 from model_with_sae import ModelWithSAEModule
 from neuronpedia_feature_api import fetch_and_parse_feature_observation
 
+try:
+    from langgraph.graph import END, START, StateGraph
+
+    LANGGRAPH_AVAILABLE = True
+except ImportError:
+    END = "__end__"
+    START = "__start__"
+    StateGraph = None
+    LANGGRAPH_AVAILABLE = False
+
 
 def _clean_text(value: Any) -> str:
     if isinstance(value, str):
@@ -577,10 +587,941 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-logit-kl-max-steps", type=int, default=12)
     parser.add_argument("--output-logit-force-refresh-kl-cache", action="store_true")
     parser.add_argument("--output-logit-include-special-tokens", action="store_true")
+    parser.add_argument(
+        "--require-langgraph",
+        action="store_true",
+        help="Fail if langgraph is not installed instead of using the local fallback executor.",
+    )
     return parser
 
 
+WorkflowState = Dict[str, Any]
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    merge_enabled = bool(args.enable_hypothesis_merge)
+    if args.max_rounds < 0:
+        raise ValueError("--max-rounds must be >= 0.")
+    if args.start_round < 0:
+        raise ValueError("--start-round must be >= 0.")
+    if args.start_round == 0 and args.start_step not in (1, 2, 3, 4, 5):
+        raise ValueError("When --start-round=0, --start-step must be one of 1/2/3/4/5.")
+    if args.start_round >= 1:
+        valid_steps = (1, 2, 3, 4, 5) if merge_enabled else (1, 2, 3, 4)
+        if args.start_step not in valid_steps:
+            if merge_enabled:
+                raise ValueError("When --start-round>=1 with merge enabled, --start-step must be one of 1/2/3/4/5.")
+            raise ValueError("When --start-round>=1 with merge disabled, --start-step must be one of 1/2/3/4.")
+    if args.start_round > args.max_rounds and args.start_round > 0:
+        raise ValueError("--start-round cannot be greater than --max-rounds.")
+    if args.history_rounds is not None and args.history_rounds < 0:
+        raise ValueError("--history-rounds must be >= 0 when provided.")
+    if (args.start_round != 0 or args.start_step != 1) and not args.reuse_from_logs:
+        raise ValueError("Resume from middle requires --reuse-from-logs.")
+    if args.reuse_from_logs and args.timestamp is None:
+        raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
+    if args.require_langgraph and not LANGGRAPH_AVAILABLE:
+        raise ImportError("langgraph is not installed, but --require-langgraph was set.")
+
+
+def _build_initial_state(args: argparse.Namespace, *, backend: str) -> WorkflowState:
+    ts = args.timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    return {
+        "args": args,
+        "workflow_backend": backend,
+        "workflow_start_time": time.perf_counter(),
+        "layer_id": str(args.layer_id),
+        "feature_id": str(args.feature_id),
+        "timestamp": ts,
+        "merge_enabled": bool(args.enable_hypothesis_merge),
+        "total_tokens": TokenUsageAccumulator(),
+        "run_tokens": TokenUsageAccumulator(),
+        "executed_steps": [],
+        "loaded_steps": [],
+        "previous_execution_result": None,
+        "previous_memory_result": None,
+        "previous_experiments_result": None,
+        "round_memories": {},
+        "round_refinements": {},
+        "round_merges": {},
+        "round_executions": {},
+        "module": None,
+        "current_round": 1,
+        "current_round_id": _round_id_from_index(1),
+        "current_merged_result": None,
+        "frozen_input_indices": set(),
+        "active_input_indices": [],
+        "converged": False,
+        "converged_this_round": False,
+        "converged_round": None,
+        "last_round_executed": 0,
+        "last_output_intervention_method": str(args.output_intervention_method),
+        "last_output_score_name": "score_blind_accuracy",
+        "last_output_logit_top_k": int(args.output_logit_top_k),
+    }
+
+
+def _track_usage(state: WorkflowState, result: Dict[str, Any], *, executed: bool) -> None:
+    usage = _result_usage(result)
+    state["total_tokens"].add(usage)
+    if executed:
+        state["run_tokens"].add(usage)
+
+
+def _update_last_output_meta(state: WorkflowState, execution_result_payload: Dict[str, Any]) -> None:
+    output_exec_meta = execution_result_payload.get("output_side_execution", {})
+    if not isinstance(output_exec_meta, dict):
+        return
+    state["last_output_intervention_method"] = str(
+        output_exec_meta.get("output_intervention_method", state["last_output_intervention_method"])
+    )
+    state["last_output_score_name"] = str(
+        output_exec_meta.get("output_score_name", state["last_output_score_name"])
+    )
+    if output_exec_meta.get("logit_top_k") is not None:
+        try:
+            state["last_output_logit_top_k"] = int(output_exec_meta.get("logit_top_k"))
+        except (TypeError, ValueError):
+            pass
+
+
+def _ensure_module(state: WorkflowState) -> ModelWithSAEModule:
+    module = state.get("module")
+    if module is not None:
+        return module
+
+    args = state["args"]
+    sae_path = args.sae_path or build_default_sae_path(
+        layer_id=state["layer_id"],
+        width=args.width,
+        release=args.sae_release,
+        average_l0=args.sae_average_l0,
+        canonical_map_path=args.sae_canonical_map,
+    )[0]
+    module = ModelWithSAEModule(
+        llm_name=args.model_checkpoint_path,
+        sae_path=sae_path,
+        sae_layer=int(state["layer_id"]),
+        feature_index=int(state["feature_id"]),
+        device=args.device,
+    )
+    state["module"] = module
+    return module
+
+
+def _load_previous_round_inputs(state: WorkflowState, round_index: int) -> None:
+    if state.get("previous_execution_result") is None:
+        prev_execution_path = _artifact_json_path(
+            layer_id=state["layer_id"],
+            feature_id=state["feature_id"],
+            timestamp=state["timestamp"],
+            round_index=round_index - 1,
+            kind="experiments_execution",
+        )
+        state["previous_execution_result"] = _load_json_or_raise(prev_execution_path)
+    if state.get("previous_memory_result") is None:
+        prev_memory_path = _artifact_json_path(
+            layer_id=state["layer_id"],
+            feature_id=state["feature_id"],
+            timestamp=state["timestamp"],
+            round_index=round_index - 1,
+            kind="memory",
+        )
+        previous_memory = _load_json_or_raise(prev_memory_path)
+        state["previous_memory_result"] = previous_memory
+        state["round_memories"][round_index - 1] = previous_memory
+    if state.get("previous_experiments_result") is None:
+        prev_experiments_path = _artifact_json_path(
+            layer_id=state["layer_id"],
+            feature_id=state["feature_id"],
+            timestamp=state["timestamp"],
+            round_index=round_index - 1,
+            kind="experiments",
+        )
+        state["previous_experiments_result"] = _load_json_or_raise(prev_experiments_path)
+
+
+def collect_observation_node(state: WorkflowState) -> WorkflowState:
+    args = state["args"]
+    observation_path = _artifact_json_path(
+        layer_id=state["layer_id"],
+        feature_id=state["feature_id"],
+        timestamp=state["timestamp"],
+        round_index=0,
+        kind="observation_input",
+    )
+    _log_stage("collect observation...", state["workflow_start_time"])
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=1):
+        observation = fetch_and_parse_feature_observation(
+            model_id=args.model_id,
+            layer_id=state["layer_id"],
+            feature_id=state["feature_id"],
+            width=args.width,
+            selection_method=args.selection_method,
+            m=args.observation_m,
+            n=args.observation_n,
+            api_key=args.neuronpedia_api_key,
+            timeout=args.neuronpedia_timeout,
+            timestamp=state["timestamp"],
+            round_id=_round_id_from_index(0),
+        )
+        state["executed_steps"].append("round_0_step_1_observation")
+    else:
+        observation = _load_json_or_raise(observation_path)
+        state["loaded_steps"].append("round_0_step_1_observation")
+    state["observation"] = observation
+    return state
+
+
+def generate_initial_hypotheses_node(state: WorkflowState) -> WorkflowState:
+    args = state["args"]
+    initial_path = _artifact_json_path(
+        layer_id=state["layer_id"],
+        feature_id=state["feature_id"],
+        timestamp=state["timestamp"],
+        round_index=0,
+        kind="initial_hypotheses",
+    )
+    _log_stage("generate initial hypotheses...", state["workflow_start_time"])
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=2):
+        initial_result = generate_initial_hypotheses(
+            observation=state["observation"],
+            model_id=args.model_id,
+            layer_id=state["layer_id"],
+            feature_id=state["feature_id"],
+            num_hypothesis=args.num_hypothesis,
+            generation_mode=args.generation_mode,
+            timestamp=state["timestamp"],
+            round_id=_round_id_from_index(0),
+            llm_base_url=args.llm_base_url,
+            llm_model=args.llm_model,
+            llm_api_key_file=args.llm_api_key_file,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+        )
+        state["executed_steps"].append("round_0_step_2_initial_hypotheses")
+        _track_usage(state, initial_result, executed=True)
+    else:
+        initial_result = _load_json_or_raise(initial_path)
+        state["loaded_steps"].append("round_0_step_2_initial_hypotheses")
+        _track_usage(state, initial_result, executed=False)
+    state["initial_result"] = initial_result
+    state["current_hypotheses"] = initial_result
+    state["last_executed_hypotheses"] = initial_result
+    return state
+
+
+def design_baseline_experiments_node(state: WorkflowState) -> WorkflowState:
+    args = state["args"]
+    baseline_experiments_path = _artifact_json_path(
+        layer_id=state["layer_id"],
+        feature_id=state["feature_id"],
+        timestamp=state["timestamp"],
+        round_index=0,
+        kind="experiments",
+    )
+    _log_stage("design baseline experiments...", state["workflow_start_time"])
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=3):
+        baseline_experiments_result = design_hypothesis_experiments(
+            hypotheses_result=state["current_hypotheses"],
+            num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
+            run_side=args.side,
+            round_id=_round_id_from_index(0),
+            llm_base_url=args.llm_base_url,
+            llm_model=args.llm_model,
+            llm_api_key_file=args.llm_api_key_file,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+        )
+        state["executed_steps"].append("round_0_step_3_experiments_design")
+        _track_usage(state, baseline_experiments_result, executed=True)
+    else:
+        baseline_experiments_result = _load_json_or_raise(baseline_experiments_path)
+        state["loaded_steps"].append("round_0_step_3_experiments_design")
+        _track_usage(state, baseline_experiments_result, executed=False)
+    state["previous_experiments_result"] = baseline_experiments_result
+    return state
+
+
+def execute_baseline_experiments_node(state: WorkflowState) -> WorkflowState:
+    args = state["args"]
+    baseline_execution_path = _artifact_json_path(
+        layer_id=state["layer_id"],
+        feature_id=state["feature_id"],
+        timestamp=state["timestamp"],
+        round_index=0,
+        kind="experiments_execution",
+    )
+    _log_stage("execute baseline experiments...", state["workflow_start_time"])
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=4):
+        baseline_execution_result = execute_hypothesis_experiments(
+            experiments_result=state["previous_experiments_result"],
+            module=_ensure_module(state),
+            run_side=args.side,
+            round_id=_round_id_from_index(0),
+            llm_base_url=args.llm_base_url,
+            llm_model=args.llm_model,
+            llm_api_key_file=args.llm_api_key_file,
+            input_non_zero_threshold=args.input_non_zero_threshold,
+            output_judge_num_choices=args.output_judge_num_choices,
+            output_judge_trials=args.output_judge_trials,
+            output_judge_seed=args.output_judge_seed,
+            output_max_new_tokens=args.output_max_new_tokens,
+            output_generation_temperature=args.output_generation_temperature,
+            output_judge_temperature=args.output_judge_temperature,
+            output_judge_max_tokens=args.output_judge_max_tokens,
+            output_kl_values=args.output_kl_values,
+            output_intervention_method=args.output_intervention_method,
+            output_logit_top_k=args.output_logit_top_k,
+            output_logit_kl_tolerance=args.output_logit_kl_tolerance,
+            output_logit_kl_max_steps=args.output_logit_kl_max_steps,
+            output_logit_force_refresh_kl_cache=args.output_logit_force_refresh_kl_cache,
+            output_logit_include_special_tokens=args.output_logit_include_special_tokens,
+        )
+        state["executed_steps"].append("round_0_step_4_experiments_execution")
+        _track_usage(state, baseline_execution_result, executed=True)
+    else:
+        baseline_execution_result = _load_json_or_raise(baseline_execution_path)
+        state["loaded_steps"].append("round_0_step_4_experiments_execution")
+        _track_usage(state, baseline_execution_result, executed=False)
+    _update_last_output_meta(state, baseline_execution_result)
+    state["round_executions"][0] = baseline_execution_result
+    state["last_executed_hypotheses"] = state["current_hypotheses"]
+    state["previous_execution_result"] = baseline_execution_result
+    return state
+
+
+def build_baseline_memory_node(state: WorkflowState) -> WorkflowState:
+    args = state["args"]
+    baseline_memory_path = _artifact_json_path(
+        layer_id=state["layer_id"],
+        feature_id=state["feature_id"],
+        timestamp=state["timestamp"],
+        round_index=0,
+        kind="memory",
+    )
+    baseline_memory_md_path = baseline_memory_path.with_suffix(".md")
+    _log_stage("build baseline memory...", state["workflow_start_time"])
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=5):
+        baseline_memory_result = build_hypothesis_memory(
+            initial_hypotheses_result=state["current_hypotheses"],
+            experiments_result=state["previous_experiments_result"],
+            execution_result=state["previous_execution_result"],
+            hypothesis_reasons=_extract_reason_map(state["current_hypotheses"]),
+            round_index=0,
+            round_id=_round_id_from_index(0),
+        )
+        _save_json(baseline_memory_path, baseline_memory_result)
+        write_hypothesis_memory_markdown(baseline_memory_md_path, memory=baseline_memory_result)
+        state["executed_steps"].append("round_0_step_5_memory")
+    else:
+        baseline_memory_result = _load_json_or_raise(baseline_memory_path)
+        state["loaded_steps"].append("round_0_step_5_memory")
+    state["round_memories"][0] = baseline_memory_result
+    state["previous_memory_result"] = baseline_memory_result
+    return state
+
+
+def refine_round_node(state: WorkflowState) -> WorkflowState:
+    args = state["args"]
+    round_index = state["current_round"]
+    round_id = _round_id_from_index(round_index)
+    state["current_round_id"] = round_id
+    _log_stage(f"round {round_index}...", state["workflow_start_time"])
+    _load_previous_round_inputs(state, round_index)
+
+    refine_path = _artifact_json_path(
+        layer_id=state["layer_id"],
+        feature_id=state["feature_id"],
+        timestamp=state["timestamp"],
+        round_index=round_index,
+        kind="refined_hypotheses",
+    )
+    _log_stage("refine hypotheses...", state["workflow_start_time"])
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=1):
+        historical_memories: List[Dict[str, Any]] = []
+        history_end = round_index - 1
+        history_start = 0
+        if args.history_rounds is not None:
+            history_start = max(0, history_end - args.history_rounds)
+        for hist_round in range(history_start, history_end):
+            if hist_round not in state["round_memories"]:
+                hist_memory_path = _artifact_json_path(
+                    layer_id=state["layer_id"],
+                    feature_id=state["feature_id"],
+                    timestamp=state["timestamp"],
+                    round_index=hist_round,
+                    kind="memory",
+                )
+                state["round_memories"][hist_round] = _load_json_or_raise(hist_memory_path)
+            historical_memories.append(state["round_memories"][hist_round])
+
+        top_m = args.top_m
+        if top_m is None:
+            top_m = len(list(state["current_hypotheses"].get("input_side_hypotheses", [])))
+        refinement_result = refine_hypotheses(
+            current_memory=state["previous_memory_result"],
+            current_execution_result=state["previous_execution_result"],
+            historical_memories=historical_memories,
+            run_side=args.side,
+            model_id=str(state["current_hypotheses"].get("model_id", args.model_id)),
+            layer_id=state["layer_id"],
+            feature_id=state["feature_id"],
+            top_m=top_m,
+            history_scope=args.history_scope,
+            timestamp=state["timestamp"],
+            round_id=round_id,
+            llm_base_url=args.llm_base_url,
+            llm_model=args.llm_model,
+            llm_api_key_file=args.llm_api_key_file,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+        )
+        state["executed_steps"].append(f"{round_id}_step_1_refinement")
+        _track_usage(state, refinement_result, executed=True)
+    else:
+        refinement_result = _load_json_or_raise(refine_path)
+        state["loaded_steps"].append(f"{round_id}_step_1_refinement")
+        _track_usage(state, refinement_result, executed=False)
+    state["round_refinements"][round_index] = refinement_result
+    state["current_refinement_result"] = refinement_result
+    state["current_merged_result"] = None
+    return state
+
+
+def merge_round_node(state: WorkflowState) -> WorkflowState:
+    args = state["args"]
+    round_index = state["current_round"]
+    round_id = state["current_round_id"]
+    merge_path = _artifact_json_path(
+        layer_id=state["layer_id"],
+        feature_id=state["feature_id"],
+        timestamp=state["timestamp"],
+        round_index=round_index,
+        kind="merged_hypotheses",
+    )
+    _log_stage("merge refined hypotheses...", state["workflow_start_time"])
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=2):
+        merged_result = merge_refined_hypotheses(
+            refined_hypotheses_result=state["current_refinement_result"],
+            model_id=str(state["current_refinement_result"].get("model_id", args.model_id)),
+            layer_id=state["layer_id"],
+            feature_id=state["feature_id"],
+            run_side=args.side,
+            timestamp=state["timestamp"],
+            round_id=round_id,
+            llm_base_url=args.llm_base_url,
+            llm_model=args.llm_model,
+            llm_api_key_file=args.llm_api_key_file,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+        )
+        state["executed_steps"].append(f"{round_id}_step_2_merge")
+        _track_usage(state, merged_result, executed=True)
+    else:
+        merged_result = _load_json_or_raise(merge_path)
+        state["loaded_steps"].append(f"{round_id}_step_2_merge")
+        _track_usage(state, merged_result, executed=False)
+    state["round_merges"][round_index] = merged_result
+    state["current_merged_result"] = merged_result
+    return state
+
+
+def prepare_round_node(state: WorkflowState) -> WorkflowState:
+    args = state["args"]
+    round_index = state["current_round"]
+    hypotheses_after_refine = state.get("current_merged_result") or state["current_refinement_result"]
+    hypotheses_before_refine = state["current_hypotheses"]
+    state["converged_this_round"] = _same_hypotheses(hypotheses_before_refine, hypotheses_after_refine)
+    current_hypotheses = _to_next_round_hypotheses(
+        refinement_result=hypotheses_after_refine,
+        round_index=round_index,
+    )
+    state["current_hypotheses"] = current_hypotheses
+    state["last_executed_hypotheses"] = current_hypotheses
+
+    frozen_input_indices: Set[int] = set()
+    if args.side in ("input", "both") and isinstance(state["previous_execution_result"], dict):
+        frozen_candidates = _frozen_input_indices_from_execution(state["previous_execution_result"])
+        before_input = _normalize_hypothesis_list(hypotheses_before_refine.get("input_side_hypotheses", []))
+        after_input = _normalize_hypothesis_list(current_hypotheses.get("input_side_hypotheses", []))
+        for idx in frozen_candidates:
+            if 1 <= idx <= len(before_input) and 1 <= idx <= len(after_input):
+                if before_input[idx - 1] == after_input[idx - 1]:
+                    frozen_input_indices.add(idx)
+
+    total_input_hypotheses = len(_normalize_hypothesis_list(current_hypotheses.get("input_side_hypotheses", [])))
+    active_input_indices = [
+        idx for idx in range(1, total_input_hypotheses + 1) if idx not in frozen_input_indices
+    ]
+    state["frozen_input_indices"] = frozen_input_indices
+    state["active_input_indices"] = active_input_indices
+    state["hypotheses_for_design"] = _build_filtered_hypotheses_for_active_input(
+        hypotheses_result=current_hypotheses,
+        active_input_indices=active_input_indices,
+    )
+    return state
+
+
+def design_round_experiments_node(state: WorkflowState) -> WorkflowState:
+    args = state["args"]
+    round_index = state["current_round"]
+    round_id = state["current_round_id"]
+    step_index = 3 if state["merge_enabled"] else 2
+    experiments_path = _artifact_json_path(
+        layer_id=state["layer_id"],
+        feature_id=state["feature_id"],
+        timestamp=state["timestamp"],
+        round_index=round_index,
+        kind="experiments",
+    )
+    _log_stage("design experiments...", state["workflow_start_time"])
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=step_index):
+        active_experiments_result = design_hypothesis_experiments(
+            hypotheses_result=state["hypotheses_for_design"],
+            num_input_sentences_per_hypothesis=args.num_input_sentences_per_hypothesis,
+            run_side=args.side,
+            round_id=round_id,
+            llm_base_url=args.llm_base_url,
+            llm_model=args.llm_model,
+            llm_api_key_file=args.llm_api_key_file,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+        )
+        if state["frozen_input_indices"]:
+            experiments_result = _merge_input_experiments_from_active_and_frozen(
+                current_hypotheses=state["current_hypotheses"],
+                active_indices=state["active_input_indices"],
+                frozen_indices=state["frozen_input_indices"],
+                active_experiments_result=active_experiments_result,
+                previous_experiments_result=state["previous_experiments_result"],
+            )
+            _save_json(experiments_path, experiments_result)
+            write_experiments_markdown(
+                experiments_path.with_suffix(".md"),
+                result=experiments_result,
+                llm_calls=active_experiments_result.get("llm_calls", []),
+            )
+        else:
+            experiments_result = active_experiments_result
+        state["executed_steps"].append(f"{round_id}_step_{step_index}_experiments_design")
+        _track_usage(state, active_experiments_result, executed=True)
+    else:
+        experiments_result = _load_json_or_raise(experiments_path)
+        state["loaded_steps"].append(f"{round_id}_step_{step_index}_experiments_design")
+        _track_usage(state, experiments_result, executed=False)
+    state["previous_experiments_result"] = experiments_result
+    return state
+
+
+def execute_round_experiments_node(state: WorkflowState) -> WorkflowState:
+    args = state["args"]
+    round_index = state["current_round"]
+    round_id = state["current_round_id"]
+    step_index = 4 if state["merge_enabled"] else 3
+    execution_path = _artifact_json_path(
+        layer_id=state["layer_id"],
+        feature_id=state["feature_id"],
+        timestamp=state["timestamp"],
+        round_index=round_index,
+        kind="experiments_execution",
+    )
+    _log_stage("execute experiments...", state["workflow_start_time"])
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=step_index):
+        experiments_for_execution = dict(state["previous_experiments_result"])
+        if state["frozen_input_indices"]:
+            active_input_experiments = []
+            all_input_experiments = state["previous_experiments_result"].get("input_side_experiments", [])
+            if isinstance(all_input_experiments, list):
+                for idx in state["active_input_indices"]:
+                    if 1 <= idx <= len(all_input_experiments) and isinstance(all_input_experiments[idx - 1], dict):
+                        active_input_experiments.append(dict(all_input_experiments[idx - 1]))
+            experiments_for_execution["input_side_experiments"] = active_input_experiments
+
+        active_execution_result = execute_hypothesis_experiments(
+            experiments_result=experiments_for_execution,
+            module=_ensure_module(state),
+            run_side=args.side,
+            round_id=round_id,
+            llm_base_url=args.llm_base_url,
+            llm_model=args.llm_model,
+            llm_api_key_file=args.llm_api_key_file,
+            input_non_zero_threshold=args.input_non_zero_threshold,
+            output_judge_num_choices=args.output_judge_num_choices,
+            output_judge_trials=args.output_judge_trials,
+            output_judge_seed=args.output_judge_seed,
+            output_max_new_tokens=args.output_max_new_tokens,
+            output_generation_temperature=args.output_generation_temperature,
+            output_judge_temperature=args.output_judge_temperature,
+            output_judge_max_tokens=args.output_judge_max_tokens,
+            output_kl_values=args.output_kl_values,
+            output_intervention_method=args.output_intervention_method,
+            output_logit_top_k=args.output_logit_top_k,
+            output_logit_kl_tolerance=args.output_logit_kl_tolerance,
+            output_logit_kl_max_steps=args.output_logit_kl_max_steps,
+            output_logit_force_refresh_kl_cache=args.output_logit_force_refresh_kl_cache,
+            output_logit_include_special_tokens=args.output_logit_include_special_tokens,
+        )
+        if state["frozen_input_indices"]:
+            execution_result = _merge_input_execution_from_active_and_frozen(
+                current_hypotheses=state["current_hypotheses"],
+                active_indices=state["active_input_indices"],
+                frozen_indices=state["frozen_input_indices"],
+                active_execution_result=active_execution_result,
+                previous_execution_result=state["previous_execution_result"],
+            )
+            _save_json(execution_path, execution_result)
+            write_execution_markdown(
+                execution_path.with_suffix(".md"),
+                result=execution_result,
+                llm_calls=execution_result.get("llm_calls", []),
+            )
+        else:
+            execution_result = active_execution_result
+        state["executed_steps"].append(f"{round_id}_step_{step_index}_experiments_execution")
+        _track_usage(state, active_execution_result, executed=True)
+    else:
+        execution_result = _load_json_or_raise(execution_path)
+        state["loaded_steps"].append(f"{round_id}_step_{step_index}_experiments_execution")
+        _track_usage(state, execution_result, executed=False)
+    _update_last_output_meta(state, execution_result)
+    state["round_executions"][round_index] = execution_result
+    state["previous_execution_result"] = execution_result
+    return state
+
+
+def build_round_memory_node(state: WorkflowState) -> WorkflowState:
+    args = state["args"]
+    round_index = state["current_round"]
+    round_id = state["current_round_id"]
+    step_index = 5 if state["merge_enabled"] else 4
+    memory_path = _artifact_json_path(
+        layer_id=state["layer_id"],
+        feature_id=state["feature_id"],
+        timestamp=state["timestamp"],
+        round_index=round_index,
+        kind="memory",
+    )
+    memory_md_path = memory_path.with_suffix(".md")
+    _log_stage("build memory...", state["workflow_start_time"])
+    if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=step_index):
+        memory_result = build_hypothesis_memory(
+            initial_hypotheses_result=state["current_hypotheses"],
+            experiments_result=state["previous_experiments_result"],
+            execution_result=state["previous_execution_result"],
+            hypothesis_reasons=_extract_reason_map(state["current_hypotheses"]),
+            round_index=round_index,
+            round_id=round_id,
+        )
+        _save_json(memory_path, memory_result)
+        write_hypothesis_memory_markdown(memory_md_path, memory=memory_result)
+        state["executed_steps"].append(f"{round_id}_step_{step_index}_memory")
+    else:
+        memory_result = _load_json_or_raise(memory_path)
+        state["loaded_steps"].append(f"{round_id}_step_{step_index}_memory")
+    state["round_memories"][round_index] = memory_result
+    state["previous_memory_result"] = memory_result
+    state["last_round_executed"] = round_index
+    if state["converged_this_round"]:
+        state["converged"] = True
+        state["converged_round"] = round_index
+    return state
+
+
+def advance_round_node(state: WorkflowState) -> WorkflowState:
+    state["current_round"] = int(state["current_round"]) + 1
+    state["current_round_id"] = _round_id_from_index(state["current_round"])
+    state["current_merged_result"] = None
+    state["frozen_input_indices"] = set()
+    state["active_input_indices"] = []
+    state["converged_this_round"] = False
+    return state
+
+
+def finalize_node(state: WorkflowState) -> WorkflowState:
+    args = state["args"]
+    final_hypotheses_source = (
+        state["last_executed_hypotheses"] if state["last_round_executed"] > 0 else state["initial_result"]
+    )
+    final_input_hypotheses = list(final_hypotheses_source.get("input_side_hypotheses", []))
+    final_output_hypotheses = list(final_hypotheses_source.get("output_side_hypotheses", []))
+    final_input_reasons = list(final_hypotheses_source.get("input_side_hypothesis_reasons", []))
+    final_output_reasons = list(final_hypotheses_source.get("output_side_hypothesis_reasons", []))
+
+    ts_dir = Path("logs") / state["layer_id"] / state["feature_id"] / state["timestamp"]
+    ts_dir.mkdir(parents=True, exist_ok=True)
+
+    input_hypothesis_cache_path = (
+        ts_dir / f"layer{state['layer_id']}-feature{state['feature_id']}-input-side-hypotheses-cache.json"
+    )
+    input_hypothesis_cache = _build_input_hypothesis_selection_payload(
+        model_id=_clean_text(final_hypotheses_source.get("model_id") or args.model_id),
+        layer_id=state["layer_id"],
+        feature_id=state["feature_id"],
+        timestamp=state["timestamp"],
+        round_executions=state["round_executions"],
+    )
+    _save_json(input_hypothesis_cache_path, input_hypothesis_cache)
+    best_input_hypothesis = input_hypothesis_cache.get("best_hypothesis")
+    if not isinstance(best_input_hypothesis, dict):
+        fallback_hypothesis = final_input_hypotheses[0] if final_input_hypotheses else ""
+        fallback_round = state["last_round_executed"] if state["last_round_executed"] > 0 else 0
+        best_input_hypothesis = {
+            "source": "final_input_hypotheses_fallback",
+            "round_index": fallback_round,
+            "round_id": _round_id_from_index(fallback_round),
+            "hypothesis_index": 1 if fallback_hypothesis else 0,
+            "hypothesis": fallback_hypothesis,
+            "score_non_zero_rate": None,
+            "score_boundary_non_activation_rate": None,
+            "combined_score": None,
+        }
+
+    workflow_memory_md = ts_dir / f"layer{state['layer_id']}-feature{state['feature_id']}-workflow-memory.md"
+    memory_lines: List[str] = [
+        "# SAE Workflow Memory (All Rounds)",
+        "",
+        "## Metadata",
+        f"- model_id: {args.model_id}",
+        f"- layer_id: {state['layer_id']}",
+        f"- feature_id: {state['feature_id']}",
+        f"- timestamp: {state['timestamp']}",
+        f"- max_rounds: {args.max_rounds}",
+        f"- workflow_backend: {state['workflow_backend']}",
+        "",
+        "## Round Memories",
+    ]
+    if state["round_memories"]:
+        for round_index in sorted(state["round_memories"].keys()):
+            memory_lines.extend(
+                [
+                    f"### {_round_id_from_index(round_index)}",
+                    "```json",
+                    json.dumps(state["round_memories"][round_index], ensure_ascii=False, indent=2),
+                    "```",
+                    "",
+                ]
+            )
+    else:
+        memory_lines.append("- no iterative memory generated (max_rounds=0)")
+    workflow_memory_md.write_text("\n".join(memory_lines) + "\n", encoding="utf-8")
+
+    final_dir = ts_dir / "final_result"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    final_result: Dict[str, Any] = {
+        "model_id": _clean_text(final_hypotheses_source.get("model_id") or args.model_id),
+        "layer_id": state["layer_id"],
+        "feature_id": state["feature_id"],
+        "timestamp": state["timestamp"],
+        "max_rounds": args.max_rounds,
+        "executed_rounds": state["last_round_executed"],
+        "converged": state["converged"],
+        "converged_round": state["converged_round"],
+        "input_side_final_hypotheses": final_input_hypotheses,
+        "input_side_final_reasons": final_input_reasons,
+        "output_side_final_hypotheses": final_output_hypotheses,
+        "output_side_final_reasons": final_output_reasons,
+        "run_side": args.side,
+        "history_rounds": args.history_rounds,
+        "enable_hypothesis_merge": state["merge_enabled"],
+        "hypothesis_merge_mode": "llm_semantic" if state["merge_enabled"] else "off",
+        "merged_rounds": sorted(state["round_merges"].keys()),
+        "output_intervention_method": state["last_output_intervention_method"],
+        "output_score_name": state["last_output_score_name"],
+        "output_logit_top_k": state["last_output_logit_top_k"],
+        "input_side_hypothesis_cache_path": str(input_hypothesis_cache_path),
+        "input_side_hypothesis_scoring_formula": input_hypothesis_cache.get("score_formula"),
+        "input_side_best_hypothesis": best_input_hypothesis,
+        "token_usage_total": state["total_tokens"].as_dict(),
+        "token_usage_this_run": state["run_tokens"].as_dict(),
+        "executed_steps": state["executed_steps"],
+        "loaded_steps": state["loaded_steps"],
+        "workflow_backend": state["workflow_backend"],
+        "langgraph_available": LANGGRAPH_AVAILABLE,
+    }
+
+    final_json_path = final_dir / f"layer{state['layer_id']}-feature{state['feature_id']}-final-result.json"
+    _save_json(final_json_path, final_result)
+    final_md_path = final_dir / f"layer{state['layer_id']}-feature{state['feature_id']}-final-result.md"
+    lines: List[str] = [
+        "# SAE Workflow Final Result",
+        "",
+        "## Metadata",
+        f"- model_id: {final_result['model_id']}",
+        f"- layer_id: {state['layer_id']}",
+        f"- feature_id: {state['feature_id']}",
+        f"- timestamp: {state['timestamp']}",
+        f"- max_rounds: {args.max_rounds}",
+        f"- executed_rounds: {state['last_round_executed']}",
+        f"- converged: {state['converged']}",
+        f"- converged_round: {state['converged_round']}",
+        f"- workflow_backend: {state['workflow_backend']}",
+        "",
+        "## Input-side Final Hypotheses",
+    ]
+    for idx, hypothesis in enumerate(final_input_hypotheses, start=1):
+        lines.append(f"{idx}. {hypothesis}")
+    lines.extend(
+        [
+            "",
+            "## Best Input Hypothesis For Final Evaluation",
+            f"- round_id: {best_input_hypothesis.get('round_id')}",
+            f"- hypothesis_index: {best_input_hypothesis.get('hypothesis_index')}",
+            f"- score_non_zero_rate: {best_input_hypothesis.get('score_non_zero_rate')}",
+            f"- score_boundary_non_activation_rate: {best_input_hypothesis.get('score_boundary_non_activation_rate')}",
+            f"- combined_score: {best_input_hypothesis.get('combined_score')}",
+            "```text",
+            str(best_input_hypothesis.get("hypothesis", "")),
+            "```",
+            "",
+            "## Output-side Final Hypotheses",
+        ]
+    )
+    for idx, hypothesis in enumerate(final_output_hypotheses, start=1):
+        lines.append(f"{idx}. {hypothesis}")
+    final_md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    print(
+        json.dumps(
+            {
+                "final_result_json_path": str(final_json_path),
+                "final_result_md_path": str(final_md_path),
+                "workflow_memory_md_path": str(workflow_memory_md),
+                "converged": state["converged"],
+                "converged_round": state["converged_round"],
+                "workflow_backend": state["workflow_backend"],
+                "langgraph_available": LANGGRAPH_AVAILABLE,
+            },
+            ensure_ascii=True,
+            indent=2,
+        )
+    )
+    state["final_result"] = final_result
+    return state
+
+
+def _route_after_baseline_memory(state: WorkflowState) -> str:
+    return "finalize" if state["args"].max_rounds <= 0 else "refine_round"
+
+
+def _route_after_refine(state: WorkflowState) -> str:
+    return "merge_round" if state["merge_enabled"] else "prepare_round"
+
+
+def _route_after_round_memory(state: WorkflowState) -> str:
+    if state["converged"] or state["current_round"] >= state["args"].max_rounds:
+        return "finalize"
+    return "advance_round"
+
+
+def _invoke_without_langgraph(state: WorkflowState) -> WorkflowState:
+    handlers = {
+        "collect_observation": collect_observation_node,
+        "generate_initial_hypotheses": generate_initial_hypotheses_node,
+        "design_baseline_experiments": design_baseline_experiments_node,
+        "execute_baseline_experiments": execute_baseline_experiments_node,
+        "build_baseline_memory": build_baseline_memory_node,
+        "refine_round": refine_round_node,
+        "merge_round": merge_round_node,
+        "prepare_round": prepare_round_node,
+        "design_round_experiments": design_round_experiments_node,
+        "execute_round_experiments": execute_round_experiments_node,
+        "build_round_memory": build_round_memory_node,
+        "advance_round": advance_round_node,
+        "finalize": finalize_node,
+    }
+    default_edges = {
+        "collect_observation": "generate_initial_hypotheses",
+        "generate_initial_hypotheses": "design_baseline_experiments",
+        "design_baseline_experiments": "execute_baseline_experiments",
+        "execute_baseline_experiments": "build_baseline_memory",
+        "merge_round": "prepare_round",
+        "prepare_round": "design_round_experiments",
+        "design_round_experiments": "execute_round_experiments",
+        "execute_round_experiments": "build_round_memory",
+        "advance_round": "refine_round",
+    }
+    routers = {
+        "build_baseline_memory": _route_after_baseline_memory,
+        "refine_round": _route_after_refine,
+        "build_round_memory": _route_after_round_memory,
+    }
+
+    current = "collect_observation"
+    while True:
+        state = handlers[current](state)
+        if current == "finalize":
+            return state
+        if current in routers:
+            current = routers[current](state)
+            continue
+        current = default_edges[current]
+
+
+def _build_langgraph_app() -> Any:
+    workflow = StateGraph(dict)
+    workflow.add_node("collect_observation", collect_observation_node)
+    workflow.add_node("generate_initial_hypotheses", generate_initial_hypotheses_node)
+    workflow.add_node("design_baseline_experiments", design_baseline_experiments_node)
+    workflow.add_node("execute_baseline_experiments", execute_baseline_experiments_node)
+    workflow.add_node("build_baseline_memory", build_baseline_memory_node)
+    workflow.add_node("refine_round", refine_round_node)
+    workflow.add_node("merge_round", merge_round_node)
+    workflow.add_node("prepare_round", prepare_round_node)
+    workflow.add_node("design_round_experiments", design_round_experiments_node)
+    workflow.add_node("execute_round_experiments", execute_round_experiments_node)
+    workflow.add_node("build_round_memory", build_round_memory_node)
+    workflow.add_node("advance_round", advance_round_node)
+    workflow.add_node("finalize", finalize_node)
+
+    workflow.add_edge(START, "collect_observation")
+    workflow.add_edge("collect_observation", "generate_initial_hypotheses")
+    workflow.add_edge("generate_initial_hypotheses", "design_baseline_experiments")
+    workflow.add_edge("design_baseline_experiments", "execute_baseline_experiments")
+    workflow.add_edge("execute_baseline_experiments", "build_baseline_memory")
+    workflow.add_conditional_edges(
+        "build_baseline_memory",
+        _route_after_baseline_memory,
+        {"refine_round": "refine_round", "finalize": "finalize"},
+    )
+    workflow.add_conditional_edges(
+        "refine_round",
+        _route_after_refine,
+        {"merge_round": "merge_round", "prepare_round": "prepare_round"},
+    )
+    workflow.add_edge("merge_round", "prepare_round")
+    workflow.add_edge("prepare_round", "design_round_experiments")
+    workflow.add_edge("design_round_experiments", "execute_round_experiments")
+    workflow.add_edge("execute_round_experiments", "build_round_memory")
+    workflow.add_conditional_edges(
+        "build_round_memory",
+        _route_after_round_memory,
+        {"advance_round": "advance_round", "finalize": "finalize"},
+    )
+    workflow.add_edge("advance_round", "refine_round")
+    workflow.add_edge("finalize", END)
+    return workflow.compile()
+
+
+def run_workflow(args: argparse.Namespace) -> Dict[str, Any]:
+    _validate_args(args)
+    backend = "langgraph" if LANGGRAPH_AVAILABLE else "fallback"
+    state = _build_initial_state(args, backend=backend)
+    if LANGGRAPH_AVAILABLE:
+        final_state = _build_langgraph_app().invoke(state)
+    else:
+        final_state = _invoke_without_langgraph(state)
+    return final_state["final_result"]
+
+
+def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    args = _build_arg_parser().parse_args(argv)
+    return run_workflow(args)
+
+
 if __name__ == "__main__":
+    main()
+    raise SystemExit(0)
     args = _build_arg_parser().parse_args()
     workflow_start_time = time.perf_counter()
     merge_enabled = bool(args.enable_hypothesis_merge)

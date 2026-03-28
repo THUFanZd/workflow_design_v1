@@ -31,7 +31,7 @@ MODE_ORDER = ["same_hypothesis", "all_hypotheses", "all_hypotheses_merge"]
 LAYER_PATTERN = re.compile(r"^layer-(\d+)$")
 FEATURE_PATTERN = re.compile(r"^feature-(\d+)$")
 
-
+# summarize for existing results
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -152,7 +152,8 @@ def expected_workflow_result_path(layer: int | None, feature: int | None, run_di
     return (
         PROJECT_ROOT
         / "logs"
-        / f"{layer}_{feature}"
+        / str(layer)
+        / str(feature)
         / run_dir
         / "final_result"
         / f"layer{layer}-feature{feature}-final-result.json"
@@ -213,16 +214,30 @@ def extract_workflow_fields(workflow_payload: dict[str, Any] | None) -> dict[str
     }
 
 
+def detect_hypothesis_mode_from_workflow(
+    run_dir: str,
+    workflow_payload: dict[str, Any] | None,
+) -> str:
+    mode = detect_hypothesis_mode(run_dir)
+    if mode != "unknown":
+        return mode
+    if not isinstance(workflow_payload, dict):
+        return "unknown"
+
+    merge_mode = str(workflow_payload.get("hypothesis_merge_mode", "")).strip().lower()
+    if merge_mode not in {"", "off", "none"}:
+        return "all_hypotheses_merge"
+
+    history_rounds = workflow_payload.get("history_rounds")
+    if isinstance(history_rounds, int):
+        return "all_hypotheses" if history_rounds > 0 else "same_hypothesis"
+
+    return "unknown"
+
+
 def _extract_relative_metrics(payload: dict[str, Any]) -> dict[str, float | None]:
-    # New schema (workflow_style_sae_only result.json).
     non_zero = coerce_float(payload.get("relative_quality_score_non_zero_rate"))
     boundary = coerce_float(payload.get("relative_quality_score_boundary_non_activation_rate"))
-
-    # Backward compatibility: old compare_explanations_with_llm output.
-    if non_zero is None:
-        non_zero = coerce_float(payload.get("activation_relative_quality_score"))
-    if boundary is None:
-        boundary = coerce_float(payload.get("boundary_relative_quality_score"))
 
     return {
         "relative_quality_score_non_zero_rate": non_zero,
@@ -324,20 +339,18 @@ def build_records(result_paths: list[Path]) -> tuple[list[dict[str, Any]], list[
             errors.append((result_path, str(exc)))
             continue
 
-        # Skip files that are clearly not the per-run input evaluation result.
+        # Only summarize the new workflow-style evaluation results.
         if (
             "relative_quality_score_non_zero_rate" not in payload
-            and "activation_relative_quality_score" not in payload
-            and "boundary_relative_quality_score" not in payload
-            and "scores" not in payload
+            and "relative_quality_score_boundary_non_activation_rate" not in payload
         ):
             continue
 
         layer, feature = extract_layer_feature(result_path)
         run_dir = result_path.parent.name
-        mode = detect_hypothesis_mode(run_dir)
 
         workflow_payload, workflow_path = load_workflow_result(layer, feature, run_dir, workflow_cache)
+        mode = detect_hypothesis_mode_from_workflow(run_dir, workflow_payload)
         workflow_fields = extract_workflow_fields(workflow_payload)
         relative_metrics = _extract_relative_metrics(payload)
         round_series = load_round_series(
@@ -527,6 +540,14 @@ def _safe_filename(text: str) -> str:
     return cleaned or "unknown"
 
 
+def feature_round_plot_dir(evaluation_result_path: str) -> Path | None:
+    result_path = Path(evaluation_result_path)
+    feature_dir = result_path.parent.parent
+    if feature_dir == result_path.parent:
+        return None
+    return feature_dir / "round_trends"
+
+
 def plot_score_boxplots(rows: list[dict[str, Any]], score_fields: list[str], output_path: Path) -> bool:
     try:
         import matplotlib.pyplot as plt
@@ -633,19 +654,22 @@ def plot_token_usage_bars(rows: list[dict[str, Any]], token_fields: list[str], o
     return True
 
 
-def plot_round_trends_per_run(rows: list[dict[str, Any]], output_dir: Path) -> int:
+def plot_round_trends_per_run(rows: list[dict[str, Any]]) -> int:
     try:
         import matplotlib.pyplot as plt
     except Exception:  # noqa: BLE001
         return 0
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     created = 0
     for row in rows:
         series_raw = row.get("__round_series_obj__")
         series = [item for item in series_raw if isinstance(item, dict)] if isinstance(series_raw, list) else []
         if not series:
             continue
+        output_dir = feature_round_plot_dir(str(row.get("evaluation_result_path", "")))
+        if output_dir is None:
+            continue
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         rounds: list[int] = []
         non_zero_vals: list[float | None] = []
@@ -787,7 +811,7 @@ def main() -> int:
     token_plot_path = plots_dir / "token_usage_mode_bars.png"
     score_plot_ok = plot_score_boxplots(rows, args.fields, score_plot_path)
     token_plot_ok = plot_token_usage_bars(rows, DEFAULT_TOKEN_FIELDS, token_plot_path)
-    round_plot_count = plot_round_trends_per_run(rows, round_plots_dir)
+    round_plot_count = plot_round_trends_per_run(rows)
 
     print(f"Scanned result files: {len(result_paths)}")
     print(f"Valid records: {len(rows)}")
@@ -803,7 +827,8 @@ def main() -> int:
         print(f"Token usage plot: {token_plot_path}")
     else:
         print("Token usage plot: skipped (matplotlib unavailable or no valid mode data)")
-    print(f"Per-run round trend plots: {round_plot_count} (dir: {round_plots_dir})")
+    print("Per-run round trend plots are written under each feature directory as round_trends/*.png")
+    print(f"Per-run round trend plots: {round_plot_count}")
 
     if errors:
         print(f"Parse errors: {len(errors)}")
