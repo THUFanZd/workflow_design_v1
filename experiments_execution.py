@@ -15,6 +15,7 @@ from function import (
     DEFAULT_CANONICAL_MAP_PATH,
     TokenUsageAccumulator,
     build_default_sae_path,
+    build_feature_dir,
     build_round_dir,
     normalize_round_id,
     read_api_key,
@@ -394,12 +395,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
-    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument(
+        "--timestamp",
+        default=None,
+        help="Custom timestamp for logs/layer-{layer}/feature-{feature}/{timestamp}",
+    )
     parser.add_argument("--round-id", default=None, help="Round directory under timestamp, e.g. round_1")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, reuse logs/{layer}_{feature}/{timestamp}/{round_id} intermediate JSON files instead of refetching.",
+        help="If set, reuse logs/layer-{layer}/feature-{feature}/{timestamp}/{round_id} intermediate JSON files instead of refetching.",
     )
     parser.add_argument(
         "--experiments-json-path",
@@ -466,8 +471,7 @@ if __name__ == "__main__":
             raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
         resolved_round_id = normalize_round_id(args.round_id, round_index=1)
         experiments_path = (
-            Path("logs")
-            / f"{args.layer_id}_{args.feature_id}"
+            build_feature_dir(layer_id=str(args.layer_id), feature_id=str(args.feature_id))
             / ts
             / resolved_round_id
             / f"layer{args.layer_id}-feature{args.feature_id}-experiments.json"

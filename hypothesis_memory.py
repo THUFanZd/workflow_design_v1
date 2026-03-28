@@ -12,6 +12,7 @@ from experiments_design import design_hypothesis_experiments
 from function import (
     DEFAULT_CANONICAL_MAP_PATH,
     build_default_sae_path,
+    build_feature_dir,
     build_round_dir,
     normalize_round_id,
 )
@@ -630,7 +631,7 @@ def _load_from_logs(
     round_id: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     resolved_round_id = normalize_round_id(round_id, round_index=1)
-    base_dir = Path("logs") / f"{layer_id}_{feature_id}" / timestamp / resolved_round_id
+    base_dir = build_feature_dir(layer_id=layer_id, feature_id=feature_id) / timestamp / resolved_round_id
     initial_path = base_dir / f"layer{layer_id}-feature{feature_id}-initial-hypotheses.json"
     experiments_path = base_dir / f"layer{layer_id}-feature{feature_id}-experiments.json"
     execution_path = base_dir / f"layer{layer_id}-feature{feature_id}-experiments-execution.json"
@@ -661,13 +662,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
-    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument(
+        "--timestamp",
+        default=None,
+        help="Custom timestamp for logs/layer-{layer}/feature-{feature}/{timestamp}",
+    )
     parser.add_argument("--round-index", type=int, default=1, help="Round index used as memory anchor.")
     parser.add_argument("--round-id", default=None, help="Optional explicit round id for the memory record.")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, reuse logs/{layer}_{feature}/{timestamp}/{round_id} intermediate JSON files.",
+        help="If set, reuse logs/layer-{layer}/feature-{feature}/{timestamp}/{round_id} intermediate JSON files.",
     )
     parser.add_argument(
         "--initial-hypotheses-json-path",
@@ -740,7 +745,7 @@ if __name__ == "__main__":
             round_index=args.round_index,
         )
 
-        default_base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts / resolved_round_id
+        default_base_dir = build_feature_dir(layer_id=layer_id, feature_id=feature_id) / ts / resolved_round_id
         initial_path = (
             Path(args.initial_hypotheses_json_path)
             if args.initial_hypotheses_json_path

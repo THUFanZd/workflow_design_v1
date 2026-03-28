@@ -19,6 +19,7 @@ from function import (
     extract_json_object,
     normalize_round_id,
     read_api_key,
+    build_feature_dir,
 )
 from initial_hypothesis_generation import GenerationMode, generate_initial_hypotheses
 from support_info.llm_api_info import api_key_file as DEFAULT_API_KEY_FILE
@@ -550,12 +551,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
-    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument(
+        "--timestamp",
+        default=None,
+        help="Custom timestamp for logs/layer-{layer}/feature-{feature}/{timestamp}",
+    )
     parser.add_argument("--round-id", default=None, help="Round directory under timestamp, e.g. round_1")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, reuse logs/{layer}_{feature}/{timestamp}/{round_id} intermediate JSON files instead of refetching.",
+        help="If set, reuse logs/layer-{layer}/feature-{feature}/{timestamp}/{round_id} intermediate JSON files instead of refetching.",
     )
     parser.add_argument("--neuronpedia-api-key", default=None)
     parser.add_argument("--neuronpedia-timeout", type=int, default=30)
@@ -576,8 +581,7 @@ if __name__ == "__main__":
             raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
         resolved_round_id = normalize_round_id(args.round_id, round_index=1)
         base_dir = (
-            Path("logs")
-            / f"{args.layer_id}_{args.feature_id}"
+            build_feature_dir(layer_id=str(args.layer_id), feature_id=str(args.feature_id))
             / ts
             / resolved_round_id
         )

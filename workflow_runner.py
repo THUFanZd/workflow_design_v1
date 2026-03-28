@@ -16,6 +16,7 @@ from function import (
     DEFAULT_CANONICAL_MAP_PATH,
     TokenUsageAccumulator,
     build_default_sae_path,
+    build_feature_dir,
     build_round_dir,
     normalize_round_id,
 )
@@ -472,7 +473,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-id", default="gemma-2-2b", help="Neuronpedia model id")
     parser.add_argument("--layer-id", required=True, help="Layer id")
     parser.add_argument("--feature-id", required=True, help="Feature id")
-    parser.add_argument("--timestamp", default=None, help="Timestamp directory under logs/{layer_id}/{feature_id}/")
+    parser.add_argument(
+        "--timestamp",
+        default=None,
+        help="Timestamp directory under logs/layer-{layer_id}/feature-{feature_id}/",
+    )
     parser.add_argument("--max-rounds", type=int, default=1, help="Maximum refinement rounds (round_1..round_n).")
     parser.add_argument(
         "--start-round",
@@ -496,7 +501,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="Reuse artifacts before start point from logs/{layer_id}/{feature_id}/{timestamp}/{round_id}.",
+        help="Reuse artifacts before start point from logs/layer-{layer_id}/feature-{feature_id}/{timestamp}/{round_id}.",
     )
 
     parser.add_argument("--num-hypothesis", type=int, default=3, help="Hypothesis count n for each side")
@@ -1252,7 +1257,10 @@ def finalize_node(state: WorkflowState) -> WorkflowState:
     final_input_reasons = list(final_hypotheses_source.get("input_side_hypothesis_reasons", []))
     final_output_reasons = list(final_hypotheses_source.get("output_side_hypothesis_reasons", []))
 
-    ts_dir = Path("logs") / state["layer_id"] / state["feature_id"] / state["timestamp"]
+    ts_dir = (
+        build_feature_dir(layer_id=state["layer_id"], feature_id=state["feature_id"])
+        / state["timestamp"]
+    )
     ts_dir.mkdir(parents=True, exist_ok=True)
 
     input_hypothesis_cache_path = (
@@ -2155,7 +2163,7 @@ if __name__ == "__main__":
     final_input_reasons = list(final_hypotheses_source.get("input_side_hypothesis_reasons", []))
     final_output_reasons = list(final_hypotheses_source.get("output_side_hypothesis_reasons", []))
 
-    ts_dir = Path("logs") / layer_id / feature_id / ts
+    ts_dir = build_feature_dir(layer_id=layer_id, feature_id=feature_id) / ts
     ts_dir.mkdir(parents=True, exist_ok=True)
 
     input_hypothesis_cache_path = (

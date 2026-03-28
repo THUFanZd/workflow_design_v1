@@ -13,6 +13,7 @@ from function import (
     DEFAULT_CANONICAL_MAP_PATH,
     TokenUsageAccumulator,
     build_default_sae_path,
+    build_feature_dir,
     build_round_dir,
     call_llm,
     extract_json_object,
@@ -768,7 +769,7 @@ def _load_historical_memories(
     if history_rounds <= 0:
         return []
 
-    feature_dir = Path("logs") / f"{layer_id}_{feature_id}"
+    feature_dir = build_feature_dir(layer_id=layer_id, feature_id=feature_id)
     if not feature_dir.exists():
         return []
 
@@ -778,7 +779,7 @@ def _load_historical_memories(
         if not ts_dir.is_dir():
             continue
 
-        # Preferred new layout: logs/{layer}_{feature}/{timestamp}/{round_id}/...
+        # Preferred layout: logs/layer-{layer}/feature-{feature}/{timestamp}/{round_id}/...
         for round_dir in ts_dir.iterdir():
             if not round_dir.is_dir():
                 continue
@@ -814,12 +815,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-id", default="gemma-2-2b", help="Neuronpedia model id")
     parser.add_argument("--layer-id", required=True, help="Layer id")
     parser.add_argument("--feature-id", required=True, help="Feature id")
-    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument(
+        "--timestamp",
+        default=None,
+        help="Custom timestamp for logs/layer-{layer}/feature-{feature}/{timestamp}",
+    )
     parser.add_argument("--round-id", default=None, help="Round directory under timestamp, e.g. round_1")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, reuse existing logs/{layer}_{feature}/{timestamp}/{round_id} files for initial/experiments/execution/memory.",
+        help="If set, reuse existing logs/layer-{layer}/feature-{feature}/{timestamp}/{round_id} files for initial/experiments/execution/memory.",
     )
     parser.add_argument("--history-rounds", type=int, default=1, help="Use previous n rounds as historical memory.")
     parser.add_argument(
@@ -909,7 +914,7 @@ if __name__ == "__main__":
             round_index=memory_round_index,
         )
 
-        default_base_dir = Path("logs") / f"{layer_id}_{feature_id}" / ts / memory_round_id
+        default_base_dir = build_feature_dir(layer_id=layer_id, feature_id=feature_id) / ts / memory_round_id
         execution_path = (
             Path(args.execution_json_path)
             if args.execution_json_path
@@ -934,7 +939,11 @@ if __name__ == "__main__":
             raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
 
         resolved_round_id = normalize_round_id(args.round_id, round_index=1)
-        base_dir = Path("logs") / f"{args.layer_id}_{args.feature_id}" / ts / resolved_round_id
+        base_dir = (
+            build_feature_dir(layer_id=str(args.layer_id), feature_id=str(args.feature_id))
+            / ts
+            / resolved_round_id
+        )
         initial_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-initial-hypotheses.json"
         experiments_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-experiments.json"
         execution_path = base_dir / f"layer{args.layer_id}-feature{args.feature_id}-experiments-execution.json"

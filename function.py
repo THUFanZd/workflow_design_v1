@@ -53,6 +53,16 @@ def normalize_round_id(round_id: Optional[str], *, round_index: Optional[int] = 
     return "round_1"
 
 
+def build_feature_dir(
+    *,
+    layer_id: str,
+    feature_id: str,
+    logs_root: Optional[Union[str, Path]] = None,
+) -> Path:
+    root = Path(logs_root) if logs_root is not None else Path("logs")
+    return root / f"layer-{str(layer_id)}" / f"feature-{str(feature_id)}"
+
+
 def build_round_dir(
     *,
     layer_id: str,
@@ -62,7 +72,7 @@ def build_round_dir(
     round_index: Optional[int] = None,
 ) -> Path:
     resolved_round_id = normalize_round_id(round_id, round_index=round_index)
-    return Path("logs") / str(layer_id) / str(feature_id) / str(timestamp) / resolved_round_id
+    return build_feature_dir(layer_id=layer_id, feature_id=feature_id) / str(timestamp) / resolved_round_id
 
 
 def extract_average_l0_from_canonical_map(

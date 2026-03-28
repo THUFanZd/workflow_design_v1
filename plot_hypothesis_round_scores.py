@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 
 
 ROUND_DIR_PATTERN = re.compile(r"^round_(\d+)$")
+LAYER_DIR_PATTERN = re.compile(r"^layer-\d+$")
+FEATURE_DIR_PATTERN = re.compile(r"^feature-\d+$")
 
 
 @dataclass
@@ -25,7 +27,7 @@ class RoundScore:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Traverse logs/{layer-id}_{feature-id}/{timestamp}_{suffix}/ and draw "
+            "Traverse logs/layer-{layer-id}/feature-{feature-id}/{timestamp}_{suffix}/ and draw "
             "per-hypothesis score-vs-round line charts."
         )
     )
@@ -59,9 +61,17 @@ def collect_run_dirs(logs_root: Path) -> list[Path]:
     if not logs_root.exists():
         return []
     run_dirs: list[Path] = []
-    for feature_dir in sorted(p for p in logs_root.iterdir() if p.is_dir()):
-        for run_dir in sorted(p for p in feature_dir.iterdir() if p.is_dir()):
-            run_dirs.append(run_dir)
+    for first_level in sorted(p for p in logs_root.iterdir() if p.is_dir()):
+        # New layout: logs/layer-{layer}/feature-{feature}/{timestamp}
+        if LAYER_DIR_PATTERN.fullmatch(first_level.name):
+            for feature_dir in sorted(
+                p for p in first_level.iterdir() if p.is_dir() and FEATURE_DIR_PATTERN.fullmatch(p.name)
+            ):
+                run_dirs.extend(sorted(p for p in feature_dir.iterdir() if p.is_dir()))
+            continue
+
+        # Legacy layout: logs/{layer_feature}/{timestamp}
+        run_dirs.extend(sorted(p for p in first_level.iterdir() if p.is_dir()))
     return run_dirs
 
 

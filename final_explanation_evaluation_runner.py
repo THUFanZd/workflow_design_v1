@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from openai import OpenAI
 
-from function import build_default_sae_path
+from function import build_default_sae_path, build_feature_dir
 from function import TokenUsageAccumulator, call_llm_stream, extract_json_object, read_api_key
 from model_with_sae import ModelWithSAEModule
 from neuronpedia_feature_api import extract_explanations, fetch_feature_json
@@ -68,9 +68,11 @@ def _resolve_workflow_path_from_args(args: argparse.Namespace) -> Path:
         )
 
     return (
-        Path(str(args.logs_root))
-        / str(args.layer_id).strip()
-        / str(args.feature_id).strip()
+        build_feature_dir(
+            layer_id=str(args.layer_id).strip(),
+            feature_id=str(args.feature_id).strip(),
+            logs_root=Path(str(args.logs_root)),
+        )
         / str(args.timestamp).strip()
     )
 
@@ -345,7 +347,14 @@ def _run_command_with_progress(
 
 
 def _neuronpedia_input_eval_cache_path(*, logs_root: Path, layer_id: str, feature_id: int) -> Path:
-    return logs_root / str(layer_id).strip() / str(feature_id) / "neuronpedia-input-eval-cache.json"
+    return (
+        build_feature_dir(
+            layer_id=str(layer_id).strip(),
+            feature_id=str(feature_id).strip(),
+            logs_root=logs_root,
+        )
+        / "neuronpedia-input-eval-cache.json"
+    )
 
 
 def _build_neuronpedia_input_eval_cache_signature(
@@ -947,7 +956,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Path to workflow final-result json file, or workflow timestamp directory. "
-            "If omitted, path is composed as logs/{layer-id}/{feature-id}/{timestamp}."
+            "If omitted, path is composed as logs/layer-{layer-id}/feature-{feature-id}/{timestamp}."
         ),
     )
     parser.add_argument("--layer-id", default=None, help="Layer id used to compose workflow path.")

@@ -11,6 +11,7 @@ from openai import OpenAI
 
 from function import (
     TokenUsageAccumulator,
+    build_feature_dir,
     build_round_dir,
     call_llm_stream,
     extract_json_object,
@@ -345,12 +346,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
-    parser.add_argument("--timestamp", default=None, help="Custom timestamp for logs/{layer}_{feature}/{timestamp}")
+    parser.add_argument(
+        "--timestamp",
+        default=None,
+        help="Custom timestamp for logs/layer-{layer}/feature-{feature}/{timestamp}",
+    )
     parser.add_argument("--round-id", default="round_0", help="Round directory under timestamp, e.g. round_0")
     parser.add_argument(
         "--reuse-from-logs",
         action="store_true",
-        help="If set, read observation input from logs/{layer}_{feature}/{timestamp}/{round_id} instead of refetching from Neuronpedia.",
+        help="If set, read observation input from logs/layer-{layer}/feature-{feature}/{timestamp}/{round_id} instead of refetching from Neuronpedia.",
     )
     parser.add_argument("--neuronpedia-api-key", default=None)
     parser.add_argument("--neuronpedia-timeout", type=int, default=30)
@@ -370,8 +375,7 @@ if __name__ == "__main__":
         if args.timestamp is None:
             raise ValueError("When --reuse-from-logs is set, --timestamp is required.")
         observation_path = (
-            Path("logs")
-            / f"{args.layer_id}_{args.feature_id}"
+            build_feature_dir(layer_id=str(args.layer_id), feature_id=str(args.feature_id))
             / ts
             / args.round_id
             / f"layer{args.layer_id}-feature{args.feature_id}-observation-input.json"
