@@ -375,8 +375,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help=(
-            "Use at most the most recent n memory rounds as historical context during refinement "
-            "(includes the immediately previous round). "
+            "Use at most previous n historical memory rounds during refinement. "
             "Default: 1."
         ),
     )
@@ -793,12 +792,11 @@ if __name__ == "__main__":
         _log_stage("refine hypotheses...", workflow_start_time)
         if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=round_index, step_index=1):
             historical_memories: List[Dict[str, Any]] = []
-            # Collect the most recent n rounds up to (and including) round_index-1.
-            history_end_exclusive = round_index
+            history_end = round_index - 1
             history_start = 0
             if args.history_rounds is not None:
-                history_start = max(0, history_end_exclusive - args.history_rounds)
-            for hist_round in range(history_start, history_end_exclusive):
+                history_start = max(0, history_end - args.history_rounds)
+            for hist_round in range(history_start, history_end):
                 if hist_round not in round_memories:
                     hist_memory_path = _artifact_json_path(
                         layer_id=layer_id,
