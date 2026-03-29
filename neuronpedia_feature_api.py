@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,6 +21,8 @@ def fetch_feature_json(
     feature_id: str,
     api_key: Optional[str] = None,
     timeout: int = 30,
+    retry_count: int = 3,
+    retry_sleep_seconds: float = 3.0,
 ) -> Dict[str, Any]:
     """Fetch feature payload from Neuronpedia API."""
     url = f"{BASE_URL}/api/feature/{model_id}/{source}/{feature_id}"
@@ -28,17 +31,34 @@ def fetch_feature_json(
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    resp = requests.get(url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
+    last_error: Optional[Exception] = None
+    total_attempts = max(1, int(retry_count))
+    for attempt_idx in range(total_attempts):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            payload = resp.json()
+            # backup_dir = Path("./neuronpedia_return")
+            # backup_dir.mkdir(parents=True, exist_ok=True)
+            # backup_path = backup_dir / f"feature_{model_id}_{source}_{feature_id}.json"
+            # with backup_path.open("w", encoding="utf-8") as f:
+            #     json.dump(payload, f, indent=2, ensure_ascii=False)
+            return payload
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_error = exc
+            is_last_attempt = attempt_idx == total_attempts - 1
+            if is_last_attempt:
+                break
+            print(
+                f"Neuronpedia request failed for feature {feature_id} "
+                f"(attempt {attempt_idx + 1}/{total_attempts}): {exc}. "
+                f"Sleeping {retry_sleep_seconds} seconds before retry."
+            )
+            time.sleep(retry_sleep_seconds)
 
-    payload = resp.json()
-    # backup_dir = Path("./neuronpedia_return")
-    # backup_dir.mkdir(parents=True, exist_ok=True)
-    # backup_path = backup_dir / f"feature_{model_id}_{source}_{feature_id}.json"
-    # with backup_path.open("w", encoding="utf-8") as f:
-    #     json.dump(payload, f, indent=2, ensure_ascii=False)
-
-    return payload
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Failed to fetch Neuronpedia feature payload for feature {feature_id}.")
 
 
 def _to_explanation_strings(obj: Any) -> List[str]:
@@ -184,7 +204,7 @@ def _build_source(layer_id: str, width: str) -> str:
     return f"{layer_id}-gemmascope-res-{width}"
 
 
-def convert_to_input_observation(parsed_result: Dict[str, Any]) -> Dict[str, Any]:
+def convert_to_input_observation(parsed_result: Dict[str, Any], layer_id: str = "", feature_id: str = "") -> Dict[str, Any]:
     """
     Convert parsed observation into compact input-observation format.
     """
@@ -194,6 +214,7 @@ def convert_to_input_observation(parsed_result: Dict[str, Any]) -> Dict[str, Any
 
     activation_examples: List[Dict[str, Any]] = []
     if isinstance(raw_activations, list):
+        raw_activation_id = 0
         for item in raw_activations:
             if not isinstance(item, dict):
                 continue
@@ -210,6 +231,14 @@ def convert_to_input_observation(parsed_result: Dict[str, Any]) -> Dict[str, Any
                 values = []
 
             sentence = "".join(str(token) for token in tokens)
+            
+            # Temporary patch: Filter out inappropriate content for specific feature (0,12154)
+            if layer_id == "0" and feature_id == "12154":
+                if raw_activation_id == 0:
+                    raw_activation_id += 1
+                    print('in convert_to_input_observation, skip sentence:')
+                    print(sentence)
+                    continue
 
             activation_tokens: List[Dict[str, Any]] = []
             pair_count = min(len(tokens), len(values))
@@ -235,6 +264,7 @@ def convert_to_input_observation(parsed_result: Dict[str, Any]) -> Dict[str, Any
                     "max_token": max_token,
                 }
             )
+            raw_activation_id += 1
 
     converted = {
         "input_side_observation": {
@@ -336,7 +366,7 @@ def fetch_and_parse_feature_observation(
     with observation_path.open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
-    converted = convert_to_input_observation(result)
+    converted = convert_to_input_observation(result, layer_id, feature_id)
     observation_input_path = base_dir / f"layer{layer_id}-feature{feature_id}-observation-input.json"
     with observation_input_path.open("w", encoding="utf-8") as f:
         json.dump(converted, f, indent=2, ensure_ascii=False)

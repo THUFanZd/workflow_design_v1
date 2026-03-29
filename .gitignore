@@ -18,3 +18,7 @@ chat_with_local_gemma.py
 steer_playground/output
 python_command.txt
 target-pairs.txt
+pairs.txt
+initial_observation_input/
+preliminary_explain.py
+initial_observation/

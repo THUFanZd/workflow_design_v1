@@ -36,6 +36,14 @@ class RunRecord:
     evaluation_seconds: float
 
 
+@dataclass
+class CommandResult:
+    returncode: int
+    seconds: float
+    stdout: str
+    stderr: str
+
+
 def _discover_features_for_layer(
     *,
     output_root: Path,
@@ -136,13 +144,72 @@ def _build_selection(
     return deduped
 
 
-def _run_command(cmd: Sequence[str], *, dry_run: bool) -> Tuple[int, float]:
+def _format_command(cmd: Sequence[str]) -> str:
+    return subprocess.list2cmdline([str(part) for part in cmd])
+
+
+def _write_failure_markdown(
+    *,
+    output_path: Path,
+    cmd: Sequence[str],
+    result: CommandResult,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr = result.stderr.strip() or "(empty)"
+    stdout = result.stdout.strip() or "(empty)"
+    content = "\n".join(
+        [
+            "# Batch Input History Scope Eval Failure",
+            "",
+            f"- command: `{_format_command(cmd)}`",
+            f"- returncode: `{result.returncode}`",
+            f"- duration_seconds: `{result.seconds:.3f}`",
+            "",
+            "## Traceback / stderr",
+            "",
+            "```text",
+            stderr,
+            "```",
+            "",
+            "## stdout",
+            "",
+            "```text",
+            stdout,
+            "```",
+            "",
+        ]
+    )
+    output_path.write_text(content, encoding="utf-8")
+
+
+def _run_command(cmd: Sequence[str], *, dry_run: bool) -> CommandResult:
     started = time.perf_counter()
-    print("$", " ".join(cmd))
+    print("$", _format_command(cmd))
     if dry_run:
-        return 0, 0.0
-    completed = subprocess.run(cmd, cwd=str(PROJECT_ROOT), check=False)
-    return completed.returncode, time.perf_counter() - started
+        return CommandResult(returncode=0, seconds=0.0, stdout="", stderr="")
+    completed = subprocess.run(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+    )
+    if completed.stdout:
+        print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n")
+    if completed.stderr:
+        print(
+            completed.stderr,
+            file=sys.stderr,
+            end="" if completed.stderr.endswith("\n") else "\n",
+        )
+    return CommandResult(
+        returncode=completed.returncode,
+        seconds=time.perf_counter() - started,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
 
 
 def _load_single_summary(summary_path: Path) -> dict:
@@ -196,6 +263,12 @@ def parse_args() -> argparse.Namespace:
         default="single_call",
         help="Passed to workflow_runner.py --generation-mode.",
     )
+    parser.add_argument(
+        "--side",
+        choices=["both", "input", "output"],
+        default="input",
+        help="Passed to run_single_input_history_scope_eval.py --side.",
+    )
     parser.add_argument("--num-input-sentences-per-hypothesis", type=int, default=5)
     parser.add_argument(
         "--top-m",
@@ -208,6 +281,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Passed to workflow_runner.py --history-rounds.",
+    )
+    parser.add_argument(
+        "--history-scopes",
+        nargs="+",
+        choices=list(HISTORY_SCOPES),
+        default=list(HISTORY_SCOPES),
+        help=(
+            "History scopes to run in batch mode. "
+            "Default: same_hypothesis all_hypotheses."
+        ),
+    )
+    parser.add_argument(
+        "--enable-all-hypotheses-merge",
+        action="store_true",
+        help=(
+            "Also run an extra all_hypotheses task with --enable-hypothesis-merge. "
+            "Only applies when all_hypotheses is included in --history-scopes."
+        ),
     )
     parser.add_argument("--width", default="16k", help="Passed to workflow/final-eval width args.")
     parser.add_argument(
@@ -282,12 +373,14 @@ def main() -> None:
 
     records: List[RunRecord] = []
     tasks: List[Tuple[int, int, str, bool]] = []
+    selected_history_scopes = tuple(dict.fromkeys(str(scope) for scope in args.history_scopes))
     for layer_id, feature_id in selection:
         tasks.extend(
             (layer_id, feature_id, history_scope, False)
-            for history_scope in HISTORY_SCOPES
+            for history_scope in selected_history_scopes
         )
-        tasks.append((layer_id, feature_id, "all_hypotheses", True))
+        if bool(args.enable_all_hypotheses_merge) and "all_hypotheses" in selected_history_scopes:
+            tasks.append((layer_id, feature_id, "all_hypotheses", True))
     for layer_id, feature_id, history_scope, merge_enabled in tqdm(
         tasks,
         desc="Batch input history scope eval",
@@ -302,6 +395,7 @@ def main() -> None:
                 / now_tag
                 / f"l{layer_id}_f{feature_id}_{history_scope}{merge_tag}.json"
             )
+            failure_log_path = single_summary_path.with_suffix(".md")
             single_cmd = [
                 str(args.python_exe),
                 str(PROJECT_ROOT / "run_single_input_history_scope_eval.py"),
@@ -314,7 +408,7 @@ def main() -> None:
                 "--timestamp",
                 timestamp,
                 "--side",
-                "input",
+                str(args.side),
                 "--history-scope",
                 history_scope,
                 "--max-rounds",
@@ -348,7 +442,14 @@ def main() -> None:
                 single_cmd.extend(["--top-m", str(args.top_m)])
             if bool(args.force_run_input_eval):
                 single_cmd.append("--force-run-input-eval")
-            single_returncode, _ = _run_command(single_cmd, dry_run=bool(args.dry_run))
+            single_result = _run_command(single_cmd, dry_run=bool(args.dry_run))
+            single_returncode = single_result.returncode
+            if single_returncode != 0 and not bool(args.dry_run):
+                _write_failure_markdown(
+                    output_path=failure_log_path,
+                    cmd=single_cmd,
+                    result=single_result,
+                )
 
             workflow_code = 0 if bool(args.dry_run) else single_returncode
             evaluation_code: int | None = 0 if bool(args.dry_run) else (0 if single_returncode == 0 else None)
@@ -395,13 +496,15 @@ def main() -> None:
         "num_input_sentences_per_hypothesis": int(args.num_input_sentences_per_hypothesis),
         "top_m": None if args.top_m is None else int(args.top_m),
         "history_rounds": int(args.history_rounds),
+        "history_scopes": list(selected_history_scopes),
+        "enable_all_hypotheses_merge": bool(args.enable_all_hypotheses_merge),
         "width": str(args.width),
         "selection_method": int(args.selection_method),
         "observation_m": int(args.observation_m),
         "observation_n": int(args.observation_n),
         "input_max_explanations": int(args.input_max_explanations),
         "input_non_activation_context_count": int(args.input_non_activation_context_count),
-        "final_run_mode": str(args.final_run_mode),
+        "final_run_mode": str(args.side),
         "force_run_input_eval": bool(args.force_run_input_eval),
         "selection": [{"layer_id": l, "feature_id": f} for l, f in selection],
         "records": [r.__dict__ for r in records],
