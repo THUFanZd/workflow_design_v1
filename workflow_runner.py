@@ -504,7 +504,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Reuse artifacts before start point from logs/layer-{layer_id}/feature-{feature_id}/{timestamp}/{round_id}.",
     )
 
-    parser.add_argument("--num-hypothesis", type=int, default=3, help="Hypothesis count n for each side")
+    parser.add_argument(
+        "--num-hypothesis",
+        type=int,
+        default=3,
+        help=(
+            "Hypothesis cap per side. In iterative initial generation, this is the maximum count; "
+            "generation stops early if LLM returns a None hypothesis."
+        ),
+    )
     parser.add_argument(
         "--side",
         choices=["input", "output", "both"],

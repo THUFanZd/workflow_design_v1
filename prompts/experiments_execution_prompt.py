@@ -6,7 +6,10 @@ from typing import Sequence
 def build_input_activation_context(*, hypothesis: str, designed_sentences: Sequence[str]) -> str:
     lines = []
     lines.append("Task background:")
-    lines.append("You are validating an input-side SAE hypothesis.")
+    lines.append(
+        "You are validating an input-side SAE hypothesis: it describes what kinds of input sentences, "
+        "when fed into the model, activate the target SAE feature."
+    )
     lines.append("Each sentence should be semantically aligned with the hypothesis and likely to activate the target SAE feature.")
     lines.append("")
     lines.append("Hypothesis:")
@@ -24,7 +27,10 @@ def build_input_activation_context(*, hypothesis: str, designed_sentences: Seque
 def build_input_boundary_context(*, hypothesis: str, boundary_sentences: Sequence[str]) -> str:
     lines = []
     lines.append("Task background:")
-    lines.append("You are validating boundary cases for an input-side SAE hypothesis.")
+    lines.append(
+        "You are validating boundary cases for an input-side SAE hypothesis: it describes what kinds of "
+        "input sentences, when fed into the model, activate the target SAE feature."
+    )
     lines.append(
         "Each boundary sentence should look similar to the hypothesis semantics but should ideally remain "
         "outside the true activation set."
@@ -49,7 +55,7 @@ def build_output_judge_system_prompt(num_sets: int) -> str:
     return (
         "You are an expert evaluator for sparse autoencoder (SAE) feature interventions in language models.\n"
         "Task background:\n"
-        "- A hypothesis describes what one SAE feature represents.\n"
+        "- The hypothesis is output-side: it describes how the model's output changes after the target SAE feature value is intervened on.\n"
         "- For each candidate set, model completions were produced after steering one SAE feature.\n"
         "- The prompts were designed to activate the target feature before intervention.\n"
         "- Exactly one candidate set is from the target feature intervention. The others are controls.\n\n"

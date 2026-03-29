@@ -10,6 +10,18 @@ def _side_label(side: SideType) -> str:
     return "input-side activation" if side == "input" else "output-side intervention"
 
 
+def _side_definition(side: SideType) -> str:
+    if side == "input":
+        return (
+            "Definition: input-side means the hypothesis describes what kinds of input sentences, "
+            "when fed into the model, activate the target SAE feature."
+        )
+    return (
+        "Definition: output-side means the hypothesis describes how the model's output changes "
+        "after the target SAE feature value is intervened on."
+    )
+
+
 def _observation_description(side: SideType) -> str:
     if side == "input":
         return (
@@ -33,9 +45,10 @@ def build_system_prompt(side: SideType) -> str:
         "Your task is to infer hypotheses about one SAE feature based on observations.\n"
         "The observation is not raw model internals; it is preprocessed evidence collected from this feature.\n"
         f"You are currently generating hypotheses for the {_side_label(side)} behavior.\n"
-        "A hypothesis must be concise, concrete, and testable.\n"
-        "Each hypothesis must be at most 30 words.\n"
-        "Do not output any chain-of-thought or extra commentary."
+        f"{_side_definition(side)}\n"
+        "A hypothesis must be concise, concrete, and testable, and not too complex.\n"
+        "Each hypothesis must be concise(at most 30 words).\n"
+        "Do not output any extra commentary."
     )
 
 
@@ -81,7 +94,8 @@ def build_iterative_user_prompt(
         "Task:\n"
         f"Generate hypothesis {current_index}/{total_count} for the {_side_label(side)} explanation.\n"
         "Your new hypothesis must stay grounded in the observation and be meaningfully different from previous hypotheses.\n"
-        "Keep it concrete and <= 30 words.\n\n"
+        "If you really can't find a meaningfully different hypothesis, just output 'None'.\n"
+        "Keep it concrete and at most 30 words.\n\n"
         "Output format (JSON only):\n"
         "{\n"
         '  "hypothesis": "one concise hypothesis"\n'

@@ -10,10 +10,23 @@ def _side_label(side: SideType) -> str:
     return "input-side" if side == "input" else "output-side"
 
 
+def _side_definition(side: SideType) -> str:
+    if side == "input":
+        return (
+            "Definition: input-side means the hypothesis describes what kinds of input sentences, "
+            "when fed into the model, activate the target SAE feature."
+        )
+    return (
+        "Definition: output-side means the hypothesis describes how the model's output changes "
+        "after the target SAE feature value is intervened on."
+    )
+
+
 def build_system_prompt(side: SideType) -> str:
     return (
         "You are merging semantically equivalent SAE hypotheses.\n"
         f"Target: {_side_label(side)} hypotheses.\n"
+        f"{_side_definition(side)}\n"
         "Rules:\n"
         "1) Merge ONLY when two hypotheses are semantically identical in all essential meaning.\n"
         "2) If there is any semantic difference, do NOT merge.\n"

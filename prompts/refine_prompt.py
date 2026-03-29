@@ -11,13 +11,25 @@ def _side_label(side: SideType) -> str:
     return "input-side activation" if side == "input" else "output-side intervention"
 
 
-def _scoring_explanation(side: SideType) -> str:
+def _side_definition(side: SideType) -> str:
+    if side == "input":
+        return (
+            "Definition: input-side means the hypothesis describes what kinds of input sentences, "
+            "when fed into the model, activate the target SAE feature."
+        )
+    return (
+        "Definition: output-side means the hypothesis describes how the model's output changes "
+        "after the target SAE feature value is intervened on."
+    )
+
+
+def _scoring_explanation(side: SideType) -> str:  # score definition
     if side == "input":
         return (
             "Score definition:\n"
             "- score_non_zero_rate = non_zero_count / total_sentences.\n"
             "- Higher is better.\n"
-            "- Input-side test sentences should semantically match the hypothesis and activate the SAE feature."
+            "- Input-side test sentences should semantically match the input-side hypothesis and activate the SAE feature."
         )
     return (
         "Score definition:\n"
@@ -31,6 +43,7 @@ def build_system_prompt(side: SideType) -> str:
     return (
         "You are an expert mechanistic interpretability researcher for sparse autoencoder (SAE) features.\n"
         f"You are refining {_side_label(side)} hypotheses using memory and experiment evidence.\n"
+        f"{_side_definition(side)}\n"
         "You must reason from score first, then inspect failures and limitations in the previous reason/hypothesis.\n"
         "Return only valid JSON with no extra text."
     )
@@ -56,22 +69,22 @@ def build_user_prompt(
     )
 
     process_steps = (
-        "Required process:\n"
+        "Process steps:\n"
         "1) Read the score and infer how strong/weak the current hypothesis is.\n"
-        "2) Analyze mismatch patterns from failed examples.\n"
+        "2) Concentrate on mismatch patterns from failed examples.\n"
     )
     if history_scope == "same_hypothesis":
         process_steps += (
             "3) Use memory trends from previous rounds.\n"
-            "4) Produce a sharper and more testable revised hypothesis.\n"
+            "4) Produce a revised hypothesis, but not too complex for a SAE feature.\n"
             "5) Explain why the revision should perform better.\n\n"
         )
     else:
         process_steps += (
-            "3) Distinguish two memory groups: (a) your own hypothesis trajectory, "
+            "3) You are offered two memory groups: (a) your own hypothesis trajectory, "
             "(b) peer hypotheses from the same side.\n"
             "4) Mine transferable failure/success patterns from all hypotheses to improve your own.\n"
-            "5) Produce a sharper and more testable revised hypothesis.\n"
+            "5) Produce a revised hypothesis, but not too complex for a SAE feature.\n"
             "6) Explain why the revision should perform better.\n\n"
         )
 
@@ -86,7 +99,6 @@ def build_user_prompt(
         "Output constraints:\n"
         "- Keep hypothesis concise and testable (<= 30 words).\n"
         "- Keep reason concise and evidence-grounded.\n"
-        "- Do not output markdown.\n"
         "- Output JSON only with this exact schema:\n"
         "{\n"
         '  "reason": "one concise improvement reason",\n'

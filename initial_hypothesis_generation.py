@@ -38,6 +38,40 @@ def _normalize_hypothesis(text: str) -> str:
     return " ".join(stripped.split())
 
 
+def _is_none_token(text: str) -> bool:
+    cleaned = text.strip()
+    if not cleaned:
+        return False
+    cleaned = cleaned.strip("`").strip()
+    cleaned = cleaned.strip('"').strip("'").strip()
+    cleaned = re.sub(r"[。.!?]+$", "", cleaned).strip()
+    return cleaned.lower() == "none"
+
+
+def _is_none_hypothesis_output(raw_output: str) -> bool:
+    if _is_none_token(raw_output):
+        return True
+
+    parsed = extract_json_object(raw_output)
+    if not isinstance(parsed, dict):
+        return False
+
+    hypothesis_key: Optional[str] = None
+    for key in parsed.keys():
+        if str(key).strip().lower() == "hypothesis":
+            hypothesis_key = key
+            break
+    if hypothesis_key is None:
+        return False
+
+    value = parsed.get(hypothesis_key)
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return _is_none_token(value)
+    return False
+
+
 def _parse_hypothesis_list(raw_output: str, expected_count: int) -> List[str]:
     parsed = extract_json_object(raw_output)
     hypotheses: List[str] = []
@@ -166,8 +200,7 @@ def _generate_hypotheses_for_side(
                 max_tokens=max_tokens,
             )
             usage_counts = token_counter.add(usage_obj)
-            one_hypothesis = _parse_single_hypothesis(raw_output)
-            hypotheses.append(one_hypothesis)
+            stop_on_none = _is_none_hypothesis_output(raw_output)
             llm_calls.append(
                 {
                     "side": side,
@@ -176,8 +209,14 @@ def _generate_hypotheses_for_side(
                     "messages": messages,
                     "raw_output": raw_output,
                     "usage": usage_counts,
+                    "stopped_on_none": stop_on_none,
                 }
             )
+            if stop_on_none:
+                break
+
+            one_hypothesis = _parse_single_hypothesis(raw_output)
+            hypotheses.append(one_hypothesis)
         return hypotheses
 
     raise ValueError(f"Unsupported generation mode: {generation_mode}")
@@ -335,7 +374,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-id", default="gemma-2-2b", help="Neuronpedia model id")
     parser.add_argument("--layer-id", required=True, help="Layer id")
     parser.add_argument("--feature-id", required=True, help="Feature id")
-    parser.add_argument("--num-hypothesis", type=int, default=3, help="Hypothesis count n for each side")
+    parser.add_argument(
+        "--num-hypothesis",
+        type=int,
+        default=3,
+        help=(
+            "Hypothesis cap per side. In iterative mode, this is the maximum count; "
+            "generation stops early if LLM returns a None hypothesis."
+        ),
+    )
     parser.add_argument(
         "--generation-mode",
         choices=["single_call", "iterative"],
