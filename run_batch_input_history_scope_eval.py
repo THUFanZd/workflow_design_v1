@@ -244,6 +244,11 @@ def parse_args() -> argparse.Namespace:
         help="Passed to run_single_input_history_scope_eval.py --bos-token-observation-root.",
     )
     parser.add_argument(
+        "--enable-bos-token-semantic-cluster",
+        action="store_true",
+        help="Passed to run_single_input_history_scope_eval.py --enable-bos-token-semantic-cluster.",
+    )
+    parser.add_argument(
         "--input-non-activation-context-count",
         type=int,
         default=5,
@@ -356,6 +361,8 @@ def main() -> None:
             ]
             if merge_enabled:
                 single_cmd.append("--enable-hypothesis-merge")
+            if bool(args.enable_bos_token_semantic_cluster):
+                single_cmd.append("--enable-bos-token-semantic-cluster")
             if args.top_m is not None:
                 single_cmd.extend(["--top-m", str(args.top_m)])
             if args.llm_generation_model:
@@ -419,6 +426,7 @@ def main() -> None:
         "observation_n": int(args.observation_n),
         "observation_source": str(args.observation_source),
         "bos_token_observation_root": str(args.bos_token_observation_root),
+        "enable_bos_token_semantic_cluster": bool(args.enable_bos_token_semantic_cluster),
         "input_non_activation_context_count": int(args.input_non_activation_context_count),
         "final_run_mode": "input",
         "force_run_input_eval": bool(args.force_run_input_eval),

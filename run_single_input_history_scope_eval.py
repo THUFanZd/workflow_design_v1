@@ -24,6 +24,7 @@ class RunSummary:
     final_run_mode: str
     history_scope: str
     merge_enabled: bool
+    bos_token_semantic_cluster_enabled: bool
     timestamp: str
     workflow_returncode: int
     evaluation_returncode: int | None
@@ -139,6 +140,11 @@ def parse_args() -> argparse.Namespace:
         default="initial_observation",
         help="Passed to workflow_runner.py --bos-token-observation-root.",
     )
+    parser.add_argument(
+        "--enable-bos-token-semantic-cluster",
+        action="store_true",
+        help="Passed to workflow_runner.py --enable-bos-token-semantic-cluster.",
+    )
 
     parser.add_argument("--sae-name", default="gemmascope-res")
     parser.add_argument(
@@ -214,6 +220,8 @@ def main() -> None:
     ]
     if bool(args.enable_hypothesis_merge):
         workflow_cmd.append("--enable-hypothesis-merge")
+    if bool(args.enable_bos_token_semantic_cluster):
+        workflow_cmd.append("--enable-bos-token-semantic-cluster")
     if args.top_m is not None:
         workflow_cmd.extend(["--top-m", str(args.top_m)])
     if args.llm_generation_model:
@@ -259,6 +267,7 @@ def main() -> None:
         final_run_mode=final_run_mode,
         history_scope=str(args.history_scope),
         merge_enabled=bool(args.enable_hypothesis_merge),
+        bos_token_semantic_cluster_enabled=bool(args.enable_bos_token_semantic_cluster),
         timestamp=timestamp,
         workflow_returncode=workflow_code,
         evaluation_returncode=evaluation_code,

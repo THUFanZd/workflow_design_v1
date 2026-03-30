@@ -29,6 +29,7 @@ from support_info.llm_api_info import model_name as DEFAULT_MODEL_NAME
 from prompts.refine_prompt import (
     HistoryScope,
     InputRefinementMode,
+    build_activation_expand_analysis_prompt,
     build_system_prompt,
     build_user_prompt,
 )
@@ -297,6 +298,30 @@ def _parse_refinement_output(raw_output: str) -> Tuple[str, str]:
     return reason, hypothesis
 
 
+def _parse_activation_expand_analysis_output(raw_output: str) -> Dict[str, Any]:
+    parsed = extract_json_object(raw_output)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Cannot parse JSON object from activation_expand analysis output: {raw_output}")
+
+    preserved_core_raw = parsed.get("preserved_core", [])
+    sibling_cases_raw = parsed.get("new_sibling_cases", [])
+    broader_scope_explanation = _clean_text(parsed.get("broader_scope_explanation"))
+
+    preserved_core = [_clean_text(item) for item in preserved_core_raw if _clean_text(item)] if isinstance(preserved_core_raw, list) else []
+    new_sibling_cases = [_clean_text(item) for item in sibling_cases_raw if _clean_text(item)] if isinstance(sibling_cases_raw, list) else []
+
+    if not preserved_core or not new_sibling_cases or not broader_scope_explanation:
+        raise ValueError(
+            "Activation_expand analysis output must contain non-empty preserved_core, "
+            f"new_sibling_cases, and broader_scope_explanation: {raw_output}"
+        )
+    return {
+        "preserved_core": preserved_core,
+        "new_sibling_cases": new_sibling_cases,
+        "broader_scope_explanation": broader_scope_explanation,
+    }
+
+
 def _build_history_evidence(
     *,
     historical_memories: Sequence[Dict[str, Any]],
@@ -419,7 +444,49 @@ def refine_hypotheses_for_side(
             else:
                 input_refinement_mode = "activation_expand" if _is_input_full_score(current_execution_evidence) else "activation_repair"
 
+        expand_analysis: Dict[str, Any] = {}
         system_prompt = build_system_prompt(side)
+        if side == "input" and input_refinement_mode == "activation_expand":
+            analysis_user_prompt = build_activation_expand_analysis_prompt(
+                hypothesis_index=hypothesis_index,
+                current_hypothesis=current_hypothesis,
+                current_reason=current_reason,
+                current_score_name=current_score_name,
+                current_score=current_score,
+                current_memory_evidence=current_memory_evidence,
+                history_scope=history_scope,
+                historical_evidence=history_evidence,
+                current_execution_evidence=current_execution_evidence,
+            )
+            analysis_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": analysis_user_prompt},
+            ]
+            analysis_raw_output, analysis_usage_obj, analysis_response_debug = call_llm(
+                client=client,
+                model=llm_model,
+                messages=analysis_messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=False,
+                response_format_text=True,
+                return_debug=True,
+            )
+            analysis_usage_counts = token_counter.add(analysis_usage_obj)
+            expand_analysis = _parse_activation_expand_analysis_output(analysis_raw_output)
+            llm_calls.append(
+                {
+                    "side": side,
+                    "stage": "activation_expand_analysis",
+                    "hypothesis_index": hypothesis_index,
+                    "messages": analysis_messages,
+                    "raw_output": analysis_raw_output,
+                    "parsed_output": expand_analysis,
+                    "usage": analysis_usage_counts,
+                    "response_debug": analysis_response_debug,
+                }
+            )
+
         user_prompt = build_user_prompt(
             side=side,
             hypothesis_index=hypothesis_index,
@@ -433,6 +500,7 @@ def refine_hypotheses_for_side(
             current_execution_evidence=current_execution_evidence,
             input_refinement_mode=input_refinement_mode,
             input_pre_expansion_hypothesis=input_pre_expansion_hypothesis,
+            expand_analysis=expand_analysis,
         )
         messages = [
             {"role": "system", "content": system_prompt},
@@ -466,6 +534,7 @@ def refine_hypotheses_for_side(
                 "history_scope": history_scope,
                 "input_refinement_mode": input_refinement_mode,
                 "input_pre_expansion_hypothesis": input_pre_expansion_hypothesis,
+                "expand_analysis": expand_analysis,
             },
             "refined_reason": refined_reason,
             "refined_hypothesis": refined_hypothesis,
@@ -475,6 +544,7 @@ def refine_hypotheses_for_side(
         llm_calls.append(
             {
                 "side": side,
+                "stage": "refinement",
                 "hypothesis_index": hypothesis_index,
                 "messages": messages,
                 "raw_output": raw_output,
@@ -552,6 +622,8 @@ def _write_refinement_markdown(
     for call_index, call in enumerate(llm_calls, start=1):
         lines.append(f"### Call {call_index}")
         lines.append(f"- side: {call.get('side', '')}")
+        if call.get("stage"):
+            lines.append(f"- stage: {call.get('stage', '')}")
         lines.append(f"- hypothesis_index: {call.get('hypothesis_index', '')}")
         usage = call.get("usage", {})
         lines.append(f"- prompt_tokens: {usage.get('prompt_tokens', 0)}")

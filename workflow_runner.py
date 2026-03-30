@@ -376,6 +376,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Expected file: layer-{layer}/feature-{feature}/bos_token/top_tokens.json."
         ),
     )
+    parser.add_argument(
+        "--enable-bos-token-semantic-cluster",
+        action="store_true",
+        help="If set, enable semantic clustering (LLM) after morphology clustering for bos_token input hypotheses.",
+    )
     parser.add_argument("--neuronpedia-api-key", default=None)
     parser.add_argument("--neuronpedia-timeout", type=int, default=30)
     parser.add_argument("--llm-base-url", default=DEFAULT_BASE_URL)
@@ -655,6 +660,7 @@ def generate_initial_hypotheses_node(state: WorkflowState) -> Dict[str, Any]:
             llm_base_url=args.llm_base_url,
             llm_model=config.generation_model,
             llm_api_key_file=args.llm_api_key_file,
+            enable_bos_token_semantic_cluster=bool(args.enable_bos_token_semantic_cluster),
             temperature=args.temperature,
             max_tokens=args.max_tokens,
         )
@@ -1342,6 +1348,7 @@ def finalize_node(state: WorkflowState) -> Dict[str, Any]:
         "history_rounds": args.history_rounds,
         "enable_hypothesis_merge": config.merge_enabled,
         "hypothesis_merge_mode": "llm_semantic" if config.merge_enabled else "off",
+        "enable_bos_token_semantic_cluster": bool(args.enable_bos_token_semantic_cluster),
         "merged_rounds": sorted(state.get("round_merges", {}).keys()),
         "output_intervention_method": state.get("last_output_intervention_method"),
         "output_score_name": state.get("last_output_score_name"),
@@ -1378,6 +1385,7 @@ def finalize_node(state: WorkflowState) -> Dict[str, Any]:
     lines.append(f"- converged_round: {state.get('converged_round')}")
     lines.append(f"- enable_hypothesis_merge: {config.merge_enabled}")
     lines.append(f"- hypothesis_merge_mode: {'llm_semantic' if config.merge_enabled else 'off'}")
+    lines.append(f"- enable_bos_token_semantic_cluster: {bool(args.enable_bos_token_semantic_cluster)}")
     lines.append(f"- merged_rounds: {sorted(state.get('round_merges', {}).keys())}")
     lines.append(f"- output_intervention_method: {state.get('last_output_intervention_method')}")
     lines.append(f"- output_score_name: {state.get('last_output_score_name')}")
@@ -1430,6 +1438,7 @@ def finalize_node(state: WorkflowState) -> Dict[str, Any]:
                 "converged_round": state.get("converged_round"),
                 "enable_hypothesis_merge": config.merge_enabled,
                 "hypothesis_merge_mode": "llm_semantic" if config.merge_enabled else "off",
+                "enable_bos_token_semantic_cluster": bool(args.enable_bos_token_semantic_cluster),
                 "merged_rounds": sorted(state.get("round_merges", {}).keys()),
                 "output_intervention_method": state.get("last_output_intervention_method"),
                 "output_score_name": state.get("last_output_score_name"),
