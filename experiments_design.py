@@ -265,24 +265,27 @@ def _write_markdown_log(
     lines.append(f"- completion_tokens: {token_usage['completion_tokens']}")
     lines.append(f"- total_tokens: {token_usage['total_tokens']}")
     lines.append("")
-    lines.append("## Input-side Hypotheses And Designed Sentences")
-    for idx, pair in enumerate(result["input_side_experiments"], start=1):
-        lines.append(f"### Input Hypothesis {idx}")
-        lines.append(f"- hypothesis: {pair['hypothesis']}")
-        lines.append(f"- test_type: {pair.get('test_type', 'activation')}")
-        lines.append(f"- reference_hypothesis: {pair.get('reference_hypothesis', '')}")
-        lines.append("- designed_sentences:")
-        for sentence in pair.get("designed_sentences", []):
-            lines.append(f"  - {sentence}")
-        lines.append("")
-    lines.append("## Output-side Hypotheses And Designed Sentences")
-    for idx, pair in enumerate(result["output_side_experiments"], start=1):
-        lines.append(f"### Output Hypothesis {idx}")
-        lines.append(f"- hypothesis: {pair['hypothesis']}")
-        lines.append("- designed_sentences:")
-        for sentence in pair.get("designed_sentences", []):
-            lines.append(f"  - {sentence}")
-        lines.append("")
+    run_side = str(result.get("run_side", "both"))
+    if run_side in ("input", "both"):
+        lines.append("## Input-side Hypotheses And Designed Sentences")
+        for idx, pair in enumerate(result["input_side_experiments"], start=1):
+            lines.append(f"### Input Hypothesis {idx}")
+            lines.append(f"- hypothesis: {pair['hypothesis']}")
+            lines.append(f"- test_type: {pair.get('test_type', 'activation')}")
+            lines.append(f"- reference_hypothesis: {pair.get('reference_hypothesis', '')}")
+            lines.append("- designed_sentences:")
+            for sentence in pair.get("designed_sentences", []):
+                lines.append(f"  - {sentence}")
+            lines.append("")
+    if run_side in ("output", "both"):
+        lines.append("## Output-side Hypotheses And Designed Sentences")
+        for idx, pair in enumerate(result["output_side_experiments"], start=1):
+            lines.append(f"### Output Hypothesis {idx}")
+            lines.append(f"- hypothesis: {pair['hypothesis']}")
+            lines.append("- designed_sentences:")
+            for sentence in pair.get("designed_sentences", []):
+                lines.append(f"  - {sentence}")
+            lines.append("")
     lines.append("## LLM Calls")
     for i, call in enumerate(llm_calls, start=1):
         lines.append(f"### Call {i}")
@@ -333,11 +336,13 @@ def design_hypothesis_experiments(
         round_id or str(hypotheses_result.get("round_id", "")).strip() or None,
         round_index=1,
     )
-    input_hypotheses = [str(item).strip() for item in hypotheses_result.get("input_side_hypotheses", [])]
-    output_hypotheses = [str(item).strip() for item in hypotheses_result.get("output_side_hypotheses", [])]
-    num_hypothesis = max(len(input_hypotheses), len(output_hypotheses))
     run_input = run_side in ("input", "both")
     run_output = run_side in ("output", "both")
+    input_hypotheses_all = [str(item).strip() for item in hypotheses_result.get("input_side_hypotheses", [])]
+    output_hypotheses_all = [str(item).strip() for item in hypotheses_result.get("output_side_hypotheses", [])]
+    input_hypotheses = input_hypotheses_all if run_input else []
+    output_hypotheses = output_hypotheses_all if run_output else []
+    num_hypothesis = max(len(input_hypotheses), len(output_hypotheses))
 
     token_counter = TokenUsageAccumulator()
     llm_calls: List[Dict[str, Any]] = []

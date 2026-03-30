@@ -53,7 +53,7 @@ def build_system_prompt(side: SideType) -> str:
         f"You are currently generating hypotheses for the {_side_label(side)} behavior.\n"
         "A hypothesis must be concise, concrete, and testable.\n"
         "Each hypothesis must be at most 30 words.\n"
-        "Do not output any chain-of-thought or extra commentary."
+        "Do not output extra commentary."
     )
 
 

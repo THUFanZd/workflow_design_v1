@@ -27,7 +27,7 @@ def build_input_system_prompt(*, test_type: InputTestType) -> str:
         "You design validation experiments for hypotheses about one SAE feature.\n"
         f"The current task is to generate input-side {task_desc}.\n"
         "Follow the user's required JSON format exactly.\n"
-        "Do not output chain-of-thought or extra commentary."
+        "Do not output extra commentary."
     )
 
 

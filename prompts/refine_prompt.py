@@ -43,7 +43,7 @@ def _input_mode_instructions(mode: InputRefinementMode) -> str:
         return (
             "Current input-side mode: activation test.\n"
             "Goal:\n"
-            "1) Keep one successful activation pattern.\n"
+            "1) Keep successful activation patterns.\n"
             "2) Exclude semantics reflected by failed activation examples.\n"
             "3) Improve activation hit rate in the next round."
         )
@@ -54,14 +54,20 @@ def _input_mode_instructions(mode: InputRefinementMode) -> str:
             "1) Treat current hypothesis as a proven subset of the true feature set.\n"
             "2) Expand the hypothesis scope beyond this subset.\n"
             "3) Use historical trajectory to avoid reusing earlier failed meanings.\n"
-            "4) Keep the expanded hypothesis precise and testable, and not too complex."
+            "4) Keep the expanded hypothesis precise and testable, and not too complex.\n"
+            "Statements for expansion:\n"
+            "- The revised hypothesis must be a semantic superset of the current hypothesis, not a narrower specialization.\n"
+            "- It must still cover every case covered by the current hypothesis.\n"
+            "- Do not keep the original token pattern and then append restrictive qualifiers such as 'when', 'where', 'if', 'only', or 'excluding'.\n"
+            "- Prefer broadening to a higher-level semantic class or adding sibling cases.\n"
+            "- If you cannot find a valid broader hypothesis, keep the original scope rather than narrowing it.\n"
         )
     return (
         "Current input-side mode: expansion test.\n"
         "Goal:\n"
         "1) Include semantics of expansion examples that activated.\n"
         "2) Exclude semantics of expansion examples that did not activate.\n"
-        "3) Keep the revised hypothesis broader than the provided pre-expansion hypothesis."
+        # "3) Keep the revised hypothesis broader than the provided pre-expansion hypothesis."
     )
 
 
@@ -92,7 +98,7 @@ def build_user_prompt(
     else:
         process_steps += (
             "3) Separate own trajectory and peer hypotheses in history.\n"
-            "4) Reuse transferable success/failure patterns.\n"
+            "4) Reuse transferable success/failure patterns, but more concentrate on your own trajectory.\n"
             "5) Produce a more reliable revised hypothesis.\n"
             "6) Explain why it should perform better.\n\n"
         )
@@ -120,7 +126,6 @@ def build_user_prompt(
         "Output constraints:\n"
         "- Keep hypothesis concise and testable (<= 40 words).\n"
         "- Keep reason concise and evidence-grounded.\n"
-        "- Do not output markdown.\n"
         "- Output JSON only with this exact schema:\n"
         "{\n"
         '  "reason": "one concise improvement reason",\n'

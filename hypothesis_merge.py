@@ -375,6 +375,9 @@ def merge_refined_hypotheses(
     input_reasons = _normalize_str_list(refined_hypotheses_result.get("input_side_hypothesis_reasons", []))
     output_hypotheses = _normalize_str_list(refined_hypotheses_result.get("output_side_hypotheses", []))
     output_reasons = _normalize_str_list(refined_hypotheses_result.get("output_side_hypothesis_reasons", []))
+    if not run_output:
+        output_hypotheses = []
+        output_reasons = []
 
     client = OpenAI(
         base_url=llm_base_url,
