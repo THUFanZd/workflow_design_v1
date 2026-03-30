@@ -233,6 +233,17 @@ def parse_args() -> argparse.Namespace:
         help="Passed only to workflow_runner.py --observation-n (workflow observation sampling).",
     )
     parser.add_argument(
+        "--observation-source",
+        choices=["neuronpedia", "bos_token"],
+        default="neuronpedia",
+        help="Passed to run_single_input_history_scope_eval.py --observation-source.",
+    )
+    parser.add_argument(
+        "--bos-token-observation-root",
+        default="initial_observation",
+        help="Passed to run_single_input_history_scope_eval.py --bos-token-observation-root.",
+    )
+    parser.add_argument(
         "--input-non-activation-context-count",
         type=int,
         default=5,
@@ -334,6 +345,10 @@ def main() -> None:
                 str(args.observation_m),
                 "--observation-n",
                 str(args.observation_n),
+                "--observation-source",
+                str(args.observation_source),
+                "--bos-token-observation-root",
+                str(args.bos_token_observation_root),
                 "--sae-name",
                 str(args.sae_name),
                 "--input-non-activation-context-count",
@@ -402,8 +417,10 @@ def main() -> None:
         "selection_method": int(args.selection_method),
         "observation_m": int(args.observation_m),
         "observation_n": int(args.observation_n),
+        "observation_source": str(args.observation_source),
+        "bos_token_observation_root": str(args.bos_token_observation_root),
         "input_non_activation_context_count": int(args.input_non_activation_context_count),
-        "final_run_mode": str(args.final_run_mode),
+        "final_run_mode": "input",
         "force_run_input_eval": bool(args.force_run_input_eval),
         "selection": [{"layer_id": l, "feature_id": f} for l, f in selection],
         "records": [r.__dict__ for r in records],

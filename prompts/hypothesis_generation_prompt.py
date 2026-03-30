@@ -10,7 +10,25 @@ def _side_label(side: SideType) -> str:
     return "input-side activation" if side == "input" else "output-side intervention"
 
 
-def _observation_description(side: SideType) -> str:
+def _infer_observation_source(observation: Dict[str, Any]) -> str:
+    source_raw = observation.get("source")
+    source = str(source_raw).strip().lower() if source_raw is not None else ""
+    if source:
+        return source
+    if "bos_token_top_tokens" in observation or "bos_token_scan_meta" in observation:
+        return "bos_token"
+    return "neuronpedia"
+
+
+def _observation_description(side: SideType, observation: Dict[str, Any]) -> str:
+    if _infer_observation_source(observation) == "bos_token":
+        if side == "input":
+            return (
+                "Observation source (input side):\n"
+                "- Feed the tokens from the target language model's vocabulary into the model, observe this SAE feature activation, and collect top-activation tokens with activation values.\n"
+            )
+        raise ValueError(f"Unknown or unsupported side type: {side}")
+
     if side == "input":
         return (
             "Observation schema (input side):\n"
@@ -47,7 +65,7 @@ def build_single_call_user_prompt(
     return (
         "Background:\n"
         "You are analyzing one SAE feature in an LLM.\n"
-        f"{_observation_description(side)}\n"
+        f"{_observation_description(side, observation)}\n"
         "The observation below has already been parsed into a compact dict.\n\n"
         "Task:\n"
         f"Generate exactly {num_hypothesis} distinct hypotheses for the {_side_label(side)} explanation.\n"
@@ -76,7 +94,7 @@ def build_iterative_user_prompt(
     return (
         "Background:\n"
         "You are analyzing one SAE feature in an LLM.\n"
-        f"{_observation_description(side)}\n"
+        f"{_observation_description(side, observation)}\n"
         "The observation below has already been parsed into a compact dict.\n\n"
         "Task:\n"
         f"Generate hypothesis {current_index}/{total_count} for the {_side_label(side)} explanation.\n"

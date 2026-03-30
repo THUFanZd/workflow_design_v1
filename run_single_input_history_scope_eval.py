@@ -128,6 +128,17 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Passed only to workflow_runner.py --observation-n (workflow observation sampling).",
     )
+    parser.add_argument(
+        "--observation-source",
+        choices=["neuronpedia", "bos_token"],
+        default="neuronpedia",
+        help="Passed to workflow_runner.py --observation-source.",
+    )
+    parser.add_argument(
+        "--bos-token-observation-root",
+        default="initial_observation",
+        help="Passed to workflow_runner.py --bos-token-observation-root.",
+    )
 
     parser.add_argument("--sae-name", default="gemmascope-res")
     parser.add_argument(
@@ -194,6 +205,10 @@ def main() -> None:
         str(args.observation_m),
         "--observation-n",
         str(args.observation_n),
+        "--observation-source",
+        str(args.observation_source),
+        "--bos-token-observation-root",
+        str(args.bos_token_observation_root),
         "--model-id",
         str(args.model_id),
     ]

@@ -362,6 +362,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-method", type=int, default=1, choices=[1, 2, 3])
     parser.add_argument("--observation-m", type=int, default=2)
     parser.add_argument("--observation-n", type=int, default=2)
+    parser.add_argument(
+        "--observation-source",
+        choices=["neuronpedia", "bos_token"],
+        default="neuronpedia",
+        help="Initial observation source for round_0 step_1.",
+    )
+    parser.add_argument(
+        "--bos-token-observation-root",
+        default="initial_observation",
+        help=(
+            "Root folder containing bos token scan outputs. "
+            "Expected file: layer-{layer}/feature-{feature}/bos_token/top_tokens.json."
+        ),
+    )
     parser.add_argument("--neuronpedia-api-key", default=None)
     parser.add_argument("--neuronpedia-timeout", type=int, default=30)
     parser.add_argument("--llm-base-url", default=DEFAULT_BASE_URL)
@@ -574,7 +588,7 @@ def _ensure_previous_round_context(state: WorkflowState, round_index: int) -> Di
 
 
 def collect_observation_node(state: WorkflowState) -> Dict[str, Any]:
-    from neuronpedia_feature_api import fetch_and_parse_feature_observation
+    from initial_observation_router import collect_initial_observation
 
     config = state["config"]
     args = config.args
@@ -587,18 +601,20 @@ def collect_observation_node(state: WorkflowState) -> Dict[str, Any]:
         kind="observation_input",
     )
     if _should_run(start_round=args.start_round, start_step=args.start_step, round_index=0, step_index=1):
-        observation = fetch_and_parse_feature_observation(
+        observation = collect_initial_observation(
+            observation_source=args.observation_source,
             model_id=args.model_id,
             layer_id=config.layer_id,
             feature_id=config.feature_id,
-            width=args.width,
-            selection_method=args.selection_method,
-            m=args.observation_m,
-            n=args.observation_n,
-            api_key=args.neuronpedia_api_key,
-            timeout=args.neuronpedia_timeout,
             timestamp=config.timestamp,
             round_id=_round_id_from_index(0),
+            width=args.width,
+            selection_method=args.selection_method,
+            observation_m=args.observation_m,
+            observation_n=args.observation_n,
+            neuronpedia_api_key=args.neuronpedia_api_key,
+            neuronpedia_timeout=args.neuronpedia_timeout,
+            bos_token_observation_root=args.bos_token_observation_root,
         )
         return {
             "observation": observation,

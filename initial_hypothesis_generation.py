@@ -95,6 +95,57 @@ def _get_side_observation(observation_dict: Dict[str, Any], side: SideType) -> D
     raise KeyError(f"Cannot find {side} observation in observation dict.")
 
 
+def _is_bos_token_side_observation(side_observation: Dict[str, Any]) -> bool:
+    source_raw = side_observation.get("source")
+    source = str(source_raw).strip().lower() if source_raw is not None else ""
+    if source == "bos_token":
+        return True
+    return "bos_token_top_tokens" in side_observation or "bos_token_scan_meta" in side_observation
+
+
+def _extract_bos_token_labels(side_observation: Dict[str, Any]) -> List[str]:
+    labels: List[str] = []
+    seen: set[str] = set()
+
+    top_tokens_raw = side_observation.get("bos_token_top_tokens", [])
+    top_tokens = [item for item in top_tokens_raw if isinstance(item, dict)] if isinstance(top_tokens_raw, list) else []
+    for item in top_tokens:
+        token_raw = item.get("token")
+        token = str(token_raw).strip() if token_raw is not None else ""
+        if token and token not in seen:
+            labels.append(token)
+            seen.add(token)
+
+    if labels:
+        return labels
+
+    activation_examples_raw = side_observation.get("activation_examples", [])
+    activation_examples = (
+        [item for item in activation_examples_raw if isinstance(item, dict)]
+        if isinstance(activation_examples_raw, list)
+        else []
+    )
+    for example in activation_examples:
+        activation_tokens_raw = example.get("activation_tokens", [])
+        activation_tokens = (
+            [item for item in activation_tokens_raw if isinstance(item, dict)]
+            if isinstance(activation_tokens_raw, list)
+            else []
+        )
+        for activation_item in activation_tokens:
+            token_raw = activation_item.get("token")
+            token = str(token_raw).strip() if token_raw is not None else ""
+            if token and token not in seen:
+                labels.append(token)
+                seen.add(token)
+    return labels
+
+
+def _build_bos_token_fixed_hypothesis(side_observation: Dict[str, Any]) -> str:
+    token_labels = _extract_bos_token_labels(side_observation)
+    return f"Activate on tokens [{', '.join(token_labels)}]"
+
+
 def _generate_hypotheses_for_side(
     client: OpenAI,
     model: str,
@@ -272,10 +323,16 @@ def generate_initial_hypotheses(
     if run_side not in ("input", "output", "both"):
         raise ValueError(f"Unsupported run_side: {run_side}")
 
-    client = OpenAI(
-        base_url=llm_base_url,
-        api_key=read_api_key(llm_api_key_file),
-    )
+    client: Optional[OpenAI] = None
+
+    def _ensure_client() -> OpenAI:
+        nonlocal client
+        if client is None:
+            client = OpenAI(
+                base_url=llm_base_url,
+                api_key=read_api_key(llm_api_key_file),
+            )
+        return client
 
     token_counter = TokenUsageAccumulator()
     llm_calls: List[Dict[str, Any]] = []
@@ -284,32 +341,38 @@ def generate_initial_hypotheses(
     output_hypotheses: List[str] = []
     if run_side in ("input", "both"):
         input_observation = _get_side_observation(observation, "input")
-        input_hypotheses = _generate_hypotheses_for_side(
-            client=client,
-            model=llm_model,
-            side="input",
-            side_observation=input_observation,
-            num_hypothesis=num_hypothesis,
-            generation_mode=generation_mode,
-            token_counter=token_counter,
-            llm_calls=llm_calls,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        if _is_bos_token_side_observation(input_observation):
+            input_hypotheses = [_build_bos_token_fixed_hypothesis(input_observation)]
+        else:
+            input_hypotheses = _generate_hypotheses_for_side(
+                client=_ensure_client(),
+                model=llm_model,
+                side="input",
+                side_observation=input_observation,
+                num_hypothesis=num_hypothesis,
+                generation_mode=generation_mode,
+                token_counter=token_counter,
+                llm_calls=llm_calls,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
     if run_side in ("output", "both"):
         output_observation = _get_side_observation(observation, "output")
-        output_hypotheses = _generate_hypotheses_for_side(
-            client=client,
-            model=llm_model,
-            side="output",
-            side_observation=output_observation,
-            num_hypothesis=num_hypothesis,
-            generation_mode=generation_mode,
-            token_counter=token_counter,
-            llm_calls=llm_calls,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        if _is_bos_token_side_observation(output_observation):
+            output_hypotheses = []
+        else:
+            output_hypotheses = _generate_hypotheses_for_side(
+                client=_ensure_client(),
+                model=llm_model,
+                side="output",
+                side_observation=output_observation,
+                num_hypothesis=num_hypothesis,
+                generation_mode=generation_mode,
+                token_counter=token_counter,
+                llm_calls=llm_calls,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
 
     base_dir = build_round_dir(
         layer_id=layer_id,
