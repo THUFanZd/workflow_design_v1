@@ -1089,6 +1089,11 @@ def main() -> None:
         final_result_payload=final_result,
         workflow_timestamp_dir=workflow_timestamp_dir,
     )
+    run_input = args.run_mode in ("both", "input")
+    run_output = args.run_mode in ("both", "output")
+    if args.run_mode == "none":
+        _log_progress("Run mode is 'none': skip input-side and output-side evaluation execution.")
+
     if selected_input_from_workflow is not None:
         selected_input = selected_input_from_workflow
     else:
@@ -1098,16 +1103,20 @@ def main() -> None:
             execution_payload=execution_payload,
             side="input",
         )
-    selected_output = _pick_best_hypothesis(
-        final_result_payload=final_result,
-        refined_payload=refined_payload,
-        execution_payload=execution_payload,
-        side="output",
-    )
-    _log_progress(
-        f"Selected hypotheses (input idx={selected_input.get('hypothesis_index')}, "
-        f"output idx={selected_output.get('hypothesis_index')})"
-    )
+    if run_output:
+        selected_output = _pick_best_hypothesis(
+            final_result_payload=final_result,
+            refined_payload=refined_payload,
+            execution_payload=execution_payload,
+            side="output",
+        )
+        _log_progress(
+            f"Selected hypotheses (input idx={selected_input.get('hypothesis_index')}, "
+            f"output idx={selected_output.get('hypothesis_index')})"
+        )
+    else:
+        selected_output = {}
+        _log_progress(f"Selected input hypothesis (idx={selected_input.get('hypothesis_index')}); output skipped")
 
     source = _build_source(layer_id=layer_id, sae_name=str(args.sae_name), width=str(args.width))
     output_blind_script = (
@@ -1122,11 +1131,6 @@ def main() -> None:
         / "output-side-evaluation"
         / "intervention_logit_topk_score.py"
     )
-
-    run_input = args.run_mode in ("both", "input")
-    run_output = args.run_mode in ("both", "output")
-    if args.run_mode == "none":
-        _log_progress("Run mode is 'none': skip input-side and output-side evaluation execution.")
 
     input_result_path: Optional[Path] = None
     input_result: Dict[str, Any] = {}
