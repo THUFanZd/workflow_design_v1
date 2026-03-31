@@ -574,6 +574,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Expected file: layer-{layer}/feature-{feature}/bos_token/top_tokens.json."
         ),
     )
+    parser.add_argument(
+        "--enable-bos-token-semantic-cluster",
+        action="store_true",
+        help="If set, enable semantic clustering (LLM) after morphology clustering for bos_token input hypotheses.",
+    )
     parser.add_argument("--neuronpedia-api-key", default=None)
     parser.add_argument("--neuronpedia-timeout", type=int, default=30)
 
@@ -1371,6 +1376,7 @@ def finalize_node(state: WorkflowState) -> WorkflowState:
         "history_rounds": args.history_rounds,
         "enable_hypothesis_merge": state["merge_enabled"],
         "hypothesis_merge_mode": "llm_semantic" if state["merge_enabled"] else "off",
+        "enable_bos_token_semantic_cluster": bool(args.enable_bos_token_semantic_cluster),
         "merged_rounds": sorted(state["round_merges"].keys()),
         "output_intervention_method": state["last_output_intervention_method"],
         "output_score_name": state["last_output_score_name"],
@@ -1402,6 +1408,7 @@ def finalize_node(state: WorkflowState) -> WorkflowState:
         f"- converged: {state['converged']}",
         f"- converged_round: {state['converged_round']}",
         f"- workflow_backend: {state['workflow_backend']}",
+        f"- enable_bos_token_semantic_cluster: {bool(args.enable_bos_token_semantic_cluster)}",
         "",
         "## Input-side Final Hypotheses",
     ]
@@ -1437,6 +1444,7 @@ def finalize_node(state: WorkflowState) -> WorkflowState:
                 "converged_round": state["converged_round"],
                 "workflow_backend": state["workflow_backend"],
                 "langgraph_available": LANGGRAPH_AVAILABLE,
+                "enable_bos_token_semantic_cluster": bool(args.enable_bos_token_semantic_cluster),
             },
             ensure_ascii=True,
             indent=2,
@@ -2269,6 +2277,7 @@ if __name__ == "__main__":
         "history_rounds": args.history_rounds,
         "enable_hypothesis_merge": merge_enabled,
         "hypothesis_merge_mode": "llm_semantic" if merge_enabled else "off",
+        "enable_bos_token_semantic_cluster": bool(args.enable_bos_token_semantic_cluster),
         "merged_rounds": sorted(round_merges.keys()),
         "output_intervention_method": last_output_intervention_method,
         "output_score_name": last_output_score_name,
@@ -2300,6 +2309,7 @@ if __name__ == "__main__":
     lines.append(f"- converged_round: {converged_round}")
     lines.append(f"- enable_hypothesis_merge: {final_result.get('enable_hypothesis_merge')}")
     lines.append(f"- hypothesis_merge_mode: {final_result.get('hypothesis_merge_mode')}")
+    lines.append(f"- enable_bos_token_semantic_cluster: {bool(args.enable_bos_token_semantic_cluster)}")
     lines.append(f"- merged_rounds: {final_result.get('merged_rounds')}")
     lines.append(f"- output_intervention_method: {final_result.get('output_intervention_method')}")
     lines.append(f"- output_score_name: {final_result.get('output_score_name')}")
@@ -2354,6 +2364,7 @@ if __name__ == "__main__":
                 "converged_round": converged_round,
                 "enable_hypothesis_merge": final_result.get("enable_hypothesis_merge"),
                 "hypothesis_merge_mode": final_result.get("hypothesis_merge_mode"),
+                "enable_bos_token_semantic_cluster": bool(args.enable_bos_token_semantic_cluster),
                 "merged_rounds": final_result.get("merged_rounds"),
                 "output_intervention_method": final_result.get("output_intervention_method"),
                 "output_score_name": final_result.get("output_score_name"),
