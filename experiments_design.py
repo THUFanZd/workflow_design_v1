@@ -91,8 +91,7 @@ def _extract_string_list(value: Any) -> List[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        normalized = " ".join(value.split())
-        return [normalized] if normalized else []
+        return [value] if value != "" else []
     if isinstance(value, list):
         out: List[str] = []
         for item in value:
