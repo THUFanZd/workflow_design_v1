@@ -42,6 +42,8 @@ def build_user_prompt(*, side: SideType, hypothesis: str, num_sentences: int) ->
             f"Given the hypothesis below, generate exactly {num_sentences} sentences.\n"
             "Each sentence must directly reflect the literal meaning of the hypothesis and be likely "
             "to trigger the corresponding SAE feature activation.\n"
+            "While staying faithful to the hypothesis, vary the surrounding context as much as reasonably possible.\n"
+            "Use diverse syntax, discourse settings, and nearby content instead of repeating one narrow scenario.\n"
             "Keep each sentence natural, clear, and under 60 words.\n"
             "Avoid near-duplicates.\n\n"
             "Output format (JSON only):\n"

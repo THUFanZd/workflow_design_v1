@@ -84,7 +84,9 @@ def build_user_prompt(
             "3) You are offered two memory groups: (a) your own hypothesis trajectory, "
             "(b) peer hypotheses from the same side.\n"
             "4) Mine transferable failure/success patterns from all hypotheses to improve your own.\n"
-            "5) Produce a revised hypothesis, but not too complex for a SAE feature.\n"
+            "5) Produce a revised hypothesis, but not too complex for a SAE feature."
+            " Do not lightly infer extra context restrictions from a small set of successful examples."
+            " Only add context-specific conditions if the evidence clearly suggests the feature depends on that context, rather than on the core semantics alone."
             "6) Explain why the revision should perform better.\n\n"
         )
 
