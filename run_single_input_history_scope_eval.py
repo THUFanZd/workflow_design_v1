@@ -78,6 +78,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timestamp", default=None, help="If omitted, use current time YYYYMMDD_HHMMSS.")
 
     parser.add_argument("--model-id", default="gemma-2-2b")
+    parser.add_argument("--llm-api-key-file", default=None, help="Forwarded to workflow_runner.py --llm-api-key-file.")
+    parser.add_argument("--input-api-key-file", default=None, help="Forwarded to final_explanation_evaluation_runner.py --input-api-key-file.")
+    parser.add_argument("--output-api-key-file", default=None, help="Forwarded to final_explanation_evaluation_runner.py --output-api-key-file.")
+    parser.add_argument("--model-checkpoint-path", default=None, help="Forwarded to workflow_runner.py --model-checkpoint-path.")
+    parser.add_argument("--sae-path", default=None, help="Forwarded to workflow_runner.py --sae-path.")
+    parser.add_argument("--sae-release", default=None, help="Forwarded to workflow_runner.py --sae-release.")
+    parser.add_argument("--sae-average-l0", default=None, help="Forwarded to workflow_runner.py --sae-average-l0.")
+    parser.add_argument("--sae-canonical-map", default=None, help="Forwarded to workflow_runner.py --sae-canonical-map.")
+    parser.add_argument("--device", default=None, help="Forwarded to workflow_runner.py --device.")
     parser.add_argument("--llm-generation-model", default=None, help="Forwarded to workflow_runner.py")
     parser.add_argument("--llm-judge-model", default=None, help="Forwarded to workflow_runner.py")
     parser.add_argument("--input-activation-max-rounds", type=int, default=1)
@@ -228,6 +237,20 @@ def main() -> None:
         workflow_cmd.extend(["--llm-generation-model", str(args.llm_generation_model)])
     if args.llm_judge_model:
         workflow_cmd.extend(["--llm-judge-model", str(args.llm_judge_model)])
+    if args.llm_api_key_file:
+        workflow_cmd.extend(["--llm-api-key-file", str(args.llm_api_key_file)])
+    if args.model_checkpoint_path:
+        workflow_cmd.extend(["--model-checkpoint-path", str(args.model_checkpoint_path)])
+    if args.sae_path:
+        workflow_cmd.extend(["--sae-path", str(args.sae_path)])
+    if args.sae_release:
+        workflow_cmd.extend(["--sae-release", str(args.sae_release)])
+    if args.sae_average_l0:
+        workflow_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
+    if args.sae_canonical_map:
+        workflow_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
+    if args.device:
+        workflow_cmd.extend(["--device", str(args.device)])
 
     workflow_code, workflow_seconds = _run_command(workflow_cmd, dry_run=bool(args.dry_run))
 
@@ -255,6 +278,14 @@ def main() -> None:
         ]
         if bool(args.force_run_input_eval):
             evaluation_cmd.append("--force-run-input-eval")
+        if args.input_api_key_file:
+            evaluation_cmd.extend(["--input-api-key-file", str(args.input_api_key_file)])
+        elif args.llm_api_key_file:
+            evaluation_cmd.extend(["--input-api-key-file", str(args.llm_api_key_file)])
+        if args.output_api_key_file:
+            evaluation_cmd.extend(["--output-api-key-file", str(args.output_api_key_file)])
+        elif args.llm_api_key_file:
+            evaluation_cmd.extend(["--output-api-key-file", str(args.llm_api_key_file)])
         evaluation_code, evaluation_seconds = _run_command(
             evaluation_cmd,
             dry_run=bool(args.dry_run),

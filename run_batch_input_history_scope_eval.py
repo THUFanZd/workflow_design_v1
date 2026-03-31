@@ -29,6 +29,7 @@ class RunRecord:
     feature_id: int
     history_scope: str
     merge_enabled: bool
+    sae_path: str | None
     timestamp: str
     workflow_returncode: int
     evaluation_returncode: int | None
@@ -108,8 +109,62 @@ def _build_selection(
     seed: int,
     sample_per_layer: int,
     manual_pairs: Sequence[Tuple[int, int]],
+    target_total_features: int | None,
+    width: str,
 ) -> List[Tuple[int, int]]:
     rng = random.Random(seed)
+    deduped: List[Tuple[int, int]] = []
+    seen = set()
+    for pair in manual_pairs:
+        if pair in seen:
+            continue
+        seen.add(pair)
+        deduped.append(pair)
+
+    def _parse_width_to_feature_count(text: str) -> int:
+        raw = str(text).strip().lower()
+        if not raw:
+            return 16384
+        match = re.fullmatch(r"(\d+)([km]?)", raw)
+        if not match:
+            return 16384
+        base = int(match.group(1))
+        suffix = match.group(2)
+        if suffix == "k":
+            return base * 1024
+        if suffix == "m":
+            return base * 1024 * 1024
+        return base
+
+    if target_total_features is not None:
+        if target_total_features <= 0:
+            raise ValueError("--target-total-features must be > 0.")
+        if len(deduped) > target_total_features:
+            raise ValueError(
+                f"manual pairs count {len(deduped)} exceeds target total {target_total_features}."
+            )
+
+        feature_space_size = _parse_width_to_feature_count(width)
+        if feature_space_size <= 0:
+            raise ValueError(f"Invalid width/feature space: {width!r}")
+
+        manual_layers = sorted({int(layer_id) for layer_id, _ in deduped})
+        layers = manual_layers or list(TARGET_LAYERS)
+        needed = target_total_features - len(deduped)
+        while needed > 0:
+            layer_id = layers[rng.randrange(len(layers))]
+            feature_id = rng.randrange(feature_space_size)
+            candidate = (layer_id, feature_id)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            deduped.append(candidate)
+            needed -= 1
+        return deduped
+
+    if sample_per_layer <= 0:
+        return deduped
+
     selected: List[Tuple[int, int]] = []
     for layer_id in TARGET_LAYERS:
         feature_ids = _discover_features_for_layer(
@@ -124,10 +179,6 @@ def _build_selection(
         sampled = sorted(rng.sample(feature_ids, sample_per_layer))
         selected.extend((layer_id, fid) for fid in sampled)
 
-    selected.extend((int(layer_id), int(feature_id)) for layer_id, feature_id in manual_pairs)
-
-    deduped: List[Tuple[int, int]] = []
-    seen = set()
     for pair in selected:
         if pair in seen:
             continue
@@ -163,6 +214,85 @@ def _build_plan_output_path(base_path: Path, *, end_time: datetime) -> Path:
     return base_path.parent / end_tag / base_path.name
 
 
+def _extract_average_l0_from_canonical_map(
+    *,
+    canonical_map_path: Path,
+    layer_id: str,
+    width: str,
+) -> str | None:
+    if not canonical_map_path.exists():
+        return None
+
+    target_id = f"layer_{layer_id}/width_{width}/canonical"
+    in_target_block = False
+    path_pattern = re.compile(
+        rf"layer_{re.escape(layer_id)}/width_{re.escape(width)}/average_l0_([0-9]+(?:\.[0-9]+)?)"
+    )
+    with canonical_map_path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if line.startswith("- id:"):
+                current_id = line.split(":", 1)[1].strip()
+                in_target_block = current_id == target_id
+                continue
+            if in_target_block and line.startswith("path:"):
+                match = path_pattern.search(line.split(":", 1)[1].strip())
+                if match:
+                    return match.group(1)
+                return None
+    return None
+
+
+def _extract_average_l0_from_path_suffix(path_text: str) -> str | None:
+    match = re.search(r"average_l0_([0-9]+(?:\.[0-9]+)?)", path_text)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _extract_width_from_sae_path(path_text: str) -> str | None:
+    match = re.search(r"width_([^/\\]+)", path_text)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _resolve_pair_sae_path(*, args: argparse.Namespace, layer_id: int) -> str | None:
+    base_sae_path = args.sae_path
+    if not base_sae_path:
+        return None
+
+    raw = str(base_sae_path).strip()
+    if not raw:
+        return None
+
+    # Allow explicit templating for advanced usage.
+    if "{layer_id}" in raw:
+        return raw.format(layer_id=layer_id)
+
+    normalized = raw.replace("\\", "/")
+    layer_match = re.search(r"/layer_\d+/", normalized)
+    width = _extract_width_from_sae_path(normalized)
+    if layer_match is None or not width:
+        return raw
+
+    canonical_map_path = Path(str(args.sae_canonical_map)) if args.sae_canonical_map else None
+    resolved_average_l0 = str(args.sae_average_l0).strip() if args.sae_average_l0 else None
+    if not resolved_average_l0 and canonical_map_path:
+        resolved_average_l0 = _extract_average_l0_from_canonical_map(
+            canonical_map_path=canonical_map_path,
+            layer_id=str(layer_id),
+            width=width,
+        )
+    if not resolved_average_l0:
+        resolved_average_l0 = _extract_average_l0_from_path_suffix(normalized)
+    if not resolved_average_l0:
+        return raw
+
+    root = normalized[: layer_match.start()]
+    return f"{root}/layer_{layer_id}/width_{width}/average_l0_{resolved_average_l0}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -175,6 +305,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sample-per-layer", type=int, default=2)
+    parser.add_argument(
+        "--target-total-features",
+        type=int,
+        default=None,
+        help=(
+            "If set, prioritize --target-pairs/--target-pairs-file, then randomly "
+            "sample remaining features from TARGET_LAYERS until this total is reached. "
+            "When omitted, uses --sample-per-layer behavior."
+        ),
+    )
     parser.add_argument(
         "--target-pairs",
         type=str,
@@ -192,6 +332,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-expansion-max-rounds", type=int, default=1)
     parser.add_argument("--llm-generation-model", default=None, help="Forwarded to run_single/workflow.")
     parser.add_argument("--llm-judge-model", default=None, help="Forwarded to run_single/workflow.")
+    parser.add_argument("--llm-api-key-file", default=None, help="Forwarded to run_single/workflow.")
+    parser.add_argument("--input-api-key-file", default=None, help="Forwarded to run_single/final-eval.")
+    parser.add_argument("--output-api-key-file", default=None, help="Forwarded to run_single/final-eval.")
+    parser.add_argument("--model-checkpoint-path", default=None, help="Forwarded to workflow_runner.py.")
+    parser.add_argument("--sae-path", default=None, help="Forwarded to workflow_runner.py.")
+    parser.add_argument("--sae-release", default=None, help="Forwarded to workflow_runner.py.")
+    parser.add_argument("--sae-average-l0", default=None, help="Forwarded to workflow_runner.py.")
+    parser.add_argument("--sae-canonical-map", default=None, help="Forwarded to workflow_runner.py.")
+    parser.add_argument("--device", default=None, help="Forwarded to workflow_runner.py.")
     parser.add_argument("--num-hypothesis", type=int, default=3)
     parser.add_argument(
         "--generation-mode",
@@ -287,6 +436,10 @@ def main() -> None:
         seed=int(args.seed),
         sample_per_layer=int(args.sample_per_layer),
         manual_pairs=manual_pairs,
+        target_total_features=(
+            None if args.target_total_features is None else int(args.target_total_features)
+        ),
+        width=str(args.width),
     )
 
     print("Selected features:")
@@ -369,6 +522,25 @@ def main() -> None:
                 single_cmd.extend(["--llm-generation-model", str(args.llm_generation_model)])
             if args.llm_judge_model:
                 single_cmd.extend(["--llm-judge-model", str(args.llm_judge_model)])
+            if args.llm_api_key_file:
+                single_cmd.extend(["--llm-api-key-file", str(args.llm_api_key_file)])
+            if args.input_api_key_file:
+                single_cmd.extend(["--input-api-key-file", str(args.input_api_key_file)])
+            if args.output_api_key_file:
+                single_cmd.extend(["--output-api-key-file", str(args.output_api_key_file)])
+            if args.model_checkpoint_path:
+                single_cmd.extend(["--model-checkpoint-path", str(args.model_checkpoint_path)])
+            resolved_sae_path = _resolve_pair_sae_path(args=args, layer_id=layer_id)
+            if resolved_sae_path:
+                single_cmd.extend(["--sae-path", resolved_sae_path])
+            if args.sae_release:
+                single_cmd.extend(["--sae-release", str(args.sae_release)])
+            if args.sae_average_l0:
+                single_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
+            if args.sae_canonical_map:
+                single_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
+            if args.device:
+                single_cmd.extend(["--device", str(args.device)])
             if bool(args.force_run_input_eval):
                 single_cmd.append("--force-run-input-eval")
             single_returncode, _ = _run_command(single_cmd, dry_run=bool(args.dry_run))
@@ -392,6 +564,7 @@ def main() -> None:
                 feature_id=feature_id,
                 history_scope=history_scope,
                 merge_enabled=merge_enabled,
+                sae_path=resolved_sae_path,
                 timestamp=timestamp,
                 workflow_returncode=workflow_code,
                 evaluation_returncode=evaluation_code,
@@ -410,6 +583,7 @@ def main() -> None:
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "seed": int(args.seed),
         "sample_per_layer": int(args.sample_per_layer),
+        "target_total_features": None if args.target_total_features is None else int(args.target_total_features),
         "target_layers": list(TARGET_LAYERS),
         "manual_pairs": [{"layer_id": l, "feature_id": f} for l, f in manual_pairs],
         "input_activation_max_rounds": int(args.input_activation_max_rounds),

@@ -56,7 +56,9 @@ def _input_mode_instructions(mode: InputRefinementMode) -> str:
             "3) Use successful examples as anchor cases, not as the full semantic boundary.\n"
             "4) Consider adjacent sibling cases that plausibly belong to the same feature.\n"
             "5) Use historical trajectory to avoid reusing earlier failed meanings.\n"
-            "6) Keep the expanded hypothesis concise, precise, and testable."
+            "6) Keep the expanded hypothesis concise, precise, and testable.\n"
+            "7) Do not lightly infer extra context restrictions from a small set of successful examples.\n"
+            "8) Only add context-specific conditions if the evidence clearly suggests the feature depends on that context, rather than on the core semantics alone."
         )
     return (
         "Current input-side mode: expansion test.\n"
@@ -193,7 +195,8 @@ def build_activation_expand_analysis_prompt(
         "Task:\n"
         "1) Extract the preserved core semantics that the current hypothesis already captures.\n"
         "2) Identify adjacent sibling cases that are not literally listed in the current hypothesis but plausibly belong to the same feature.\n"
-        "3) Explain why the broader latent semantic class still covers the current positives.\n\n"
+        "3) Explain why the broader latent semantic class still covers the current positives.\n"
+        "4) Treat incidental context overlap in the examples as weak evidence unless the feature clearly appears context-dependent.\n\n"
         "Output constraints:\n"
         "- preserved_core: 2-4 short bullet-like strings.\n"
         "- new_sibling_cases: 2-4 short bullet-like strings.\n"
