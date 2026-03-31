@@ -23,3 +23,4 @@ initial_observation_input/
 preliminary_explain.py
 initial_observation/
 support_info/ali_api_key.txt
+support_info/llm_api_info.py

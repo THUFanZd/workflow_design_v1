@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence, Tuple
 
-from function import build_feature_dir
+from function import build_feature_dir, extract_average_l0_from_canonical_map
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -55,6 +55,37 @@ def _resolve_timestamp(args: argparse.Namespace) -> str:
     return now_tag
 
 
+def _resolve_local_sae_path(args: argparse.Namespace, *, layer_id: int) -> str | None:
+    if args.sae_path:
+        return str(args.sae_path)
+    if not args.sae_root:
+        return None
+
+    width = str(args.width).strip()
+    average_l0 = str(args.sae_average_l0).strip() if args.sae_average_l0 else ""
+    if not average_l0:
+        canonical_map = (
+            Path(str(args.sae_canonical_map))
+            if args.sae_canonical_map
+            else (PROJECT_ROOT / "support_info" / "canonical_map.txt")
+        )
+        mapped_l0 = extract_average_l0_from_canonical_map(
+            canonical_map_path=canonical_map,
+            layer_id=str(layer_id),
+            width=width,
+        )
+        average_l0 = str(mapped_l0).strip() if mapped_l0 else ""
+    if not average_l0:
+        raise ValueError(
+            "Cannot resolve average_l0 for local SAE path. "
+            "Please provide --sae-average-l0 or ensure canonical_map has "
+            f"layer_{layer_id}/width_{width}/canonical."
+        )
+
+    sae_root = str(args.sae_root).rstrip("/\\")
+    return f"{sae_root}/layer_{layer_id}/width_{width}/average_l0_{average_l0}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -83,6 +114,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-api-key-file", default=None, help="Forwarded to final_explanation_evaluation_runner.py --output-api-key-file.")
     parser.add_argument("--model-checkpoint-path", default=None, help="Forwarded to workflow_runner.py --model-checkpoint-path.")
     parser.add_argument("--sae-path", default=None, help="Forwarded to workflow_runner.py --sae-path.")
+    parser.add_argument(
+        "--sae-root",
+        default=None,
+        help=(
+            "Optional local SAE root. If set (and --sae-path is unset), auto-build SAE path as "
+            "{sae_root}/layer_{layer}/width_{width}/average_l0_{resolved_l0}."
+        ),
+    )
     parser.add_argument("--sae-release", default=None, help="Forwarded to workflow_runner.py --sae-release.")
     parser.add_argument("--sae-average-l0", default=None, help="Forwarded to workflow_runner.py --sae-average-l0.")
     parser.add_argument("--sae-canonical-map", default=None, help="Forwarded to workflow_runner.py --sae-canonical-map.")
@@ -186,6 +225,7 @@ def main() -> None:
     layer_id = int(args.layer_id)
     feature_id = int(args.feature_id)
     final_run_mode = str(args.side)
+    resolved_sae_path = _resolve_local_sae_path(args, layer_id=layer_id)
 
     workflow_cmd = [
         str(args.python_exe),
@@ -241,8 +281,8 @@ def main() -> None:
         workflow_cmd.extend(["--llm-api-key-file", str(args.llm_api_key_file)])
     if args.model_checkpoint_path:
         workflow_cmd.extend(["--model-checkpoint-path", str(args.model_checkpoint_path)])
-    if args.sae_path:
-        workflow_cmd.extend(["--sae-path", str(args.sae_path)])
+    if resolved_sae_path:
+        workflow_cmd.extend(["--sae-path", str(resolved_sae_path)])
     if args.sae_release:
         workflow_cmd.extend(["--sae-release", str(args.sae_release)])
     if args.sae_average_l0:
@@ -286,6 +326,18 @@ def main() -> None:
             evaluation_cmd.extend(["--output-api-key-file", str(args.output_api_key_file)])
         elif args.llm_api_key_file:
             evaluation_cmd.extend(["--output-api-key-file", str(args.llm_api_key_file)])
+        if args.model_checkpoint_path:
+            evaluation_cmd.extend(["--model-checkpoint-path", str(args.model_checkpoint_path)])
+        if resolved_sae_path:
+            evaluation_cmd.extend(["--sae-path", str(resolved_sae_path)])
+        if args.sae_release:
+            evaluation_cmd.extend(["--sae-release", str(args.sae_release)])
+        if args.sae_average_l0:
+            evaluation_cmd.extend(["--sae-average-l0", str(args.sae_average_l0)])
+        if args.sae_canonical_map:
+            evaluation_cmd.extend(["--sae-canonical-map", str(args.sae_canonical_map)])
+        if args.device:
+            evaluation_cmd.extend(["--device", str(args.device)])
         evaluation_code, evaluation_seconds = _run_command(
             evaluation_cmd,
             dry_run=bool(args.dry_run),
