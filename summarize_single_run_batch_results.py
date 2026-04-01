@@ -22,6 +22,12 @@ RELATIVE_QUALITY_FIELDS = [
     "relative_quality_combined_input_score",
 ]
 
+TOKEN_USAGE_FIELDS = [
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+]
+
 ROUND_SCORE_FIELDS = [
     "score_non_zero_rate",
     "score_boundary_non_activation_rate",
@@ -159,6 +165,18 @@ def final_evaluation_path(layer: int, feature: int, timestamp: str) -> Path:
     )
 
 
+def final_result_path(layer: int, feature: int, timestamp: str) -> Path:
+    return (
+        PROJECT_ROOT
+        / "logs"
+        / f"layer-{layer}"
+        / f"feature-{feature}"
+        / timestamp
+        / "final_result"
+        / f"layer{layer}-feature{feature}-final-result.json"
+    )
+
+
 def execution_round_path(layer: int, feature: int, timestamp: str, round_index: int) -> Path:
     return (
         PROJECT_ROOT
@@ -169,6 +187,62 @@ def execution_round_path(layer: int, feature: int, timestamp: str, round_index: 
         / f"round_{round_index}"
         / f"layer{layer}-feature{feature}-experiments-execution.json"
     )
+
+
+def parse_token_usage(token_usage_obj: Any) -> tuple[float | None, float | None, float | None]:
+    if not isinstance(token_usage_obj, dict):
+        return None, None, None
+    input_tokens = to_float(token_usage_obj.get("prompt_tokens"))
+    output_tokens = to_float(token_usage_obj.get("completion_tokens"))
+    total_tokens = to_float(token_usage_obj.get("total_tokens"))
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    return input_tokens, output_tokens, total_tokens
+
+
+def extract_token_usage_for_feature(
+    *,
+    layer: int,
+    feature: int,
+    timestamp: str,
+    final_eval_payload: dict[str, Any],
+) -> tuple[float | None, float | None, float | None]:
+    # Prefer full-run usage from final-result JSON.
+    final_result = final_result_path(layer, feature, timestamp)
+    if final_result.exists():
+        try:
+            final_result_payload = load_json(final_result)
+        except Exception:
+            final_result_payload = {}
+        if isinstance(final_result_payload, dict):
+            for key in ["token_usage_this_run", "token_usage_total", "token_usage"]:
+                input_tokens, output_tokens, total_tokens = parse_token_usage(final_result_payload.get(key))
+                if any(v is not None for v in [input_tokens, output_tokens, total_tokens]):
+                    return input_tokens, output_tokens, total_tokens
+
+    # Fallback to token usage carried by final-evaluation JSON.
+    for key in ["token_usage_this_run", "token_usage_total", "token_usage"]:
+        input_tokens, output_tokens, total_tokens = parse_token_usage(final_eval_payload.get(key))
+        if any(v is not None for v in [input_tokens, output_tokens, total_tokens]):
+            return input_tokens, output_tokens, total_tokens
+
+    input_eval = final_eval_payload.get("input_evaluation")
+    if isinstance(input_eval, dict):
+        raw_result = input_eval.get("raw_result")
+        if isinstance(raw_result, dict):
+            input_tokens, output_tokens, total_tokens = parse_token_usage(raw_result.get("token_usage"))
+            if any(v is not None for v in [input_tokens, output_tokens, total_tokens]):
+                return input_tokens, output_tokens, total_tokens
+
+    output_eval = final_eval_payload.get("output_evaluation")
+    if isinstance(output_eval, dict):
+        raw_result = output_eval.get("raw_result")
+        if isinstance(raw_result, dict):
+            input_tokens, output_tokens, total_tokens = parse_token_usage(raw_result.get("token_usage"))
+            if any(v is not None for v in [input_tokens, output_tokens, total_tokens]):
+                return input_tokens, output_tokens, total_tokens
+
+    return None, None, None
 
 
 def extract_best_round_score(execution_payload: dict[str, Any]) -> tuple[float | None, float | None]:
@@ -267,6 +341,27 @@ def build_relative_quality_stats(
     return overall_rows, by_layer_rows
 
 
+def build_token_usage_stats(feature_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for field in TOKEN_USAGE_FIELDS:
+        values = [to_float(row.get(field)) for row in feature_rows]
+        numeric = [v for v in values if v is not None]
+        summary = summarize_numeric(numeric)
+        rows.append(
+            {
+                "metric": field,
+                "valid_count": summary["count"],
+                "sum": sum(numeric) if numeric else None,
+                "mean": summary["mean"],
+                "median": summary["median"],
+                "std": summary["std"],
+                "min": summary["min"],
+                "max": summary["max"],
+            }
+        )
+    return rows
+
+
 def build_round_mean_stats(
     round_rows: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -352,6 +447,122 @@ def _plot_round_lines(
     plt.savefig(out_path, dpi=160)
     plt.close()
     return True
+
+
+def _plot_histogram(
+    *,
+    out_path: Path,
+    values: list[float],
+    title: str,
+    x_label: str,
+) -> bool:
+    if not values:
+        return False
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return False
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    bins = max(5, min(30, int(math.sqrt(len(values))) + 1))
+    plt.figure(figsize=(8, 5))
+    plt.hist(values, bins=bins, edgecolor="black", alpha=0.8)
+    mean_v = statistics.fmean(values)
+    median_v = statistics.median(values)
+    plt.axvline(mean_v, color="red", linestyle="--", linewidth=1.6, label=f"mean={mean_v:.4f}")
+    plt.axvline(median_v, color="green", linestyle="-.", linewidth=1.6, label=f"median={median_v:.4f}")
+    plt.xlabel(x_label)
+    plt.ylabel("feature count")
+    plt.title(title)
+    plt.grid(axis="y", linestyle="--", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+    return True
+
+
+def render_token_usage_plot(*, token_usage_overall: list[dict[str, Any]], figures_dir: Path) -> list[str]:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return []
+
+    metric_to_row = {str(row.get("metric")): row for row in token_usage_overall}
+    labels = TOKEN_USAGE_FIELDS
+    sums: list[float] = []
+    means: list[float | None] = []
+    for metric in labels:
+        row = metric_to_row.get(metric, {})
+        sum_v = to_float(row.get("sum"))
+        sums.append(sum_v if sum_v is not None else 0.0)
+        means.append(to_float(row.get("mean")))
+
+    if not any(v > 0 for v in sums):
+        return []
+
+    out_path = figures_dir / "token_usage_overall.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pretty_label = {
+        "input_tokens": "input tokens",
+        "output_tokens": "output tokens",
+        "total_tokens": "total tokens",
+    }
+    x_labels = [pretty_label[name] for name in labels]
+
+    plt.figure(figsize=(8, 5))
+    bars = plt.bar(x_labels, sums)
+    plt.ylabel("sum across features")
+    plt.title("Token Usage Summary (All Features)")
+    plt.grid(axis="y", linestyle="--", alpha=0.3)
+    for i, bar in enumerate(bars):
+        height = bar.get_height()
+        mean_v = means[i]
+        if mean_v is None:
+            label = f"sum={height:.0f}"
+        else:
+            label = f"sum={height:.0f}\nmean={mean_v:.2f}"
+        plt.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            height,
+            label,
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=160)
+    plt.close()
+    return [str(out_path)]
+
+
+def render_relative_quality_distribution_plots(
+    *, feature_rows: list[dict[str, Any]], figures_dir: Path
+) -> list[str]:
+    generated: list[str] = []
+    metric_to_name = {
+        "relative_quality_score_non_zero_rate": "Relative Quality (Non-Zero Rate)",
+        "relative_quality_score_boundary_non_activation_rate": "Relative Quality (Boundary Non-Activation Rate)",
+        "relative_quality_combined_input_score": "Relative Quality (Combined Input Score)",
+    }
+    metric_to_filename = {
+        "relative_quality_score_non_zero_rate": "relative_quality_non_zero_rate_distribution.png",
+        "relative_quality_score_boundary_non_activation_rate": "relative_quality_boundary_non_activation_rate_distribution.png",
+        "relative_quality_combined_input_score": "relative_quality_combined_input_score_distribution.png",
+    }
+    for metric in RELATIVE_QUALITY_FIELDS:
+        values = [to_float(row.get(metric)) for row in feature_rows]
+        numeric = [v for v in values if v is not None]
+        out_path = figures_dir / metric_to_filename[metric]
+        if _plot_histogram(
+            out_path=out_path,
+            values=numeric,
+            title=metric_to_name[metric],
+            x_label="score",
+        ):
+            generated.append(str(out_path))
+    return generated
 
 
 def render_round_plots(
@@ -493,6 +704,13 @@ def main() -> int:
             )
             continue
 
+        input_tokens, output_tokens, total_tokens = extract_token_usage_for_feature(
+            layer=layer,
+            feature=feature,
+            timestamp=timestamp,
+            final_eval_payload=final_payload,
+        )
+
         feature_rows.append(
             {
                 "layer": layer,
@@ -516,6 +734,9 @@ def main() -> int:
                 "neuronpedia_mean_combined_input_score": to_float(
                     input_eval.get("neuronpedia_mean_combined_input_score")
                 ),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
             }
         )
 
@@ -570,6 +791,7 @@ def main() -> int:
         return 1
 
     relative_overall, relative_by_layer = build_relative_quality_stats(feature_rows)
+    token_usage_overall = build_token_usage_stats(feature_rows)
     round_mean_overall, round_mean_by_layer = build_round_mean_stats(round_rows)
 
     # Raw tables
@@ -589,6 +811,9 @@ def main() -> int:
             "workflow_score_boundary_non_activation_rate",
             "workflow_combined_input_score",
             "neuronpedia_mean_combined_input_score",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
             "final_evaluation_path",
         ],
     )
@@ -610,6 +835,7 @@ def main() -> int:
     # Aggregated tables
     relative_overall_path = ctx.tables_dir / "relative_quality_overall.csv"
     relative_by_layer_path = ctx.tables_dir / "relative_quality_by_layer.csv"
+    token_usage_overall_path = ctx.tables_dir / "token_usage_overall.csv"
     round_mean_overall_path = ctx.tables_dir / "round_mean_overall.csv"
     round_mean_by_layer_path = ctx.tables_dir / "round_mean_by_layer.csv"
     write_csv(
@@ -621,6 +847,11 @@ def main() -> int:
         relative_by_layer_path,
         relative_by_layer,
         ["layer", "metric", "valid_count", "mean", "median", "std", "min", "max"],
+    )
+    write_csv(
+        token_usage_overall_path,
+        token_usage_overall,
+        ["metric", "valid_count", "sum", "mean", "median", "std", "min", "max"],
     )
     write_csv(
         round_mean_overall_path,
@@ -636,10 +867,23 @@ def main() -> int:
     debug_path = ctx.debug_dir / "missing_or_invalid_records.csv"
     write_csv(debug_path, debug_rows, ["layer", "feature", "timestamp", "reason", "path"])
 
-    figure_paths = render_round_plots(
+    figure_paths: list[str] = []
+    figure_paths.extend(render_round_plots(
         round_mean_overall=round_mean_overall,
         round_mean_by_layer=round_mean_by_layer,
         figures_dir=ctx.figures_dir,
+    ))
+    figure_paths.extend(
+        render_relative_quality_distribution_plots(
+            feature_rows=feature_rows,
+            figures_dir=ctx.figures_dir,
+        )
+    )
+    figure_paths.extend(
+        render_token_usage_plot(
+            token_usage_overall=token_usage_overall,
+            figures_dir=ctx.figures_dir,
+        )
     )
 
     analysis_manifest = {
@@ -655,6 +899,7 @@ def main() -> int:
             "round_scores_per_feature_csv": str(round_scores_path),
             "relative_quality_overall_csv": str(relative_overall_path),
             "relative_quality_by_layer_csv": str(relative_by_layer_path),
+            "token_usage_overall_csv": str(token_usage_overall_path),
             "round_mean_overall_csv": str(round_mean_overall_path),
             "round_mean_by_layer_csv": str(round_mean_by_layer_path),
             "debug_csv": str(debug_path),
